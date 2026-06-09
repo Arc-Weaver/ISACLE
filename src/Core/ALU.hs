@@ -2,7 +2,13 @@ module Core.ALU where
 
 import Data.Maybe (Maybe)
 
--- | Generic CPU ALU interface.
+-- | Generic record-based CPU ALU interface.
+--
+--   This is a lightweight composition helper for cores that want to pass an
+--   ALU implementation around as data. The Harvard pipeline uses the
+--   typeclass-based interface in 'Core.Harvard.ISA'; both abstractions are
+--   kept here because they support different styles of ISA-independent core
+--   assembly.
 --
 --   Each field is a pure function from instruction + state to effect:
 --     read    — which data RAM address to read before compute (if any)

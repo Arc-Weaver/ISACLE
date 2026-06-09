@@ -83,10 +83,11 @@ pipelineStep (PipeState slots lat) cpuState inp =
       -- pipeline; ISA stages that need ROM data should carry it in their stage
       -- type.
       SIsa stage ->
-          let memVal       = fromMaybe (errorX "Core.Harvard.Pipeline: SIsa expects mem resp")
+          let memVal       = fromMaybe
+                                 (errorX "Core.Harvard.Pipeline: ISA-specific stage requires a memory response, but none was provided")
                                        (pipeMemResp inp)
               (cpu', done) = isaStageStep stage
-                                 (errorX "Core.Harvard.Pipeline: SIsa ROM feed unimplemented", memVal)
+                                 (errorX "Core.Harvard.Pipeline: ISA-specific stage ROM feed is intentionally unimplemented; carry any required ROM data in the stage value", memVal)
                                  cpuState
           in case done of
               Left  stage' ->
