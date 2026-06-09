@@ -1,0 +1,5 @@
+resolver: lts-23.28
+
+extra-deps:
+- clash-lib-1.8.4@sha256:6d08a798f5e2e4772290d6c480f0e3de4ef3309d737ace37f0a27281433e3adb,15721
+- clash-prelude-1.8.4@sha256:4d1d9b05cc38f6c1e856de3035ee044bfcb7666e6ebeb978aef54da840255a67,17871
