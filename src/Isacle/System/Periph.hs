@@ -1,11 +1,13 @@
 -- NB: NoImplicitPrelude is active from cabal common-options.
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TypeFamilies               #-}
 module Isacle.System.Periph
     ( -- * Signal operations record
       PeriphOps(..)
     , nullOps
+      -- * Bus interface adapter
+    , BusIface(..)
+    , nullBusIface
       -- * Peripheral definition monad
     , PeriphDef
     , runPeriphDef
@@ -27,19 +29,22 @@ module Isacle.System.Periph
       -- * BitField helpers
     , bitF
     , bitsF
-      -- * Physical I/O typeclass
-    , HasPhysIO(..)
+      -- * Memory peripheral phantom types
+    , RAM
+    , ROM
+      -- * Block memory peripheral defs (isacle-hdl backend)
+    , blockRamDef
+    , blockRomDef
     ) where
 
 import Prelude
 import Data.Kind (Type)
 import Data.Word (Word8, Word32)
-import Data.Proxy (Proxy(..))
-import GHC.TypeLits (Nat)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
 
+import Isacle.Hdl.Prim (Unsigned)
 import Isacle.System.Spec (NullSig(..))
 
 -- ---------------------------------------------------------------------------
@@ -94,176 +99,206 @@ specSize (PeriphSpec fs) = maximum
 
 -- | Operations record injected into the 'PeriphDef' monad.
 --
--- Using a record rather than a typeclass avoids the GHC restriction that
--- implicit-parameter constraints (such as 'HiddenClockResetEnable') cannot
--- appear in instance heads.
---
--- Two values exist:
+-- Two concrete values exist:
 --
 --   * 'nullOps' — spec / documentation interpreter; all operations are no-ops.
---   * @'synthOps'@ (in "Isacle.System.Circuit") — Clash synthesis; 'sigReg'
---     compiles to @regEn@.
-newtype PeriphOps (sig :: Type -> Type) dat = PeriphOps
+--   * @'hdlOps'@ (in "Isacle.System.HdlCircuit") — isacle-hdl backend.
+data PeriphOps (sig :: Type -> Type) dat = PeriphOps
     { -- | Create a clocked register.
       -- @sigReg initVal writeEnable writeData@ → current register value.
       sigReg :: dat -> sig Bool -> sig dat -> sig dat
+      -- | Create a block RAM/ROM.
+      -- @sigBlockMem size initVals writeEnable writeAddr writeData readAddr@
+    , sigBlockMem :: Int -> [Integer]
+                  -> sig Bool -> sig (Unsigned 32) -> sig dat -> sig (Unsigned 32)
+                  -> sig dat
+      -- | Address less-than: @sigAddrLt addr limit@ is True when @addr < limit@.
+    , sigAddrLt :: sig (Unsigned 32) -> Word32 -> sig Bool
+      -- | Zero signal (initial read-data accumulator).
+    , sigZero :: sig dat
+      -- | Combinational AND of two Bool signals.
+    , sigAnd  :: sig Bool -> sig Bool -> sig Bool
+      -- | Combinational mux: @sigMux sel thenSig elseSig@.
+    , sigMux  :: sig Bool -> sig dat -> sig dat -> sig dat
     }
 
--- | Spec / documentation ops: register creation is a no-op.
+-- | Spec / documentation ops: all hardware operations are no-ops.
 nullOps :: PeriphOps NullSig dat
-nullOps = PeriphOps { sigReg = \_ _ _ -> NullSig }
+nullOps = PeriphOps
+    { sigReg      = \_ _ _ -> NullSig
+    , sigBlockMem = \_ _ _ _ _ _ -> NullSig
+    , sigAddrLt   = \_ _ -> NullSig
+    , sigZero     = NullSig
+    , sigAnd      = \_ _ -> NullSig
+    , sigMux      = \_ _ _ -> NullSig
+    }
+
+-- ---------------------------------------------------------------------------
+-- BusIface: decomposed bus adapter (backend-agnostic)
+-- ---------------------------------------------------------------------------
+
+-- | Decomposed bus interface passed to 'runPeriphDef'.
+--
+-- Each backend constructs one of these from its native bus representation:
+--
+--   * isacle-hdl: 'hdlBusIface' in "Isacle.System.HdlCircuit"
+--   * spec / null: 'nullBusIface'
+data BusIface sig dat = BusIface
+    { biWrData    :: sig dat
+      -- ^ Write data (valid only when 'biWrEqAddr' returns True for some offset).
+    , biWrEqAddr  :: Word32 -> sig Bool
+      -- ^ @biWrEqAddr off@ — True iff a write is targeting byte offset @off@.
+    , biRdEqAddr  :: Word32 -> sig Bool
+      -- ^ @biRdEqAddr off@ — True iff a read is targeting byte offset @off@.
+    , biWrEn      :: sig Bool
+      -- ^ Global write enable (not address-decoded; used by block-memory peripherals).
+    , biRelWrAddr :: sig (Unsigned 32)
+      -- ^ Write address relative to peripheral base (used by block-memory peripherals).
+    , biRelRdAddr :: sig (Unsigned 32)
+      -- ^ Read address relative to peripheral base (used by block-memory peripherals).
+    }
+
+-- | 'BusIface' for the spec / documentation path; all signals are 'NullSig'.
+nullBusIface :: BusIface NullSig dat
+nullBusIface = BusIface
+    { biWrData    = NullSig
+    , biWrEqAddr  = \_ -> NullSig
+    , biRdEqAddr  = \_ -> NullSig
+    , biWrEn      = NullSig
+    , biRelWrAddr = NullSig
+    , biRelRdAddr = NullSig
+    }
 
 -- ---------------------------------------------------------------------------
 -- PeriphDef: peripheral definition monad
 -- ---------------------------------------------------------------------------
 
-type WriteBus sig dat = sig (Maybe (Word8, dat))
-
 data PeriphEnv sig dat = PeriphEnv
-    { peOps    :: PeriphOps sig dat
-    , peWrite  :: WriteBus sig dat
-    , peRdAddr :: sig (Maybe Word8)   -- ^ current read address (offset from base)
+    { peOps :: PeriphOps sig dat
+    , peBus :: BusIface sig dat
     }
 
 data PeriphAccum sig dat = PeriphAccum
     { paFields :: [FieldSpec]
-    , paRdData :: sig dat             -- ^ accumulated read-mux output signal
+    , paRdData :: sig dat
     }
-
-emptyAccum :: (Applicative sig, Num dat) => PeriphAccum sig dat
-emptyAccum = PeriphAccum [] (pure 0)
 
 -- | Peripheral description monad.
 --
 -- @p@   — phantom peripheral kind tag (e.g. @GPIO@, @UART@).
--- @sig@ — signal family; 'NullSig' for spec, @Signal dom@ for synthesis.
--- @dat@ — bus data type (e.g. @BitVector 8@).
+-- @sig@ — signal family; 'NullSig' for spec, @Sig dom@ for isacle-hdl.
+-- @dat@ — bus data type.
 -- @a@   — return type (the peripheral's physical output signals).
---
--- A single @do@-block mixes structural declarations ('field', 'register') and
--- signal-level circuit operations ('onWrite', 'onRead').
 newtype PeriphDef (p :: Type) (sig :: Type -> Type) dat a = PeriphDef
     { unPeriphDef :: ReaderT (PeriphEnv sig dat) (State (PeriphAccum sig dat)) a }
     deriving newtype (Functor, Applicative, Monad)
 
--- | Run a peripheral definition with the given ops, write bus, and read address.
---
--- Returns the physical outputs, the assembled read-data signal (a chain of
--- combinational mux operations, not a list), and the structural 'PeriphSpec'.
+-- | Run a peripheral definition.
 runPeriphDef
-    :: (Applicative sig, Num dat)
-    => PeriphOps sig dat
-    -> WriteBus sig dat         -- ^ write bus (offset-relative)
-    -> sig (Maybe Word8)        -- ^ read address (offset-relative)
+    :: PeriphOps sig dat
+    -> BusIface sig dat
     -> PeriphDef p sig dat a
     -> (a, sig dat, PeriphSpec)
-runPeriphDef ops wrBus rdAddr def =
-    let env      = PeriphEnv { peOps = ops, peWrite = wrBus, peRdAddr = rdAddr }
-        (a, acc) = runState (runReaderT (unPeriphDef def) env) emptyAccum
-    in (a, paRdData acc, PeriphSpec (reverse (paFields acc)))
+runPeriphDef ops bus def =
+    let env      = PeriphEnv { peOps = ops, peBus = bus }
+        initAcc  = PeriphAccum { paFields = [], paRdData = sigZero ops }
+        (a, acc) = runState (runReaderT (unPeriphDef def) env) initAcc
+    in (a, paRdData acc, PeriphSpec (paFields acc))
 
 -- ---------------------------------------------------------------------------
 -- Signal-level circuit operations
 -- ---------------------------------------------------------------------------
 
 -- | Declare a registered output at @offset@.
---
--- In the synthesis interpreter the returned signal updates on every write to
--- @base + offset@ from the bus.  Write-first semantics: reading the register
--- in the same cycle as a write returns the newly written value (combinational
--- bypass), not the value clocked in on the previous edge.
---
--- In the spec interpreter it returns 'NullSig'.
 onWrite
-    :: Applicative sig
-    => Word8         -- ^ byte offset from peripheral base
-    -> dat           -- ^ initial / reset value
+    :: Word32
+    -> dat
     -> PeriphDef p sig dat (sig dat)
 onWrite off initVal = PeriphDef $ do
-    PeriphEnv { peOps = ops, peWrite = wr } <- ask
-    let wen  = fmap (maybe False (\(a, _) -> a == off)) wr
-        wdat = fmap (maybe initVal snd) wr
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
+    let wen  = biWrEqAddr bus off
+        wdat = biWrData bus
         reg  = sigReg ops initVal wen wdat
-    pure ((\w d r -> if w then d else r) <$> wen <*> wdat <*> reg)
+    pure (sigMux ops wen wdat reg)
 
--- | Like 'onWrite' but also returns a write-strobe: a signal that is @True@
--- for exactly the cycle on which the CPU writes to @offset@.
---
--- Useful for peripherals (e.g. UART) that need to react to the write event
--- rather than just reading the current register value.
+-- | Like 'onWrite' but also returns a write-strobe.
 onWriteStrobe
-    :: Applicative sig
-    => Word8
+    :: Word32
     -> dat
     -> PeriphDef p sig dat (sig dat, sig Bool)
 onWriteStrobe off initVal = PeriphDef $ do
-    PeriphEnv { peOps = ops, peWrite = wr } <- ask
-    let wen  = fmap (maybe False (\(a, _) -> a == off)) wr
-        wdat = fmap (maybe initVal snd) wr
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
+    let wen  = biWrEqAddr bus off
+        wdat = biWrData bus
         reg  = sigReg ops initVal wen wdat
-        out  = (\w d r -> if w then d else r) <$> wen <*> wdat <*> reg
-    pure (out, wen)
+    pure (sigMux ops wen wdat reg, wen)
 
 -- | Wire @sig@ into the read-data mux at @offset@.
---
--- Each call extends the accumulated read-data signal with one combinational
--- select: if the read address equals @offset@, return @sig@, otherwise pass
--- through the previously accumulated value.  No list is used; the result is
--- a direct chain of @\<$\>@\/@\<*\>@ that Clash can synthesize.
 onRead
-    :: Applicative sig
-    => Word8
+    :: Word32
     -> sig dat
     -> PeriphDef p sig dat ()
 onRead off sig = PeriphDef $ do
-    PeriphEnv { peRdAddr = rd } <- ask
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
     lift $ modify $ \acc ->
-        let prev      = paRdData acc
-            newRdData = (\mrd s r -> case mrd of
-                            Just a | a == off -> s
-                            _                 -> r)
-                        <$> rd <*> sig <*> prev
-        in acc { paRdData = newRdData }
+        let prev = paRdData acc
+        in acc { paRdData = sigMux ops (biRdEqAddr bus off) sig prev }
 
 -- ---------------------------------------------------------------------------
 -- Structural metadata declarations
 -- ---------------------------------------------------------------------------
 
--- | Declare a monolithic register at @offset@.
 field :: RegWidth -> RegAccess -> Word8 -> String -> String
       -> PeriphDef p sig dat ()
 field width acc off name desc = PeriphDef $ lift $ modify $ \a ->
     a { paFields = paFields a ++ [FieldSpec off width acc name desc []] }
 
--- | Shorthand for an 8-bit monolithic register.
 field8 :: RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
 field8 = field RW8
 
--- | Declare a register whose word is split into named bit-fields.
 register :: RegWidth -> Word8 -> String -> String -> [BitField]
          -> PeriphDef p sig dat ()
 register width off name desc bfs = PeriphDef $ lift $ modify $ \a ->
     a { paFields = paFields a ++ [FieldSpec off width ReadWrite name desc bfs] }
 
--- | A single-bit sub-field inside a register.
 bitF :: RegAccess -> Word8 -> String -> String -> BitField
 bitF acc b = BitField b b acc
 
--- | A multi-bit sub-field inside a register.
 bitsF :: RegAccess -> Word8 -> Word8 -> String -> String -> BitField
 bitsF acc lo hi = BitField lo hi acc
 
 -- ---------------------------------------------------------------------------
--- Physical I/O typeclass
+-- Memory peripheral phantom types and block memory defs
 -- ---------------------------------------------------------------------------
 
--- | Associates a peripheral kind @p@ with its physical signal types.
-class HasPhysIO (p :: Type) where
-    -- | Byte size of the peripheral's address window.  Used by synthesis to
-    -- allocate address decode ranges without running the PeriphDef monad at
-    -- circuit-normalization time (which Clash cannot evaluate).
-    type PeriphSize p :: Nat
-    type PeriphSize p = 256
-    type PhysInputs  p (sig :: Type -> Type) :: Type
-    type PhysOutputs p (sig :: Type -> Type) :: Type
-    nullOutputs :: Proxy p -> PhysOutputs p NullSig
+-- | Phantom type tag for a synchronous block RAM peripheral.
+data RAM
+
+-- | Phantom type tag for a read-only ROM peripheral.
+data ROM
+
+-- | Block RAM peripheral for the isacle-hdl path.
+-- Occupies @size@ entries of the bus address space starting at the peripheral
+-- base.  Write is synchronous; read is asynchronous (combinational).
+blockRamDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+blockRamDef size initVals = PeriphDef $ do
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
+    let relRd  = biRelRdAddr bus
+        relWr  = biRelWrAddr bus
+        rdSel  = sigAddrLt ops relRd (fromIntegral size)
+        wrEn'  = sigAnd ops (biWrEn bus) (sigAddrLt ops relWr (fromIntegral size))
+        rdData = sigBlockMem ops size initVals wrEn' relWr (biWrData bus) relRd
+    lift $ modify $ \acc ->
+        acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }
+
+-- | ROM peripheral for the isacle-hdl path.
+-- Read is purely combinational; ignores all writes.
+blockRomDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+blockRomDef size initVals = PeriphDef $ do
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
+    let relRd  = biRelRdAddr bus
+        rdSel  = sigAddrLt ops relRd (fromIntegral size)
+        noWr   = sigAddrLt ops relRd 0   -- unsigned < 0 is always False
+        rdData = sigBlockMem ops size initVals noWr relRd (sigZero ops) relRd
+    lift $ modify $ \acc ->
+        acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }

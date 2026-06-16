@@ -1,62 +1,73 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE NoImplicitPrelude #-}
 module Main where
 
 import Prelude
-import Clash.Sized.BitVector (BitVector)
+import Numeric (showHex)
+import System.Exit (exitFailure)
 
-import Isacle.System
-import Isacle.CPU.Dummy (DummyCore(..))
-import Isacle.Periph.GPIO (gpioDef)
-import Isacle.Periph.UART (uartSpecPeriphDef)
+import Isacle.Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
+import Isacle.Hdl.Types (KnownDom(..), Sig(..))
+import Isacle.Hdl.Prim  (Unsigned)
+import Isacle.System.SystemDSL
+import Isacle.System.Generate (sysExtractMemoryMap, sysGenCHeader)
+
+assert :: String -> Bool -> IO ()
+assert msg False = putStrLn ("FAIL: " ++ msg) >> exitFailure
+assert msg True  = putStrLn ("ok:   " ++ msg)
 
 -- ---------------------------------------------------------------------------
--- System description
---
--- mkPeriph  — instantiate peripherals, binding physical signals
--- attach     — lay out the address space
--- mkRam      — instantiate a block RAM (monadic; synthesis-capable)
--- simpleHarvardCore — connect a CPU bus master
---
--- Returns GPIO port/ddr outputs so the top entity can expose them.
+-- Test clock domain
+-- ---------------------------------------------------------------------------
+
+data Clk
+instance KnownDom Clk where
+    domId _ = DomId "clk" 12000000 Rising ActiveHigh
+
+-- ---------------------------------------------------------------------------
+-- System description: UART at 0x0100, GPIO at 0x0300
 -- ---------------------------------------------------------------------------
 
 mySystem
-    :: SystemDSL m sig (BitVector 8)
-    => sig (BitVector 8)   -- ^ GPIO physical pin inputs
-    -> m ( sig (BitVector 8)   -- ^ GPIO PORT latch
-         , sig (BitVector 8)   -- ^ GPIO DDR
-         )
-mySystem gpioIn = do
-    (gpioBus, (gpioPort, gpioDdr)) <- mkPeriph (gpioDef gpioIn)
+    :: Sig Clk Bool
+    -> Sig Clk (Unsigned 8)
+    -> SysDSL Clk (Unsigned 8)
+              (Sig Clk Bool, Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
+mySystem rxPin gpioIn = do
+    uart <- createUart "uart" rxPin
+    gpio <- createGpio "gpio" gpioIn
 
-    rxPin <- externalIn @"uart_rx"
-    (uartBus, (txLine, _rxIrq, _txIrq)) <- mkPeriph (uartSpecPeriphDef rxPin)
-    externalOut @"uart_tx" txLine
+    ((tx, port, ddr), _rdData) <- createBus "databus" $ do
+        (txLine, _rxIrq, _txIrq) <- attachPeripheral 0x0100 uart
+        (gpioPort, gpioDdr)      <- attachPeripheral 0x0300 gpio
+        return (txLine, gpioPort, gpioDdr)
 
-    dataRam <- mkRam @2048
-
-    let codeBus = mkBus SimpleBus $
-            annotate @".text" $
-                attach 0x0000 (romBlock 0x2000)
-
-    let dataBus = mkBus SimpleBus $ do
-            label @"periph" $ attach 0x0100 $ do
-                label @"gpio" $ attach 0x00 gpioBus
-                label @"uart" $ attach 0x10 uartBus
-            label @"ram" $
-                attach 0x8000 dataRam
-
-    _ <- simpleHarvardCore DummyCore codeBus dataBus noIrqs
-    return (gpioPort, gpioDdr)
+    return (tx, port, ddr)
 
 -- ---------------------------------------------------------------------------
--- Run the spec interpreter and print artifacts
+-- Main: print artifacts and run sanity checks
 -- ---------------------------------------------------------------------------
 
 main :: IO ()
 main = do
-    let (_, spec) = runSpecWriter (mySystem NullSig)
-    putStrLn (extractMemoryMap spec)
-    putStrLn (genCHeader "memmap" spec)
+    let rxSig  = SExpr (pure 0) :: Sig Clk Bool
+        gpioSig = SExpr (pure 0) :: Sig Clk (Unsigned 8)
+        (_, _, doc) = runSystemDSL (mySystem rxSig gpioSig)
+
+    putStrLn "=== Memory Map ==="
+    putStr (sysExtractMemoryMap doc)
+
+    putStrLn "\n=== C Header ==="
+    putStr (sysGenCHeader "memmap" doc)
+
+    putStrLn "\n=== Bus entries ==="
+    mapM_ (\bs -> mapM_ (\pe ->
+                putStrLn (bsName bs ++ "  0x" ++ showHex (peBase pe) "  " ++ peName pe))
+            (bsEntries bs))
+        (sdBuses doc)
+
+    let entryCount = sum (map (length . bsEntries) (sdBuses doc))
+    putStrLn $ "\nTotal peripherals: " ++ show entryCount
+
+    assert "two peripherals registered" (entryCount == 2)
+    putStrLn "PASS"

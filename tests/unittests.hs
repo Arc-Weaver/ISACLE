@@ -1,22 +1,30 @@
+module Main where
+
 import Prelude
 
-import Test.Tasty
-
-import qualified Tests.Isacle.Harvard.ISA
-import qualified Tests.Isacle.Harvard.Pipeline
-import qualified Tests.Isacle.GPIO
-import qualified Tests.Isacle.Periph.Timer
-import qualified Tests.Isacle.Periph.UART
-import qualified Tests.Isacle.Periph.DMA
-import qualified Tests.Isacle.System.Bus
+import qualified Tests.Isacle.Harvard.ISA      as ISA
+import qualified Tests.Isacle.Harvard.Pipeline as Pipeline
+import qualified Tests.Isacle.GPIO             as GPIO
+import qualified Tests.Isacle.Periph.Timer     as Timer
+import qualified Tests.Isacle.Periph.UART      as UART
+import qualified Tests.Isacle.Periph.DMA       as DMA
+import qualified Tests.Isacle.System.Bus       as Bus
 
 main :: IO ()
-main = defaultMain $ testGroup "."
-  [ Tests.Isacle.Harvard.ISA.isaTests
-  , Tests.Isacle.Harvard.Pipeline.pipelineTests
-  , Tests.Isacle.GPIO.gpioTests
-  , Tests.Isacle.Periph.Timer.timerTests
-  , Tests.Isacle.Periph.UART.uartTests
-  , Tests.Isacle.Periph.DMA.dmaTests
-  , Tests.Isacle.System.Bus.busTests
-  ]
+main = do
+    putStrLn "=== ISACLE unit tests ==="
+    putStrLn "\n=== Harvard ISA ==="
+    ISA.runIsaTests
+    putStrLn "\n=== Harvard Pipeline ==="
+    Pipeline.runPipelineTests
+    putStrLn "\n=== GPIO peripheral ==="
+    GPIO.runGpioTests
+    putStrLn "\n=== Timer peripheral ==="
+    Timer.runTimerTests
+    putStrLn "\n=== UART peripheral ==="
+    UART.runUartTests
+    putStrLn "\n=== DMA engine ==="
+    DMA.runDmaTests
+    putStrLn "\n=== System Bus DSL ==="
+    Bus.runBusTests
+    putStrLn "\n=== all tests passed ==="

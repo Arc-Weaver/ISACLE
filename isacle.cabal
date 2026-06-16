@@ -2,8 +2,8 @@ cabal-version:       2.4
 name:                isacle
 version:             0.1
 license:             MIT
-synopsis:            ISA-agnostic Clash CPU core building blocks
-description:         Generic Clash modules extracted from clavr for building CPU cores.
+synopsis:            ISA-Agnostic Core Logic Environment — Clash-free HDL meta-compiler
+description:         System-level SoC DSL and peripheral register framework built on the isacle-hdl NetNode IR.
 category:            Hardware
 author:              Jonathan Fraser <jonathanfras@gmail.com>
 maintainer:          Jonathan Fraser <jonathanfras@gmail.com>
@@ -12,7 +12,6 @@ build-type:          Simple
 common common-options
   default-extensions:
     BangPatterns
-    BinaryLiterals
     ConstraintKinds
     DataKinds
     DefaultSignatures
@@ -44,97 +43,95 @@ common common-options
     TypeFamilies
     TypeOperators
     ViewPatterns
-    TemplateHaskell
-    QuasiQuotes
     NoImplicitPrelude
   ghc-options:
     -Wall -Wcompat
-    -haddock
-    -fplugin GHC.TypeLits.Extra.Solver
-    -fplugin GHC.TypeLits.Normalise
-    -fplugin GHC.TypeLits.KnownNat.Solver
-    -fexpose-all-unfoldings
-    -fno-worker-wrapper
-    -fno-unbox-small-strict-fields
-    -fno-unbox-strict-fields
   build-depends:
     base >= 4.12 && < 4.22,
-    clash-prelude >= 1.8.4 && < 1.11,
-    ghc-typelits-natnormalise,
-    ghc-typelits-extra,
-    ghc-typelits-knownnat,
-    template-haskell >= 2.16,
-    bytestring,
     containers >= 0.6,
     transformers >= 0.5
 
 library
   import: common-options
   hs-source-dirs: src
+  build-depends:
+    isacle-hdl,
+    mtl >= 2.2,
+    filepath >= 1.4,
+    template-haskell >= 2.16,
+    bytestring >= 0.10
   exposed-modules:
     Isacle
     Isacle.ALU
     Isacle.Bus
     Isacle.Decode
-    Isacle.Memory
-    Isacle.TH
     Isacle.Harvard
     Isacle.Harvard.ISA
     Isacle.Harvard.CPU
     Isacle.Harvard.Pipeline
+    Isacle.Memory
+    Isacle.TH
+    Isacle.CPU.Dummy
+    Isacle.Periph.DMA
     Isacle.Periph.GPIO
     Isacle.Periph.Interrupt
     Isacle.Periph.Timer
     Isacle.Periph.UART
-    Isacle.Periph.DMA
     Isacle.System
     Isacle.System.Spec
     Isacle.System.Periph
     Isacle.System.BusDef
     Isacle.System.BusArch
-    Isacle.System.Builder
-    Isacle.System.Circuit
+    Isacle.System.HdlCircuit
+    Isacle.System.HdlSystem
+    Isacle.System.SystemDSL
     Isacle.System.Generate
-    Isacle.System.Synth
-    Isacle.CPU.Dummy
   default-language: Haskell2010
 
--- Clash synthesis executable: cabal run isacle:clash -- Example.SimpleBusSynth --vhdl
-executable clash
+library isacle-hdl
   default-language: Haskell2010
-  main-is: bin/Clash.hs
-  build-depends: base, clash-ghc, isacle, isacle-examples
-  if !os(Windows)
-    ghc-options: -dynamic
-
-library isacle-examples
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: example
+  hs-source-dirs: src-hdl
+  default-extensions:
+    DataKinds
+    FlexibleContexts
+    FlexibleInstances
+    FunctionalDependencies
+    GADTs
+    GeneralizedNewtypeDeriving
+    KindSignatures
+    LambdaCase
+    MultiParamTypeClasses
+    PolyKinds
+    RankNTypes
+    RecordWildCards
+    RecursiveDo
+    ScopedTypeVariables
+    StandaloneDeriving
+    TupleSections
+    TypeApplications
+    TypeFamilies
+    TypeOperators
+    TemplateHaskell
+  ghc-options: -Wall -Wcompat
   exposed-modules:
-    Example.SimpleBusSynth
-    Example.CpuBusSynth
+    Isacle.Hdl.Net
+    Isacle.Hdl.Types
+    Isacle.Hdl.Prim
+    Isacle.Hdl.Class
+    Isacle.Hdl.Emit.Vhdl
   build-depends:
     base >= 4.12 && < 4.22,
-    clash-prelude >= 1.8.4 && < 1.11,
-    isacle
+    containers >= 0.6,
+    filepath >= 1.4,
+    text >= 1.2,
+    mtl >= 2.2,
+    transformers >= 0.5,
+    template-haskell >= 2.16
 
-executable test-dsl
+executable unittests
   import: common-options
   default-language: Haskell2010
   hs-source-dirs: tests
-  main-is: TestDSL.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    isacle,
-    clash-prelude >= 1.8.4 && < 1.11
-
-test-suite test-library
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  type: exitcode-stdio-1.0
-  ghc-options: -threaded
   main-is: unittests.hs
   other-modules:
     Tests.Isacle.Harvard.ISA
@@ -147,7 +144,43 @@ test-suite test-library
   build-depends:
     base >= 4.12 && < 4.22,
     isacle,
-    hedgehog,
-    tasty >= 1.2 && < 1.6,
-    tasty-hedgehog,
-    tasty-th
+    isacle-hdl
+
+executable test-dsl
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestDSL.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle-hdl
+
+executable test-hdl-system
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestHdlSystem.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle-hdl
+
+executable test-hdl
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestHdl.hs
+  default-extensions:
+    DataKinds
+    FlexibleContexts
+    FlexibleInstances
+    KindSignatures
+    RecursiveDo
+    ScopedTypeVariables
+    TypeApplications
+    TypeFamilies
+  ghc-options: -Wall -Wcompat
+  build-depends:
+    base >= 4.12 && < 4.22,
+    containers >= 0.6,
+    isacle-hdl

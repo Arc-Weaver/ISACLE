@@ -1,8 +1,8 @@
 module Isacle.Harvard.CPU where
 
-import Clash.Prelude
-import Isacle.Harvard.ISA
+import Prelude
 import Data.Maybe (fromMaybe)
+import Isacle.Harvard.ISA
 
 -- | Execute one decoded instruction using an 'ALU', advancing the program counter.
 --

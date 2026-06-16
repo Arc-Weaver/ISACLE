@@ -1,5 +1,6 @@
 -- NB: NoImplicitPrelude is active from cabal common-options.
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DataKinds           #-}
 module Isacle.System.BusDef
     ( -- * Bus topology monad
       BusDef
@@ -26,7 +27,7 @@ import Prelude
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 import GHC.TypeLits (KnownSymbol, symbolVal)
-import Clash.Prelude (Unsigned)
+import Isacle.Hdl.Prim (Unsigned)
 
 import Isacle.System.Spec (ComponentSpec(..))
 import Isacle.System.Periph (PeriphSpec)
@@ -47,28 +48,15 @@ data BusPeriph p = BusPeriph
 -- BusMaster — CPU / DMA bus master handle (symmetric with BusPeriph)
 -- ---------------------------------------------------------------------------
 
--- | Signals driven by a bus master onto the shared bus.
---
--- In the spec / documentation path (@sig = NullSig@) all fields are
--- 'NullSig' placeholders.  In the synthesis path (@sig = Signal dom@) they
--- carry the CPU's actual drive signals.
---
--- 'bmCodeAddr' is the program-counter output used to address the code ROM
--- (Harvard code bus); 'bmRdAddr' and 'bmWrBus' are the data-bus signals.
-data BusMaster sig dat = BusMaster
-    { bmRdAddr   :: sig (Maybe Word32)            -- ^ data-bus read address
-    , bmWrBus    :: sig (Maybe (Word32, dat))      -- ^ data-bus write command
-    , bmCodeAddr :: sig (Unsigned 16)              -- ^ code-bus address (PC)
+-- | Signals driven by a bus master onto the shared data bus.
+data BusMaster sig addrW dat = BusMaster
+    { bmRdAddr   :: sig (Maybe (Unsigned addrW))            -- ^ data-bus read address
+    , bmWrBus    :: sig (Maybe (Unsigned addrW, dat))       -- ^ data-bus write command
+    , bmCodeAddr :: sig (Unsigned addrW)                    -- ^ code-bus address (PC)
     }
 
 -- ---------------------------------------------------------------------------
 -- BusDef — Writer-style product: pure spec list paired with result value.
---
--- Unlike a State-based representation this never contains function values,
--- so Clash's InlineNonRep pass sees it as a plain data type rather than a
--- non-representable function closure.  runBusDef is a single pattern match;
--- attach and label are pure list transformations.  The monad laws hold via
--- the standard Writer/list-monoid argument.
 -- ---------------------------------------------------------------------------
 
 data BusDef a = BusDef [ComponentSpec] a

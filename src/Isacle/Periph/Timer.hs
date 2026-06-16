@@ -3,18 +3,22 @@ module Isacle.Periph.Timer
       Timer
       -- * PeriphDef description (single source of truth)
     , timerDef
-    , timerSpecPeriphDef
-      -- * Physical I/O instance
-      -- (instance HasPhysIO Timer)
-      -- * Backward-compatible circuit wrapper
+      -- * Counter state machine
+    , counterFSM
+      -- * Standalone circuit wrapper
     , timerUnit
     ) where
 
-import Clash.Prelude hiding (register)
+import Prelude
+import Data.Word (Word32)
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (natVal)
 
+import Isacle.Hdl.Net
+import Isacle.Hdl.Types
+import Isacle.Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.Circuit
-import Isacle.System.Spec (NullSig(..))
+import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -33,12 +37,11 @@ data Timer
 --   offset 2  OCR   read/write  output compare register
 --
 -- @cntSig@ is the current counter value driven by the counter state machine.
--- Writing TCNT presets the counter; the write-first bypass is handled by
--- 'counterFSM', not by the register itself.
+-- Writing TCNT presets the counter.
 --
 -- Returns @(tccr, ocr, tcntPreset, tcntWritten)@.
 timerDef
-    :: (Applicative sig, Num dat)
+    :: (Num dat)
     => sig dat                     -- ^ current counter value (from counter FSM)
     -> PeriphDef Timer sig dat (sig dat, sig dat, sig dat, sig Bool)
 timerDef cntSig = do
@@ -49,7 +52,7 @@ timerDef cntSig = do
 
     field8 ReadWrite 1 "TCNT" "Counter value (write to preset)"
     (tcntPreset, tcntWritten) <- onWriteStrobe 1 0
-    onRead 1 cntSig                 -- reads actual counter, not the preset register
+    onRead 1 cntSig
 
     field8 ReadWrite 2 "OCR" "Output compare register"
     ocr <- onWrite 2 0
@@ -57,97 +60,86 @@ timerDef cntSig = do
 
     return (tccr, ocr, tcntPreset, tcntWritten)
 
--- | Documentation-only 'PeriphDef' for use with 'mkPeriph' in spec interpreters.
-timerSpecPeriphDef :: (Applicative sig, Num dat) => PeriphDef Timer sig dat (PhysOutputs Timer sig)
-timerSpecPeriphDef = timerDef (pure 0) >> return (pure False, pure False)
-
 -- ---------------------------------------------------------------------------
--- Physical I/O instance
+-- Counter state machine
 -- ---------------------------------------------------------------------------
 
-instance HasPhysIO Timer where
-    type PeriphSize  Timer     = 3   -- TCCR(0), TCNT(1), OCR(2)
-    type PhysInputs  Timer sig = sig Bool           -- tick / count enable
-    type PhysOutputs Timer sig = (sig Bool, sig Bool)  -- (overflow IRQ, compare IRQ)
-    nullOutputs _ = (NullSig, NullSig)
-
--- ---------------------------------------------------------------------------
--- Counter state machine (synthesis only)
--- ---------------------------------------------------------------------------
-
--- | Clocked counter that implements the timer behaviour described by 'timerDef'.
+-- | Clocked counter implementing the timer behaviour described by 'timerDef'.
 --
--- The 'mealy' register breaks the mutual dependency between 'timerDef' and
--- the counter logic: @tccr@, @ocr@, and @tcntWritten@ are one cycle old from
--- the counter's perspective, which is identical to the previous hand-written
--- @mealy step (TimerRegs 0 0 0)@ implementation.
+--   Logic summary:
+--     * Normal mode: increment on tick; wrap 0xFF→0x00 and raise ovf.
+--     * CTC mode (bit 0 of tccr set): reset to 0 and raise cmp when cnt == ocr.
+--     * Writing TCNT presets the counter immediately (synchronous preset).
+--
+--   The counter register is implemented with an 'NReg' node using deferred
+--   emission so the feedback signal (cnt feeding timerDef feeding counterFSM
+--   feeding cnt) is safe.
 counterFSM
-    :: ( HiddenClockResetEnable dom
-       , NFDataX dat, Num dat, Eq dat, Bounded dat, Bits dat
-       )
-    => Signal dom Bool   -- ^ tick / count enable
-    -> Signal dom dat    -- ^ tccr (from timerDef)
-    -> Signal dom dat    -- ^ ocr  (from timerDef)
-    -> Signal dom dat    -- ^ tcntPreset (from timerDef onWriteStrobe)
-    -> Signal dom Bool   -- ^ tcntWritten (write strobe from timerDef)
-    -> (Signal dom dat, Signal dom Bool, Signal dom Bool)  -- ^ (cnt, ovf, cmp)
-counterFSM tick tccr ocr tcntPreset tcntWritten =
-    let step cnt (t, ctrl, cmp_val, preset, written) =
-            let ctcMode = testBit ctrl 0
-                atTop   = cnt == cmp_val
-                atMax   = cnt == maxBound
+    :: forall dom dat.
+       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Sig dom Bool           -- ^ tick / count enable
+    -> Sig dom dat            -- ^ TCCR (from timerDef)
+    -> Sig dom dat            -- ^ OCR  (from timerDef)
+    -> Sig dom dat            -- ^ TCNT preset value (from timerDef onWriteStrobe)
+    -> Sig dom Bool           -- ^ TCNT write strobe (from timerDef)
+    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
+counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
+  where
+    w       = fromIntegral (natVal (Proxy @(Width dat)))
+    domInfo = domId (Proxy @dom)
+    maxVal  = fromInteger (2^w - 1) :: Sig dom dat
 
-                cnt' = if written then preset
-                       else case (t, ctcMode) of
-                                (True, True)  | atTop -> 0
-                                (True, False) | atMax -> 0
-                                (True, _)             -> cnt + 1
-                                (False, _)            -> cnt
+    -- Counter register with deferred feedback.
+    cnt = SExpr $ do
+        outWid <- freshWire
+        let cntSig     = SWire outWid :: Sig dom dat
+            cntCtcMode = sigBit 0 tccr
+            cntAtTop   = cntSig .==. ocr
+            cntAtMax   = cntSig .==. maxVal
+            cntInc     = cntSig + 1
+            cntTick    = mux (cntCtcMode .&&. cntAtTop)
+                             0
+                             (mux (sigNot cntCtcMode .&&. cntAtMax)
+                                  0
+                                  cntInc)
+            cntNext    = mux tcntWritten tcntPreset (mux tick cntTick cntSig)
 
-                ovf = t && not ctcMode && atMax && not written
-                cmp = t && ctcMode     && atTop && not written
+        defer $ do
+            nextWid <- materialize cntNext
+            let initBits = SomeBits 0 w
+            emit $ NReg outWid nextWid Nothing initBits domInfo
+        pure outWid
 
-            -- Output cnt' (post-write, post-tick) so same-cycle reads see
-            -- the updated value — matches the behaviour of the original mealy.
-            in (cnt', (cnt', ovf, cmp))
+    ctcMode = sigBit 0 tccr
+    atTop   = cnt .==. ocr
+    atMax   = cnt .==. maxVal
 
-        out    = mealy step 0 (bundle (tick, tccr, ocr, tcntPreset, tcntWritten))
-        cntSig = fmap (\(c, _, _) -> c) out
-        ovfSig = fmap (\(_, o, _) -> o) out
-        cmpSig = fmap (\(_, _, c) -> c) out
-    in (cntSig, ovfSig, cmpSig)
+    ovf = tick .&&. sigNot ctcMode .&&. atMax  .&&. sigNot tcntWritten
+    cmp = tick .&&. ctcMode        .&&. atTop  .&&. sigNot tcntWritten
 
 -- ---------------------------------------------------------------------------
--- Backward-compatible circuit wrapper
+-- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
--- | Generic memory-mapped timer/counter, derived from 'timerDef'.
+-- | Memory-mapped timer built from 'timerDef' + 'counterFSM'.
 --
 --   Register layout:
 --     base + 0  TCCR  control
 --     base + 1  TCNT  counter (write = preset, read = current value)
 --     base + 2  OCR   output compare
 timerUnit
-    :: forall dom addr dat.
-       ( HiddenClockResetEnable dom
-       , Integral addr, Num addr, Eq addr
-       , NFDataX dat, Num dat, Eq dat, Bounded dat, Bits dat
-       )
-    => addr                               -- ^ base address
-    -> Signal dom Bool                    -- ^ tick / count enable
-    -> Signal dom (Maybe addr)            -- ^ bus read address
-    -> Signal dom (Maybe (addr, dat))     -- ^ bus write
-    -> ( Signal dom dat                   -- ^ read data
-       , Signal dom Bool                  -- ^ overflow interrupt
-       , Signal dom Bool                  -- ^ compare-match interrupt
-       )
-timerUnit base tick rdAddr wr = (rdData, ovfIrq, cmpIrq)
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Word32                          -- ^ peripheral base address
+    -> Sig dom Bool                    -- ^ tick / count enable
+    -> Sig dom (Unsigned 32)           -- ^ bus write address
+    -> Sig dom dat                     -- ^ bus write data
+    -> Sig dom Bool                    -- ^ bus write enable
+    -> Sig dom (Unsigned 32)           -- ^ bus read address
+    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (rdData, ovfIrq, cmpIrq)
+timerUnit base tick wrAddr wrData wrEn rdAddr = (rdData, ovfIrq, cmpIrq)
   where
-    -- Mutual recursion: cntSig feeds timerDef, timerDef feeds counterFSM,
-    -- counterFSM produces cntSig.  The mealy register in counterFSM breaks
-    -- the combinational cycle.
-    ((tccr, ocr, tcntPreset, tcntWritten), rdData) =
-        runSynthPeriph base wr rdAddr (timerDef cntSig)
-
-    (cntSig, ovfIrq, cmpIrq) =
+    bus = hdlBusIface wrAddr wrData wrEn rdAddr base
+    ((tccr, ocr, tcntPreset, tcntWritten), rdData, _spec) =
+        runPeriphDef hdlOps bus (timerDef cnt)
+    (cnt, ovfIrq, cmpIrq) =
         counterFSM tick tccr ocr tcntPreset tcntWritten

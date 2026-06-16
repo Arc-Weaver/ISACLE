@@ -3,16 +3,16 @@ module Isacle.Periph.GPIO
       GPIO
       -- * PeriphDef description (single source of truth)
     , gpioDef
-      -- * Physical I/O instance
-      -- (instance HasPhysIO GPIO)
-      -- * Backward-compatible circuit wrapper
+      -- * Standalone circuit wrapper
     , gpioUnit
     ) where
 
-import Clash.Prelude
+import Prelude
+import Data.Word (Word32)
+import Isacle.Hdl.Types (KnownDom, HdlType, Sig)
+import Isacle.Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.Circuit
-import Isacle.System.Spec (NullSig(..))
+import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -32,11 +32,8 @@ data GPIO
 --
 -- @pinsIn@ is the current physical pin-input signal.
 -- Returns @(PORT latch signal, DDR signal)@.
---
--- Generic over @dat@ so the same definition works for @BitVector 8@,
--- @Unsigned 8@, etc.
 gpioDef
-    :: (Applicative sig, Num dat)
+    :: (Num dat)
     => sig dat                                    -- ^ physical pin inputs
     -> PeriphDef GPIO sig dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
 gpioDef pinsIn = do
@@ -54,39 +51,22 @@ gpioDef pinsIn = do
     return (port, ddr)
 
 -- ---------------------------------------------------------------------------
--- Physical I/O instance
+-- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
-instance HasPhysIO GPIO where
-    type PeriphSize  GPIO     = 3   -- PIN(0), DDR(1), PORT(2)
-    type PhysInputs  GPIO sig = sig (BitVector 8)
-    type PhysOutputs GPIO sig = (sig (BitVector 8), sig (BitVector 8))  -- (PORT, DDR)
-    nullOutputs _ = (NullSig, NullSig)
-
--- ---------------------------------------------------------------------------
--- Backward-compatible circuit wrapper
--- ---------------------------------------------------------------------------
-
--- | Generic memory-mapped GPIO port with three consecutive registers.
---
---   Derived from 'gpioDef' via the synthesis runner; no hand-written
---   state machine.
---
---   Returns: @(read data, PORT output latch, DDR output-enable)@
+-- | Memory-mapped GPIO port built from 'gpioDef'.
+--   Accepts raw bus signals and returns (rdData, PORT latch, DDR).
+--   For use via 'attachPeripheral' in 'SysDSL' prefer 'createGpio'.
 gpioUnit
-    :: forall dom addr dat.
-       ( HiddenClockResetEnable dom
-       , Integral addr, Num addr, Eq addr
-       , NFDataX dat, Num dat
-       )
-    => addr                               -- ^ base address
-    -> Signal dom dat                     -- ^ physical pin inputs
-    -> Signal dom (Maybe addr)            -- ^ bus read address
-    -> Signal dom (Maybe (addr, dat))     -- ^ bus write
-    -> ( Signal dom dat                   -- ^ read data
-       , Signal dom dat                   -- ^ PORT output latch
-       , Signal dom dat                   -- ^ DDR output-enable
-       )
-gpioUnit base pinsIn rdAddr wr =
-    let ((port, ddr), rdData) = runSynthPeriph base wr rdAddr (gpioDef pinsIn)
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Word32                          -- ^ peripheral base address
+    -> Sig dom dat                     -- ^ physical pin inputs
+    -> Sig dom (Unsigned 32)           -- ^ bus write address
+    -> Sig dom dat                     -- ^ bus write data
+    -> Sig dom Bool                    -- ^ bus write enable
+    -> Sig dom (Unsigned 32)           -- ^ bus read address
+    -> (Sig dom dat, Sig dom dat, Sig dom dat)  -- ^ (rdData, PORT, DDR)
+gpioUnit base pinsIn wrAddr wrData wrEn rdAddr =
+    let bus              = hdlBusIface wrAddr wrData wrEn rdAddr base
+        ((port, ddr), rdData, _spec) = runPeriphDef hdlOps bus (gpioDef pinsIn)
     in (rdData, port, ddr)

@@ -1,9 +1,7 @@
 module Isacle
     ( module Isacle.Memory
-    , module Isacle.Decode
-    , module Isacle.Harvard
+    , module Isacle.Bus
     ) where
 
 import Isacle.Memory
-import Isacle.Decode
-import Isacle.Harvard
+import Isacle.Bus

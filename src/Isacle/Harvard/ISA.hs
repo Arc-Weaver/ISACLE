@@ -1,7 +1,8 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 module Isacle.Harvard.ISA where
 
-import Clash.Prelude
+import Prelude
+import GHC.TypeLits (Nat)
 
 -- ---------------------------------------------------------------------------
 -- Base ALU interface
@@ -44,8 +45,6 @@ class ALU state where
 --     - 2 for AVR (1- or 2-word instructions)
 --     - 3 for MCS-51 (1-, 2-, or 3-byte instructions)
 --
---   At synthesis time Clash can size the fetch buffer as
---   @Vec (MaxFetch state) (FetchWord state)@ with no wasted bits.
 --   The runtime decision of how many words a specific opcode needs is made
 --   by 'instrFetch'.
 class ALU state => ISA state where
@@ -107,14 +106,14 @@ class ALU state => ISA state where
 data FlushEvent romaddr
     = FlushBranch    romaddr    -- taken jump or branch
     | FlushInterrupt romaddr    -- interrupt accepted
-    deriving (Generic, NFDataX, Show, Eq)
+    deriving (Show, Eq)
 
 -- | A read-after-write memory hazard: an incoming load addresses a location
 --   that an in-flight store has not yet committed. The pipeline holds the
 --   load until the store completes.
 newtype StallEvent ramaddr
     = StallReadAfterWrite ramaddr
-    deriving (Generic, NFDataX, Show, Eq)
+    deriving (Show, Eq)
 
 -- | Flush and stall condition detection, fully separated from the pipeline
 --   mechanics that act on them.
@@ -156,4 +155,4 @@ data Slot instr stage
     | SReady   instr        -- decoded, awaiting execute
     | SMemRead instr        -- stalled: data RAM response in flight
     | SIsa     stage        -- ISA-specific multi-cycle in progress
-    deriving (Generic, NFDataX, Show, Eq)
+    deriving (Show, Eq)

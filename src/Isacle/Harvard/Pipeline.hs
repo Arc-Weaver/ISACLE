@@ -7,20 +7,20 @@ module Isacle.Harvard.Pipeline
     , pipelineStep
     ) where
 
-import Clash.Prelude hiding (read)
+import Prelude hiding (read)
 import Data.Maybe (fromMaybe)
 import Isacle.Harvard.ISA
 
--- | Pipeline register state: n+1 slots plus a latency countdown.
---   Slot 0 is the execute (head) end; slot n is the fetch (tail) end.
-data PipeState n instr stage = PipeState
-    { psSlots   :: Vec (n+1) (Slot instr stage)
-    , psLatency :: Unsigned 8
-    } deriving (Generic, NFDataX)
+-- | Pipeline register state: a list of slots (head = execute end, last = fetch end)
+--   plus a latency countdown.
+data PipeState instr stage = PipeState
+    { psSlots   :: [Slot instr stage]
+    , psLatency :: Int
+    } deriving (Show, Eq)
 
--- | All-bubble initial state.
-emptyPipe :: KnownNat n => PipeState n instr stage
-emptyPipe = PipeState (repeat SEmpty) 0
+-- | All-bubble initial state for a pipeline of @depth@ stages.
+emptyPipe :: Int -> PipeState instr stage
+emptyPipe depth = PipeState (replicate depth SEmpty) 0
 
 -- | Inputs consumed each cycle.
 data PipeInput state = PipeInput
@@ -37,27 +37,29 @@ data PipeOutput state = PipeOutput
     , pipeStalled  :: Bool                               -- True = freeze fetch
     }
 
--- | Advance the pipeline by one clock cycle (pure; wrap in 'mealy' for hardware).
+-- | Advance the pipeline by one clock cycle (pure; wrap in a clocked register
+--   for synthesis).
 --
--- Instructions flow from slot n (fetch end) toward slot 0 (execute end) each
--- cycle. On a flush the entire pipeline is cleared and the fetch unit is
--- redirected via 'pipeFlush'. On a stall 'pipeStalled' is True and the fetch
--- unit must re-present the same instruction next cycle.
+-- Instructions flow from the last slot (fetch end) toward the first slot
+-- (execute end) each cycle. On a flush the entire pipeline is cleared and the
+-- fetch unit is redirected via 'pipeFlush'. On a stall 'pipeStalled' is True
+-- and the fetch unit must re-present the same instruction next cycle.
 pipelineStep
-    :: forall state n. (HasFlush state, KnownNat n)
-    => PipeState n (Instr state) (IsaStage state)
+    :: forall state. HasFlush state
+    => PipeState (Instr state) (IsaStage state)
     -> state
     -> PipeInput state
-    -> ( PipeState n (Instr state) (IsaStage state)
+    -> ( PipeState (Instr state) (IsaStage state)
        , state
        , PipeOutput state
        )
 pipelineStep (PipeState slots lat) cpuState inp =
-    let execSlot = head slots
-        rest     = tail slots          -- Vec n
+    let depth    = length slots
+        execSlot = head slots
+        rest     = tail slots
         newSlot  = maybe SEmpty SReady (pipeInstr inp)
-        advance  = rest :< newSlot     -- Vec (n+1): shift toward head, admit new
-        cleared  = repeat SEmpty       -- Vec (n+1): all bubbles
+        advance  = rest ++ [newSlot]            -- shift toward head, admit new
+        cleared  = replicate depth SEmpty       -- all bubbles
     in case execSlot of
 
       -- ── Bubble ────────────────────────────────────────────────────────────
@@ -66,8 +68,7 @@ pipelineStep (PipeState slots lat) cpuState inp =
               Just irqAddr | interruptible cpuState ->
                   let (cpu', mstage) = acceptIrq cpuState irqAddr
                       headSlot       = maybe SEmpty SIsa mstage
-                      -- headSlot occupies slot 0; rest of pipeline is clear
-                      slots'         = headSlot :> (repeat SEmpty :: Vec n (Slot (Instr state) (IsaStage state)))
+                      slots'         = headSlot : replicate (depth - 1) SEmpty
                   in ( PipeState slots' 0
                      , cpu'
                      , PipeOutput Nothing Nothing (Just (FlushInterrupt irqAddr)) False
@@ -79,19 +80,16 @@ pipelineStep (PipeState slots lat) cpuState inp =
                   )
 
       -- ── ISA-specific multi-cycle stage ────────────────────────────────────
-      -- Note: isaStageStep's ROM-word argument is not yet wired through the
-      -- pipeline; ISA stages that need ROM data should carry it in their stage
-      -- type.
       SIsa stage ->
           let memVal       = fromMaybe
-                                 (errorX "Isacle.Harvard.Pipeline: ISA-specific stage requires a memory response, but none was provided")
-                                       (pipeMemResp inp)
+                                 (error "Pipeline: ISA stage needs memory response")
+                                 (pipeMemResp inp)
               (cpu', done) = isaStageStep stage
-                                 (errorX "Isacle.Harvard.Pipeline: ISA-specific stage ROM feed is intentionally unimplemented; carry any required ROM data in the stage value", memVal)
+                                 (error "Pipeline: ISA stage ROM feed unimplemented; carry ROM data in stage value", memVal)
                                  cpuState
           in case done of
               Left  stage' ->
-                  ( PipeState (SIsa stage' :> rest) 0
+                  ( PipeState (SIsa stage' : rest) 0
                   , cpu'
                   , PipeOutput Nothing Nothing Nothing True
                   )
@@ -105,7 +103,6 @@ pipelineStep (PipeState slots lat) cpuState inp =
       SMemRead instr ->
           case pipeMemResp inp of
               Nothing ->
-                  -- Hold everything until RAM responds.
                   ( PipeState slots lat
                   , cpuState
                   , PipeOutput Nothing Nothing Nothing True
@@ -124,8 +121,7 @@ pipelineStep (PipeState slots lat) cpuState inp =
 
       -- ── Instruction ready to execute ──────────────────────────────────────
       SReady instr ->
-          -- Count down any multi-cycle latency before executing.
-          let initialLat   = fromIntegral (max 1 (latency @state instr) - 1) :: Unsigned 8
+          let initialLat   = max 1 (latency @state instr) - 1
               effectiveLat = if lat == 0 then initialLat else lat - 1
           in if effectiveLat > 0
               then
@@ -135,21 +131,18 @@ pipelineStep (PipeState slots lat) cpuState inp =
                   )
               else case toIsaStage instr cpuState of
                   Just stage ->
-                      -- Hand off to ISA-specific multi-cycle execution.
-                      ( PipeState (SIsa stage :> rest) 0
+                      ( PipeState (SIsa stage : rest) 0
                       , cpuState
                       , PipeOutput Nothing Nothing Nothing True
                       )
                   Nothing ->
                       case read instr cpuState of
                           Just addr ->
-                              -- Issue data RAM read; slot becomes SMemRead.
-                              ( PipeState (SMemRead instr :> rest) 0
+                              ( PipeState (SMemRead instr : rest) 0
                               , cpuState
                               , PipeOutput (Just addr) Nothing Nothing True
                               )
                           Nothing ->
-                              -- Single-cycle execute.
                               let cpu'   = compute instr Nothing cpuState
                                   mwrite = write instr cpu'
                                   mflush = flushCondition instr cpu'

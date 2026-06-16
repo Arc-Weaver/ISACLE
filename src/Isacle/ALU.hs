@@ -1,6 +1,6 @@
 module Isacle.ALU where
 
-import Data.Maybe (Maybe)
+import Prelude (Maybe)
 
 -- | Generic record-based CPU ALU interface.
 --

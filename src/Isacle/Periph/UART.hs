@@ -3,50 +3,28 @@ module Isacle.Periph.UART
       UART
       -- * PeriphDef description (single source of truth)
     , uartDef
-    , uartSpecPeriphDef
-      -- * Physical I/O instance
-      -- (instance HasPhysIO UART)
-      -- * Backward-compatible circuit wrapper
+      -- * Serial state machine
+    , serialFSM
+      -- * Standalone circuit wrapper
     , uartUnit
     ) where
 
-import Clash.Prelude hiding (register)
-import Data.Word (Word8)
+import Prelude
+import Data.Word (Word32)
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (natVal)
 
+import Isacle.Hdl.Net
+import Isacle.Hdl.Types
+import Isacle.Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.Circuit
-import Isacle.System.Spec (NullSig(..))
+import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
 -- ---------------------------------------------------------------------------
 
 data UART
-
--- ---------------------------------------------------------------------------
--- Internal state types (serial FSM)
--- ---------------------------------------------------------------------------
-
-data TxState dat
-    = TxIdle
-    | TxStart  dat (Unsigned 16)
-    | TxBit    dat (Unsigned 4) (Unsigned 16)
-    | TxStop   (Unsigned 16)
-    deriving (Generic, NFDataX, Show, Eq)
-
-data RxState dat
-    = RxIdle
-    | RxStart  (Unsigned 16)
-    | RxBit    (BitVector 8) (Unsigned 4) (Unsigned 16)
-    | RxDone   dat
-    deriving (Generic, NFDataX, Show, Eq)
-
-data SerialState dat = SerialState
-    { ssTxState :: TxState dat
-    , ssRxState :: RxState dat
-    , ssTxBuf   :: Maybe dat
-    , ssRxBuf   :: Maybe dat
-    } deriving (Generic, NFDataX, Show)
 
 -- ---------------------------------------------------------------------------
 -- Register map — single source of truth
@@ -62,20 +40,20 @@ data SerialState dat = SerialState
 -- Returns @(txData, txStrobe, baud)@ for the serial FSM.
 -- @txStrobe@ pulses True on the cycle the CPU writes to UDR.
 uartDef
-    :: (Applicative sig, Num dat)
+    :: (Num dat)
     => sig dat    -- ^ status register value (driven by serial FSM)
     -> sig dat    -- ^ RX buffer (read side of UDR, driven by serial FSM)
     -> PeriphDef UART sig dat (sig dat, sig Bool, sig dat)
 uartDef stat rxData = do
     field8 ReadWrite 0 "UDR" "TX write / RX read (reads return Rx buffer)"
     (txData, txStrobe) <- onWriteStrobe 0 0
-    onRead 0 rxData                -- reads RX buffer, not TX register
+    onRead 0 rxData
 
     register RW8 1 "USR" "Status"
         [ bitF ReadOnly 0 "UDRE" "TX data register empty (safe to write)"
         , bitF ReadOnly 1 "RXC"  "RX complete (received byte ready)"
         ]
-    onRead 1 stat                  -- read-only: no onWrite
+    onRead 1 stat
 
     field8 ReadWrite 2 "UBRR" "Baud rate divisor (system clocks per baud period)"
     baud <- onWrite 2 0
@@ -83,182 +61,386 @@ uartDef stat rxData = do
 
     return (txData, txStrobe, baud)
 
--- | Spec-mode 'PeriphDef' for use with 'mkPeriph'.
+-- ---------------------------------------------------------------------------
+-- Serial state machine
+-- ---------------------------------------------------------------------------
 --
--- Accepts the RX pin input (for type compatibility with the synthesis path)
--- but uses stub signals in the spec interpreter.  Returns @(TX, rxIrq, txIrq)@
--- as stubs; the physical pins should be wired with 'externalIn'\/'externalOut'
--- at the 'SystemDSL' level.
+-- TX states (2-bit): 0=Idle  1=Start  2=Bit  3=Stop
+-- RX states (2-bit): 0=Idle  1=Start  2=Bit  3=Done
 --
--- For actual synthesis circuits use 'uartUnit' directly.
-uartSpecPeriphDef
-    :: Applicative sig
-    => sig Bool   -- ^ RX serial line (unused in spec mode)
-    -> PeriphDef UART sig (BitVector 8) (PhysOutputs UART sig)
-uartSpecPeriphDef _rxPin =
-    uartDef (pure 0) (pure 0) >> return (pure False, pure False, pure False)
+-- Internal registers (all Sig dom (Unsigned N), sized to match):
+--   txSt     2-bit state
+--   txBitN   4-bit current bit index 0-7
+--   txCtr   16-bit baud counter
+--   txBuf    dat-bit TX buffer  (txBufVld 1-bit valid flag)
+--   rxSt     2-bit state
+--   rxBitN   4-bit current bit index 0-7
+--   rxCtr   16-bit baud counter
+--   rxAcc    dat-bit accumulator
+--   rxBuf    dat-bit RX buffer  (rxBufVld 1-bit valid flag)
 
--- ---------------------------------------------------------------------------
--- Physical I/O instance
--- ---------------------------------------------------------------------------
+-- | Logical-AND two Bool signals; short alias.
+(.&.) :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
+(.&.) = (.&&.)
+infixr 3 .&.
 
-instance HasPhysIO UART where
-    type PeriphSize  UART     = 3   -- UDR(0), USR(1), UBRR(2)
-    type PhysInputs  UART sig = sig Bool
-    type PhysOutputs UART sig = (sig Bool, sig Bool, sig Bool)  -- (TX, rxIrq, txIrq)
-    nullOutputs _ = (NullSig, NullSig, NullSig)
+-- | 'mux' with the branches swapped for readability (if cond then t else f).
+ifSig :: Sig dom Bool -> Sig dom a -> Sig dom a -> Sig dom a
+ifSig = mux
 
--- ---------------------------------------------------------------------------
--- Serial state machine (synthesis only)
--- ---------------------------------------------------------------------------
+-- | @sigEqLit n s@ — True when signal @s@ (treated as unsigned integer) equals
+--   the compile-time integer @n@.
+sigEqLit :: Int -> Sig dom a -> Sig dom Bool
+sigEqLit n s = SExpr $ do
+    ws  <- materialize s
+    wl  <- freshWire
+    emit $ NComb wl (PLit (fromIntegral n) 16) []
+    out <- freshWire
+    emit $ NComb out PEq [ws, wl]
+    pure out
 
+-- | @sigGeLit n s@ — True when signal @s@ >= compile-time @n@ (unsigned).
+--   Implemented as NOT (s < n).
+sigGeLit :: Int -> Sig dom a -> Sig dom Bool
+sigGeLit n s = sigNot (sigLtLit n s)
+  where
+    sigLtLit v x = SExpr $ do
+        wx <- materialize x
+        wl <- freshWire
+        emit $ NComb wl (PLit (fromIntegral v) 16) []
+        out <- freshWire
+        emit $ NComb out PLt [wx, wl]
+        pure out
+
+-- | Resize a signal to @bw@ bits (truncate or zero-extend).
+sigResize :: Int -> Sig dom a -> Sig dom b
+sigResize bw s = SExpr $ do
+    ws  <- materialize s
+    out <- freshWire
+    emit $ NComb out (PResize bw) [ws]
+    pure out
+
+-- | Extract a single data bit at a dynamic index: bit 0 of (val >> idx).
+sigBitDyn' :: Sig dom a -> Sig dom b -> Sig dom Bool
+sigBitDyn' val idx = sigBit 0 (sigShiftRDyn val idx)
+
+-- | OR two signals of the same type.
+sigOrV :: Sig dom a -> Sig dom a -> Sig dom a
+sigOrV a b = SExpr $ do
+    wa <- materialize a
+    wb <- materialize b
+    out <- freshWire
+    emit $ NComb out POr [wa, wb]
+    pure out
+
+-- | Set bit @idx@ in a value: val .|. (1 << idx).
+sigSetBit :: Sig dom a -> Sig dom b -> Sig dom a
+sigSetBit val idx =
+    let one = SExpr $ do
+            out <- freshWire
+            emit $ NComb out (PLit 1 8) []
+            pure out
+        mask = sigShiftLDyn (one :: Sig dom a) idx
+    in sigOrV val mask
+
+-- | Literal signal of a given width.
+litW :: Integer -> Int -> Sig dom a
+litW v bw = SExpr $ do
+    out <- freshWire
+    emit $ NComb out (PLit v bw) []
+    pure out
+
+-- | 1-bit True literal.
+sigTrue :: Sig dom Bool
+sigTrue = SExpr $ do
+    out <- freshWire
+    emit $ NComb out (PLit 1 1) []
+    pure out
+
+-- | 1-bit False literal.
+sigFalse :: Sig dom Bool
+sigFalse = SExpr $ do
+    out <- freshWire
+    emit $ NComb out (PLit 0 1) []
+    pure out
+
+-- | Serial 8N1 state machine.
 serialFSM
-    :: ( HiddenClockResetEnable dom
-       , NFDataX dat, Num dat, Bits dat, BitPack dat, BitSize dat ~ 8
+    :: forall dom dat.
+       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Sig dom dat    -- ^ baud divisor (from uartDef UBRR)
+    -> Sig dom dat    -- ^ txData byte to transmit (from uartDef UDR write)
+    -> Sig dom Bool   -- ^ txStrobe: True when CPU writes UDR
+    -> Sig dom Bool   -- ^ RX serial line
+    -> ( Sig dom Bool  -- ^ TX serial line
+       , Sig dom dat   -- ^ status register (bit0=UDRE, bit1=RXC)
+       , Sig dom dat   -- ^ RX buffer
+       , Sig dom Bool  -- ^ RX complete IRQ
+       , Sig dom Bool  -- ^ TX empty (UDRE) IRQ
        )
-    => Unsigned 16                          -- ^ initial baud divisor
-    -> Signal dom dat                       -- ^ baud register (from uartDef)
-    -> Signal dom dat                       -- ^ txData: byte to transmit (from uartDef)
-    -> Signal dom Bool                      -- ^ txStrobe: True when CPU writes UDR
-    -> Signal dom Bool                      -- ^ UDR read strobe (clears RX buffer)
-    -> Signal dom Bool                      -- ^ RX serial line
-    -> ( Signal dom Bool                    -- ^ TX serial line
-       , Signal dom dat                     -- ^ status register value
-       , Signal dom dat                     -- ^ RX buffer (read side of UDR)
-       , Signal dom Bool                    -- ^ RX complete IRQ
-       , Signal dom Bool                    -- ^ TX empty (UDRE) IRQ
-       )
-serialFSM initBrr baud txData txStrobe udrRead rxLine =
-    let initSt = SerialState TxIdle RxIdle Nothing Nothing
+serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq)
+  where
+    dom    = domId (Proxy @dom)
+    datW   = fromIntegral (natVal (Proxy @(Width dat)))
+    brr16  = sigResize 16 baud :: Sig dom (Unsigned 16)
 
-        step st (rxBit, txStr, txDat, brrVal, udrRd) =
-            let brr = unpack (resize (pack brrVal)) :: Unsigned 16
+    -- -----------------------------------------------------------------------
+    -- TX state machine
+    -- -----------------------------------------------------------------------
 
-                -- Latch TX byte into buffer on write strobe
-                st1 = if txStr then st { ssTxBuf = Just txDat } else st
+    -- Registers: pre-allocate output wires, defer NReg emission.
+    txSt :: Sig dom (Unsigned 2)
+    txSt = SExpr $ do
+        outWid <- freshWire
+        let stSig    = SWire outWid :: Sig dom (Unsigned 2)
+            isIdle   = sigEqLit 0 stSig
+            isStart  = sigEqLit 1 stSig
+            isBit    = sigEqLit 2 stSig
+            isStop   = sigEqLit 3 stSig
+            ctrDone  = sigGeLit 1 (txCtr - brr16)  -- ctr+1 >= brr  ↔  ctr >= brr-1
+            bit7Done = sigGeLit 7 txBitN
+            startFSM = isIdle .&. txBufVld
+            stNext   = ifSig startFSM            (litW 1 2)
+                     $ ifSig (isStart .&. ctrDone) (litW 2 2)
+                     $ ifSig (isBit   .&. ctrDone .&. bit7Done) (litW 3 2)
+                     $ ifSig (isStop  .&. ctrDone) (litW 0 2)
+                       stSig
+        defer $ do
+            nextWid <- materialize stNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 2) dom
+        pure outWid
 
-                -- TX FSM runs on PRE-write txBuf (so TX starts one cycle
-                -- after the CPU writes, giving UDRE one visible-low cycle)
-                (txSt', txBit, txConsumed) = stepTx (ssTxState st) (ssTxBuf st) brr
-                st2 = st1 { ssTxState = txSt'
-                           , ssTxBuf   = if txConsumed then Nothing else ssTxBuf st1 }
+    txCtr :: Sig dom (Unsigned 16)
+    txCtr = SExpr $ do
+        outWid <- freshWire
+        let ctrSig   = SWire outWid :: Sig dom (Unsigned 16)
+            isIdle   = sigEqLit 0 (txSt :: Sig dom (Unsigned 2))
+            isStart  = sigEqLit 1 (txSt :: Sig dom (Unsigned 2))
+            isBit    = sigEqLit 2 (txSt :: Sig dom (Unsigned 2))
+            isStop   = sigEqLit 3 (txSt :: Sig dom (Unsigned 2))
+            ctrDone  = sigGeLit 1 (ctrSig - brr16)
+            reset    =  (isIdle  .&. txBufVld)
+                    .||. (isStart .&. ctrDone)
+                    .||. (isBit   .&. ctrDone)
+                    .||. (isStop  .&. ctrDone)
+            ctrNext  = ifSig reset 0 (ctrSig + 1)
+        defer $ do
+            nextWid <- materialize ctrNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 16) dom
+        pure outWid
 
-                -- Advance RX FSM
-                (rxSt', mRxByte) = stepRx (ssRxState st2) rxBit brr
-                st3 = st2 { ssRxState = rxSt'
-                           , ssRxBuf   = case mRxByte of
-                                             Just b  -> Just b
-                                             Nothing -> ssRxBuf st2 }
+    txBitN :: Sig dom (Unsigned 4)
+    txBitN = SExpr $ do
+        outWid <- freshWire
+        let bitSig  = SWire outWid :: Sig dom (Unsigned 4)
+            isBit   = sigEqLit 2 (txSt :: Sig dom (Unsigned 2))
+            ctrDone = sigGeLit 1 ((txCtr :: Sig dom (Unsigned 16)) - brr16)
+            advance = isBit .&. ctrDone
+            bitNext = ifSig advance (bitSig + 1) bitSig
+            -- Reset to 0 when leaving Bit state
+            leaving = isBit .&. ctrDone .&. sigGeLit 7 bitSig
+            bitFin  = ifSig leaving 0 bitNext
+        defer $ do
+            nextWid <- materialize bitFin
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 4) dom
+        pure outWid
 
-                -- Clear RX buffer when CPU reads UDR
-                st4 = if udrRd then st3 { ssRxBuf = Nothing } else st3
+    -- TX buffer
+    txBufVld :: Sig dom Bool
+    txBufVld = SExpr $ do
+        outWid <- freshWire
+        let vldSig  = SWire outWid :: Sig dom Bool
+            consume = sigEqLit 0 (txSt :: Sig dom (Unsigned 2)) .&. vldSig
+            vldNext = ifSig txStrobe sigTrue
+                    $ ifSig consume  sigFalse
+                      vldSig
+        defer $ do
+            nextWid <- materialize vldNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 1) dom
+        pure outWid
 
-                udre   = case ssTxBuf st4 of Nothing -> True; _ -> False
-                rxc    = case ssRxBuf st4 of Just _  -> True; _ -> False
-                statV  = (if udre then 1 else 0) .|. (if rxc then 2 else 0)
-                rxBufV = maybe 0 id (ssRxBuf st4)
+    txBufData :: Sig dom dat
+    txBufData = SExpr $ do
+        outWid <- freshWire
+        let datSig  = SWire outWid :: Sig dom dat
+            datNext = ifSig txStrobe txDataIn datSig
+        defer $ do
+            nextWid <- materialize datNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 datW) dom
+        pure outWid
 
-            in (st4, (txBit, statV, rxBufV, rxc, udre))
+    -- TX current shift byte (loaded from buffer when entering Start)
+    txShift :: Sig dom dat
+    txShift = SExpr $ do
+        outWid <- freshWire
+        let shSig   = SWire outWid :: Sig dom dat
+            loadIt  = sigEqLit 0 (txSt :: Sig dom (Unsigned 2)) .&. txBufVld
+            shNext  = ifSig loadIt txBufData shSig
+        defer $ do
+            nextWid <- materialize shNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 datW) dom
+        pure outWid
 
-        out    = mealy step initSt (bundle (rxLine, txStrobe, txData, baud, udrRead))
-        txLine = fmap (\(t, _, _, _, _) -> t) out
-        statS  = fmap (\(_, s, _, _, _) -> s) out
-        rxBufS = fmap (\(_, _, r, _, _) -> r) out
-        rxIrq  = fmap (\(_, _, _, r, _) -> r) out
-        txIrq  = fmap (\(_, _, _, _, t) -> t) out
-    in (txLine, statS, rxBufS, rxIrq, txIrq)
+    -- TX output: idle/stop = '1', start = '0', bit = bit[bitN] of shift reg
+    txBitOut :: Sig dom Bool
+    txBitOut =
+        let isStart = sigEqLit 1 (txSt :: Sig dom (Unsigned 2))
+            isBit   = sigEqLit 2 (txSt :: Sig dom (Unsigned 2))
+            datBit  = sigBitDyn' txShift (sigResize 4 txBitN :: Sig dom dat)
+        in ifSig isStart sigFalse
+         $ ifSig isBit   datBit
+           sigTrue
+
+    txLine = txBitOut
+
+    -- -----------------------------------------------------------------------
+    -- RX state machine
+    -- -----------------------------------------------------------------------
+
+    rxSt :: Sig dom (Unsigned 2)
+    rxSt = SExpr $ do
+        outWid <- freshWire
+        let stSig    = SWire outWid :: Sig dom (Unsigned 2)
+            isIdle   = sigEqLit 0 stSig
+            isStart  = sigEqLit 1 stSig
+            isBit    = sigEqLit 2 stSig
+            ctrDone  = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
+            halfDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - (sigResize 16 (baud `div'` 2)))
+            bit7Done = sigGeLit 7 (rxBitN :: Sig dom (Unsigned 4))
+            startRx  = isIdle .&. sigNot rxLine
+            stNext   = ifSig startRx            (litW 1 2)
+                     $ ifSig (isStart .&. halfDone) (litW 2 2)
+                     $ ifSig (isBit .&. ctrDone .&. bit7Done) (litW 0 2)
+                     $ ifSig (isBit .&. ctrDone) stSig
+                       stSig
+        defer $ do
+            nextWid <- materialize stNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 2) dom
+        pure outWid
+
+    -- baud/2 via PShiftR 1
+    div' :: Sig dom dat -> Integer -> Sig dom dat
+    div' s _ = sigShiftR 1 s
+
+    rxCtr :: Sig dom (Unsigned 16)
+    rxCtr = SExpr $ do
+        outWid <- freshWire
+        let ctrSig   = SWire outWid :: Sig dom (Unsigned 16)
+            isIdle   = sigEqLit 0 (rxSt :: Sig dom (Unsigned 2))
+            isStart  = sigEqLit 1 (rxSt :: Sig dom (Unsigned 2))
+            isBit    = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
+            halfDone = sigGeLit 1 (ctrSig - sigResize 16 (baud `div'` 2))
+            ctrDone  = sigGeLit 1 (ctrSig - brr16)
+            reset    =  (isIdle  .&. sigNot rxLine)
+                    .||. (isStart .&. halfDone)
+                    .||. (isBit   .&. ctrDone)
+            ctrNext  = ifSig reset 0 (ctrSig + 1)
+        defer $ do
+            nextWid <- materialize ctrNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 16) dom
+        pure outWid
+
+    rxBitN :: Sig dom (Unsigned 4)
+    rxBitN = SExpr $ do
+        outWid <- freshWire
+        let bitSig  = SWire outWid :: Sig dom (Unsigned 4)
+            isBit   = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
+            ctrDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
+            advance = isBit .&. ctrDone
+            bitNext = ifSig advance (bitSig + 1) bitSig
+            leaving = isBit .&. ctrDone .&. sigGeLit 7 bitSig
+            bitFin  = ifSig leaving 0 bitNext
+        defer $ do
+            nextWid <- materialize bitFin
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 4) dom
+        pure outWid
+
+    rxAcc :: Sig dom dat
+    rxAcc = SExpr $ do
+        outWid <- freshWire
+        let accSig  = SWire outWid :: Sig dom dat
+            isBit   = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
+            ctrDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
+            sample  = isBit .&. ctrDone
+            rxBitIdx = sigResize datW rxBitN :: Sig dom dat
+            accSet  = sigSetBit accSig rxBitIdx
+            accNext = ifSig sample
+                          (ifSig rxLine accSet accSig)
+                          accSig
+            -- Clear accumulator when starting a new byte (entering new reception)
+            leaving = isBit .&. ctrDone .&. sigGeLit 7 rxBitN
+            accFin  = ifSig leaving (litW 0 datW) accNext
+        defer $ do
+            nextWid <- materialize accFin
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 datW) dom
+        pure outWid
+
+    -- RX buffer: latched when last bit received
+    rxBufVld :: Sig dom Bool
+    rxBufVld = SExpr $ do
+        outWid <- freshWire
+        let vldSig  = SWire outWid :: Sig dom Bool
+            isBit   = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
+            ctrDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
+            done    = isBit .&. ctrDone .&. sigGeLit 7 rxBitN
+            -- Buffer stays valid until a new byte arrives
+            vldNext = ifSig done sigTrue vldSig
+        defer $ do
+            nextWid <- materialize vldNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 1) dom
+        pure outWid
+
+    rxBuf :: Sig dom dat
+    rxBuf = SExpr $ do
+        outWid <- freshWire
+        let bufSig  = SWire outWid :: Sig dom dat
+            isBit   = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
+            ctrDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
+            done    = isBit .&. ctrDone .&. sigGeLit 7 rxBitN
+            bufNext = ifSig done rxAcc bufSig
+        defer $ do
+            nextWid <- materialize bufNext
+            emit $ NReg outWid nextWid Nothing (SomeBits 0 datW) dom
+        pure outWid
+
+    -- -----------------------------------------------------------------------
+    -- Status / IRQ outputs
+    -- -----------------------------------------------------------------------
+
+    udreIrq = sigNot txBufVld  -- UDRE: TX buffer empty
+    rxIrq   = rxBufVld
+
+    -- status byte: bit 0 = UDRE, bit 1 = RXC
+    udreB :: Sig dom dat
+    udreB = ifSig udreIrq (litW 1 datW) (litW 0 datW)
+    rxcB  :: Sig dom dat
+    rxcB  = ifSig rxIrq   (litW 2 datW) (litW 0 datW)
+    status = sigOrV udreB rxcB
 
 -- ---------------------------------------------------------------------------
--- TX state machine
+-- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
-stepTx :: (Num dat, BitPack dat, BitSize dat ~ 8)
-       => TxState dat -> Maybe dat -> Unsigned 16
-       -> (TxState dat, Bool, Bool)
-stepTx TxIdle (Just byte) _   = (TxStart byte 0, True, True)
-stepTx TxIdle Nothing     _   = (TxIdle,         True, False)
-
-stepTx (TxStart byte ctr) _ brr
-    | ctr + 1 >= brr = (TxBit byte 0 0,      False, False)
-    | otherwise      = (TxStart byte (ctr+1), False, False)
-
-stepTx (TxBit byte bitN ctr) _ brr
-    | ctr + 1 >= brr =
-        let bitVal = testBit (pack byte) (fromIntegral bitN)
-            bitN'  = bitN + 1
-        in (if bitN' >= 8 then TxStop 0 else TxBit byte bitN' 0, bitVal, False)
-    | otherwise =
-        (TxBit byte bitN (ctr+1), testBit (pack byte) (fromIntegral bitN), False)
-
-stepTx (TxStop ctr) _ brr
-    | ctr + 1 >= brr = (TxIdle,           True, False)
-    | otherwise      = (TxStop (ctr + 1), True, False)
-
--- ---------------------------------------------------------------------------
--- RX state machine
--- ---------------------------------------------------------------------------
-
-stepRx :: (BitPack dat, BitSize dat ~ 8)
-       => RxState dat -> Bool -> Unsigned 16
-       -> (RxState dat, Maybe dat)
-stepRx RxIdle rxBit _
-    | not rxBit = (RxStart 0, Nothing)
-    | otherwise = (RxIdle,    Nothing)
-
-stepRx (RxStart ctr) _ brr
-    | ctr + 1 >= brr `shiftR` 1 = (RxBit 0 0 0, Nothing)
-    | otherwise                  = (RxStart (ctr + 1), Nothing)
-
-stepRx (RxBit acc bitN ctr) rxBit brr
-    | ctr + 1 >= brr =
-        let acc'  = if rxBit then acc .|. (1 `shiftL` fromIntegral bitN) else acc
-            bitN' = bitN + 1
-        in if bitN' >= 8
-           then (RxIdle, Just (unpack acc'))
-           else (RxBit acc' bitN' 0, Nothing)
-    | otherwise = (RxBit acc bitN (ctr + 1), Nothing)
-
-stepRx (RxDone byte) _ _ = (RxIdle, Just byte)
-
--- ---------------------------------------------------------------------------
--- Backward-compatible circuit wrapper
--- ---------------------------------------------------------------------------
-
--- | Generic memory-mapped 8N1 UART, derived from 'uartDef' + 'serialFSM'.
+-- | Memory-mapped 8N1 UART built from 'uartDef' + 'serialFSM'.
 --
 --   Register layout:
---     base + 0  UDR   data register (TX on write, RX on read)
+--     base + 0  UDR   data (TX on write, RX on read)
 --     base + 1  USR   status (read-only)
 --     base + 2  UBRR  baud rate divisor
 uartUnit
-    :: forall dom addr dat.
-       ( HiddenClockResetEnable dom
-       , Integral addr, Num addr, Eq addr
-       , NFDataX dat, Num dat, Bits dat, BitPack dat, BitSize dat ~ 8
-       )
-    => addr                               -- ^ base address
-    -> Unsigned 16                        -- ^ initial baud divisor
-    -> Signal dom Bool                    -- ^ RX serial line
-    -> Signal dom (Maybe addr)            -- ^ bus read address
-    -> Signal dom (Maybe (addr, dat))     -- ^ bus write
-    -> ( Signal dom dat                   -- ^ read data
-       , Signal dom Bool                  -- ^ TX serial line
-       , Signal dom Bool                  -- ^ RX complete IRQ
-       , Signal dom Bool                  -- ^ TX empty (UDRE) IRQ
-       )
-uartUnit base initBrr rxLine rdAddr wr = (rdData, txLine, rxIrq, txIrq)
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Word32                          -- ^ peripheral base address
+    -> Sig dom Bool                    -- ^ RX serial line
+    -> Sig dom (Unsigned 32)           -- ^ bus write address
+    -> Sig dom dat                     -- ^ bus write data
+    -> Sig dom Bool                    -- ^ bus write enable
+    -> Sig dom (Unsigned 32)           -- ^ bus read address
+    -> (Sig dom dat, Sig dom Bool, Sig dom Bool, Sig dom Bool)
+       -- ^ (rdData, txLine, rxIrq, txIrq)
+uartUnit base rxLine wrAddr wrData wrEn rdAddr = (rdData, txLine, rxIrq, txIrq)
   where
-    -- UDR read strobe: True when CPU reads offset 0
-    udrRead :: Signal dom Bool
-    udrRead = fmap isUdrRead rdAddr
-      where
-        isUdrRead Nothing  = False
-        isUdrRead (Just a) = fromIntegral (a - base) == (0 :: Word8)
-
-    -- Mutual recursion (broken by mealy registers in serialFSM):
-    --   stat, rxBuf ← serialFSM ← uartDef ← stat, rxBuf
-    ((txData, txStrobe, baud), rdData) =
-        runSynthPeriph base wr rdAddr (uartDef stat rxBuf)
-
+    bus = hdlBusIface wrAddr wrData wrEn rdAddr base
+    ((txDataIn, txStrobe, baud), rdData, _spec) =
+        runPeriphDef hdlOps bus (uartDef stat rxBuf)
     (txLine, stat, rxBuf, rxIrq, txIrq) =
-        serialFSM initBrr baud txData txStrobe udrRead rxLine
+        serialFSM baud txDataIn txStrobe rxLine

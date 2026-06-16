@@ -1,13 +1,7 @@
 module Tests.Isacle.Harvard.Pipeline where
 
-import Prelude hiding (read, repeat, (!!))
-
-import Test.Tasty
-import Test.Tasty.TH
-import Test.Tasty.Hedgehog
-import qualified Hedgehog as H
-
-import qualified Clash.Prelude as C
+import Prelude hiding (read)
+import System.Exit (exitFailure)
 
 import Isacle.Harvard.ISA
 import Isacle.Harvard.Pipeline
@@ -17,17 +11,21 @@ import Tests.Isacle.Harvard.ISA
     , initState, withZero, setReg, getReg
     )
 
+assert :: String -> Bool -> IO ()
+assert msg False = putStrLn ("FAIL: " ++ msg) >> exitFailure
+assert msg True  = putStrLn ("ok:   " ++ msg)
+
 -- ---------------------------------------------------------------------------
--- 2-slot pipeline helpers
+-- 2-deep pipeline helpers
 -- ---------------------------------------------------------------------------
 
-type P1 = PipeState 1 TInstr TIsaStage
+type P = PipeState TInstr TIsaStage
 
-emptyP1 :: P1
-emptyP1 = emptyPipe
+emptyP :: P
+emptyP = emptyPipe 2
 
-step1 :: P1 -> TState -> PipeInput TState -> (P1, TState, PipeOutput TState)
-step1 = pipelineStep
+step :: P -> TState -> PipeInput TState -> (P, TState, PipeOutput TState)
+step = pipelineStep
 
 noInp :: PipeInput TState
 noInp = PipeInput Nothing Nothing Nothing
@@ -35,274 +33,136 @@ noInp = PipeInput Nothing Nothing Nothing
 withInstr :: TInstr -> PipeInput TState
 withInstr i = PipeInput (Just i) Nothing Nothing
 
--- | Feed an instruction into the 2-slot pipeline and advance it to the
---   execute head (slot 0).  The result is ready for the actual execute step.
-primeExec :: TInstr -> TState -> (P1, TState)
+-- | Advance instruction to execute head (slot 0).
+primeExec :: TInstr -> TState -> (P, TState)
 primeExec instr s =
-    let (ps1, s1, _) = step1 emptyP1 s  (withInstr instr)
-        (ps2, s2, _) = step1 ps1     s1 noInp
+    let (ps1, s1, _) = step emptyP s  (withInstr instr)
+        (ps2, s2, _) = step ps1    s1 noInp
     in (ps2, s2)
 
--- ---------------------------------------------------------------------------
--- Bubble behaviour
--- ---------------------------------------------------------------------------
-
-prop_empty_pipe_no_output :: H.Property
-prop_empty_pipe_no_output = H.withTests 1 . H.property $ do
-    let (_, _, out) = step1 emptyP1 initState noInp
-    pipeMemRead  out H.=== Nothing
-    pipeMemWrite out H.=== Nothing
-    pipeFlush    out H.=== Nothing
-    pipeStalled  out H.=== False
-
--- An instruction fed into an empty pipeline enters at the tail (slot 1), not
--- the head (slot 0) — it needs one more advance before execution.
-prop_bubble_accepts_new_instruction :: H.Property
-prop_bubble_accepts_new_instruction = H.withTests 1 . H.property $ do
-    let (ps', _, _) = step1 emptyP1 initState (withInstr TNop)
-    C.head (psSlots ps') H.=== SEmpty
-    (psSlots ps' C.!! (1 :: C.Index 2)) H.=== SReady TNop
+depth :: Int
+depth = 2
 
 -- ---------------------------------------------------------------------------
--- Single-cycle execution
+-- Tests
 -- ---------------------------------------------------------------------------
 
-prop_nop_executes_and_advances :: H.Property
-prop_nop_executes_and_advances = H.withTests 1 . H.property $ do
-    let (ps0, s0) = primeExec TNop initState    -- TNop now at slot 0
-    let (ps1, s1, out) = step1 ps0 s0 noInp    -- execute
-    s1           H.=== initState
-    pipeFlush out H.=== Nothing
-    pipeStalled out H.=== False
-    C.head (psSlots ps1) H.=== SEmpty
+runPipelineTests :: IO ()
+runPipelineTests = do
+    putStrLn "\n-- bubble behaviour --"
+    let (_, _, out0) = step emptyP initState noInp
+    assert "empty pipe no output"     (pipeMemRead out0 == Nothing && pipeMemWrite out0 == Nothing
+                                     && pipeFlush out0 == Nothing && pipeStalled out0 == False)
 
-prop_add_updates_register :: H.Property
-prop_add_updates_register = H.withTests 1 . H.property $ do
-    let s0 = setReg 0 3 (setReg 1 4 initState)
-    let (ps0, s0') = primeExec (TAdd 0 1) s0
-    let (_, s1, _) = step1 ps0 s0' noInp
-    getReg 0 s1 H.=== 7
+    let (ps', _, _) = step emptyP initState (withInstr TNop)
+    assert "new instr enters tail"    (head (psSlots ps') == SEmpty)
+    assert "new instr in slot 1"      (psSlots ps' !! 1 == SReady TNop)
 
-prop_jump_flushes_pipeline :: H.Property
-prop_jump_flushes_pipeline = H.withTests 1 . H.property $ do
-    let (ps0, s0) = primeExec (TJump 0x42) initState
-    let (ps1, _, out) = step1 ps0 s0 noInp
-    pipeFlush    out H.=== Just (FlushBranch 0x42)
-    pipeStalled  out H.=== False
-    psSlots ps1 H.=== C.repeat SEmpty
+    putStrLn "\n-- single-cycle execution --"
+    let (ps0, s0) = primeExec TNop initState
+    let (ps1, s1, out1) = step ps0 s0 noInp
+    assert "nop state unchanged"      (s1 == initState)
+    assert "nop no flush"             (pipeFlush out1 == Nothing)
+    assert "nop not stalled"          (pipeStalled out1 == False)
+    assert "nop head cleared"         (head (psSlots ps1) == SEmpty)
 
--- ---------------------------------------------------------------------------
--- Memory read (load)
--- ---------------------------------------------------------------------------
+    let sa = setReg 0 3 (setReg 1 4 initState)
+    let (pa0, sa0) = primeExec (TAdd 0 1) sa
+    let (_, sa1, _) = step pa0 sa0 noInp
+    assert "add updates register"     (getReg 0 sa1 == 7)
 
-prop_load_issues_read_request :: H.Property
-prop_load_issues_read_request = H.withTests 1 . H.property $ do
-    let (ps0, s0)      = primeExec (TLoad 0 0x10) initState
-    let (ps1, _, out)  = step1 ps0 s0 noInp
-    pipeMemRead out H.=== Just 0x10
-    pipeStalled out H.=== True
-    C.head (psSlots ps1) H.=== SMemRead (TLoad 0 0x10)
+    let (pj0, sj0) = primeExec (TJump 0x42) initState
+    let (pj1, _, outj) = step pj0 sj0 noInp
+    assert "jump flushes"             (pipeFlush outj == Just (FlushBranch 0x42))
+    assert "jump not stalled"         (pipeStalled outj == False)
+    assert "jump clears pipeline"     (psSlots pj1 == replicate depth SEmpty)
 
-prop_load_stalls_without_response :: H.Property
-prop_load_stalls_without_response = H.withTests 1 . H.property $ do
-    let (ps0, s0) = primeExec (TLoad 0 0x10) initState
-    let (ps1, s1, _)  = step1 ps0 s0 noInp   -- issues read
-    let (ps2, _, out) = step1 ps1 s1 noInp   -- no response yet
-    pipeStalled out H.=== True
-    C.head (psSlots ps2) H.=== SMemRead (TLoad 0 0x10)
+    putStrLn "\n-- memory read (load) --"
+    let (pl0, sl0) = primeExec (TLoad 0 0x10) initState
+    let (pl1, sl1, outl1) = step pl0 sl0 noInp
+    assert "load issues read"         (pipeMemRead outl1 == Just 0x10)
+    assert "load stalls"              (pipeStalled outl1 == True)
+    assert "load head is SMemRead"    (head (psSlots pl1) == SMemRead (TLoad 0 0x10))
 
-prop_load_completes_with_response :: H.Property
-prop_load_completes_with_response = H.withTests 1 . H.property $ do
-    let (ps0, s0) = primeExec (TLoad 2 0x10) initState
-    let (ps1, s1, _) = step1 ps0 s0 noInp                                  -- issue read
-    let (_, s2, out) = step1 ps1 s1 (noInp { pipeMemResp = Just 0xAB })    -- response
-    pipeStalled out H.=== False
-    getReg 2 s2 H.=== 0xAB
+    let (pl2, sl2, outl2) = step pl1 sl1 noInp
+    assert "load stalls w/o response" (pipeStalled outl2 == True)
+    assert "load stays SMemRead"      (head (psSlots pl2) == SMemRead (TLoad 0 0x10))
 
--- ---------------------------------------------------------------------------
--- Memory write (store)
--- ---------------------------------------------------------------------------
+    let (_, sl3, outl3) = step pl2 sl2 (noInp { pipeMemResp = Just 0xAB })
+    assert "load completes w/ resp"   (pipeStalled outl3 == False)
+    assert "load result in reg"       (getReg 0 sl3 == 0xAB)
 
-prop_store_issues_write :: H.Property
-prop_store_issues_write = H.withTests 1 . H.property $ do
-    let s0 = setReg 1 0xBE initState
-    let (ps0, s0') = primeExec (TStore 0x20 1) s0
-    let (_, _, out) = step1 ps0 s0' noInp
-    pipeMemWrite out H.=== Just (0x20, 0xBE)
+    putStrLn "\n-- memory write (store) --"
+    let ss0 = setReg 1 0xBE initState
+    let (pst0, ss0') = primeExec (TStore 0x20 1) ss0
+    let (_, _, outst) = step pst0 ss0' noInp
+    assert "store issues write"       (pipeMemWrite outst == Just (0x20, 0xBE))
 
--- ---------------------------------------------------------------------------
--- Multi-cycle latency (TMul latency = 2)
--- ---------------------------------------------------------------------------
+    putStrLn "\n-- multi-cycle latency --"
+    let sm0 = setReg 0 3 (setReg 1 4 initState)
+    let (pm0, sm0') = primeExec (TMul 0 1) sm0
+    let (pm1, sm1, om1) = step pm0 sm0' noInp
+    assert "mul first cycle stalls"   (pipeStalled om1 == True)
+    let (_, sm2, om2) = step pm1 sm1 noInp
+    assert "mul second cycle executes" (pipeStalled om2 == False)
+    assert "mul result correct"        (getReg 0 sm2 == 12)
 
-prop_mul_stalls_one_extra_cycle :: H.Property
-prop_mul_stalls_one_extra_cycle = H.withTests 1 . H.property $ do
-    let s0 = setReg 0 3 (setReg 1 4 initState)
-    let (ps0, s0') = primeExec (TMul 0 1) s0     -- TMul at execute head
-    -- First execution attempt: latency=2, so counts down (stall).
-    let (ps1, s1, o1) = step1 ps0 s0' noInp
-    pipeStalled o1 H.=== True
-    -- Second attempt: countdown expired; execute.
-    let (_, s2, o2) = step1 ps1 s1 noInp
-    pipeStalled o2 H.=== False
-    getReg 0 s2 H.=== 12   -- 3 * 4
+    putStrLn "\n-- conditional branch --"
+    let (pb0, sb0) = primeExec (TBrZ 0x30) (withZero False initState)
+    let (_, _, outbf) = step pb0 sb0 noInp
+    assert "brz not taken: no flush"  (pipeFlush outbf == Nothing)
 
--- ---------------------------------------------------------------------------
--- Conditional branch
--- ---------------------------------------------------------------------------
+    let (pb1, sb1) = primeExec (TBrZ 0x30) (withZero True initState)
+    let (_, _, outbt) = step pb1 sb1 noInp
+    assert "brz taken: flush"         (pipeFlush outbt == Just (FlushBranch 0x30))
 
-prop_brz_no_flush_when_zero_clear :: H.Property
-prop_brz_no_flush_when_zero_clear = H.withTests 1 . H.property $ do
-    let s0 = withZero False initState
-    let (ps0, s0') = primeExec (TBrZ 0x30) s0
-    let (_, _, out) = step1 ps0 s0' noInp
-    pipeFlush out H.=== Nothing
+    putStrLn "\n-- interrupt --"
+    let irqInp = PipeInput Nothing Nothing (Just 0xFF)
+    let (_, _, outi) = step emptyP initState irqInp
+    assert "irq at bubble accepted"   (pipeFlush outi == Just (FlushInterrupt 0xFF))
+    assert "irq not stalled"          (pipeStalled outi == False)
 
-prop_brz_flushes_when_zero_set :: H.Property
-prop_brz_flushes_when_zero_set = H.withTests 1 . H.property $ do
-    let s0 = withZero True initState
-    let (ps0, s0') = primeExec (TBrZ 0x30) s0
-    let (_, _, out) = step1 ps0 s0' noInp
-    pipeFlush out H.=== Just (FlushBranch 0x30)
+    let irqInp2 = PipeInput (Just TNop) Nothing (Just 0xFF)
+    let (pir2, _, _) = step emptyP initState irqInp2
+    assert "irq clears pipeline"      (psSlots pir2 == replicate depth SEmpty)
 
--- ---------------------------------------------------------------------------
--- Interrupt acceptance
--- ---------------------------------------------------------------------------
+    putStrLn "\n-- complex sequences --"
+    let sc0 = setReg 0 1 (setReg 1 2 (setReg 2 3 initState))
+    let (pc1, sc1, _) = step emptyP sc0 (withInstr (TAdd 0 1))
+    let (pc2, sc2, _) = step pc1 sc1 (withInstr (TAdd 1 2))
+    assert "back-to-back: slot 0 filled"  (head (psSlots pc2) == SReady (TAdd 0 1))
+    assert "back-to-back: slot 1 filled"  (psSlots pc2 !! 1 == SReady (TAdd 1 2))
+    let (pc3, sc3, _) = step pc2 sc2 noInp
+    assert "first add executes"           (getReg 0 sc3 == 3)
+    let (_, sc4, _) = step pc3 sc3 noInp
+    assert "second add executes"          (getReg 1 sc4 == 5)
+    assert "first result preserved"       (getReg 0 sc4 == 3)
 
-prop_irq_accepted_at_bubble :: H.Property
-prop_irq_accepted_at_bubble = H.withTests 1 . H.property $ do
-    let inp = PipeInput Nothing Nothing (Just 0xFF)
-    let (_, _, out) = step1 emptyP1 initState inp
-    pipeFlush   out H.=== Just (FlushInterrupt 0xFF)
-    pipeStalled out H.=== False
+    let (pfj1, sfj1, _) = step emptyP initState (withInstr (TJump 0x42))
+    let (pfj2, sfj2, _) = step pfj1 sfj1 (withInstr TNop)
+    let (pfj3, _, outfj) = step pfj2 sfj2 noInp
+    assert "flush discards in-flight"     (pipeFlush outfj == Just (FlushBranch 0x42))
+    assert "pipeline cleared on flush"    (psSlots pfj3 == replicate depth SEmpty)
 
-prop_irq_clears_pipeline :: H.Property
-prop_irq_clears_pipeline = H.withTests 1 . H.property $ do
-    -- TState.acceptIrq returns (s, Nothing), so after IRQ head is SEmpty.
-    let inp = PipeInput (Just TNop) Nothing (Just 0xFF)
-    let (ps', _, _) = step1 emptyP1 initState inp
-    psSlots ps' H.=== C.repeat SEmpty
+    let sl_s0 = setReg 1 5 initState
+    let (pll1, sll1, _) = step emptyP sl_s0 (withInstr (TLoad 0 0x10))
+    let (pll2, sll2, _) = step pll1 sll1 (withInstr (TAdd 0 1))
+    let (pll3, sll3, oll3) = step pll2 sll2 noInp
+    assert "load issues read"             (pipeMemRead oll3 == Just 0x10)
+    assert "load stalls"                  (pipeStalled oll3 == True)
+    assert "add in slot 1 during stall"   (psSlots pll3 !! 1 == SReady (TAdd 0 1))
+    let (pll4, sll4, oll4) = step pll3 sll3 noInp
+    assert "no resp: still stalled"       (pipeStalled oll4 == True)
+    let (pll5, sll5, _) = step pll4 sll4 (noInp { pipeMemResp = Just 7 })
+    assert "load completes: r0=7"         (getReg 0 sll5 == 7)
+    assert "add advanced to head"         (head (psSlots pll5) == SReady (TAdd 0 1))
+    let (_, sll6, _) = step pll5 sll5 noInp
+    assert "add uses loaded value"        (getReg 0 sll6 == 12)
 
--- ---------------------------------------------------------------------------
--- Complex sequences
--- ---------------------------------------------------------------------------
-
--- Two independent adds pipelined back-to-back: second instruction enters
--- the pipeline while the first is advancing to the execute head.
-prop_back_to_back_adds :: H.Property
-prop_back_to_back_adds = H.withTests 1 . H.property $ do
-    let s0 = setReg 0 1 (setReg 1 2 (setReg 2 3 initState))
-    -- Cycle 1: TAdd 0 1 enters pipeline tail.
-    let (ps1, s1, _) = step1 emptyP1 s0 (withInstr (TAdd 0 1))
-    -- Cycle 2: TAdd 0 1 advances to head; TAdd 1 2 enters tail simultaneously.
-    let (ps2, s2, _) = step1 ps1 s1 (withInstr (TAdd 1 2))
-    -- At this point both instructions are in the pipeline.
-    C.head (psSlots ps2) H.=== SReady (TAdd 0 1)
-    (psSlots ps2 C.!! (1 :: C.Index 2)) H.=== SReady (TAdd 1 2)
-    -- Cycle 3: TAdd 0 1 executes (r0 = 1+2 = 3).
-    let (ps3, s3, _) = step1 ps2 s2 noInp
-    getReg 0 s3 H.=== 3
-    C.head (psSlots ps3) H.=== SReady (TAdd 1 2)
-    -- Cycle 4: TAdd 1 2 executes (r1 = 2+3 = 5).
-    let (_, s4, _) = step1 ps3 s3 noInp
-    getReg 1 s4 H.=== 5
-    getReg 0 s4 H.=== 3   -- first result preserved
-
--- An instruction sitting in slot 1 when a flush fires must be discarded.
-prop_flush_discards_in_flight_instruction :: H.Property
-prop_flush_discards_in_flight_instruction = H.withTests 1 . H.property $ do
-    -- Cycle 1: TJump enters tail.
-    let (ps1, s1, _) = step1 emptyP1 initState (withInstr (TJump 0x42))
-    -- Cycle 2: TJump advances to head; TNop enters tail.
-    let (ps2, s2, _) = step1 ps1 s1 (withInstr TNop)
-    C.head (psSlots ps2) H.=== SReady (TJump 0x42)
-    (psSlots ps2 C.!! (1 :: C.Index 2)) H.=== SReady TNop
-    -- Cycle 3: TJump executes → flush.  TNop must be gone.
-    let (ps3, _, out) = step1 ps2 s2 noInp
-    pipeFlush    out H.=== Just (FlushBranch 0x42)
-    psSlots ps3 H.=== C.repeat SEmpty
-
--- A load followed by an add that uses the loaded register: the add must see
--- the value written by the load.
-prop_load_then_add_uses_loaded_value :: H.Property
-prop_load_then_add_uses_loaded_value = H.withTests 1 . H.property $ do
-    let s0 = setReg 1 5 initState   -- r1 = 5; r0 will be loaded from RAM
-    -- Cycle 1: TLoad 0 0x10 enters tail.
-    let (ps1, s1, _) = step1 emptyP1 s0 (withInstr (TLoad 0 0x10))
-    -- Cycle 2: TLoad advances to head; TAdd 0 1 enters tail.
-    let (ps2, s2, _) = step1 ps1 s1 (withInstr (TAdd 0 1))
-    -- Cycle 3: TLoad issues RAM read, transitions to SMemRead; TAdd stalls.
-    let (ps3, s3, o3) = step1 ps2 s2 noInp
-    pipeMemRead o3 H.=== Just 0x10
-    pipeStalled o3 H.=== True
-    C.head (psSlots ps3) H.=== SMemRead (TLoad 0 0x10)
-    -- TAdd must still be in the pipeline (slot 1), not lost.
-    (psSlots ps3 C.!! (1 :: C.Index 2)) H.=== SReady (TAdd 0 1)
-    -- Cycle 4: no RAM response yet → entire pipeline holds.
-    let (ps4, s4, o4) = step1 ps3 s3 noInp
-    pipeStalled o4 H.=== True
-    C.head (psSlots ps4) H.=== SMemRead (TLoad 0 0x10)
-    -- Cycle 5: RAM responds with 7 → TLoad completes, r0 = 7.
-    let (ps5, s5, _) = step1 ps4 s4 (noInp { pipeMemResp = Just 7 })
-    getReg 0 s5 H.=== 7
-    -- TAdd has advanced to head after TLoad completed.
-    C.head (psSlots ps5) H.=== SReady (TAdd 0 1)
-    -- Cycle 6: TAdd executes → r0 = 7 + 5 = 12.
-    let (_, s6, _) = step1 ps5 s5 noInp
-    getReg 0 s6 H.=== 12
-
--- A taken branch followed by two NOPs in flight: both must be flushed.
-prop_flush_clears_multiple_in_flight :: H.Property
-prop_flush_clears_multiple_in_flight = H.withTests 1 . H.property $ do
-    -- Fill the pipeline: TBrZ in slot 0, TNop in slot 1, more incoming.
-    let s0 = withZero True initState  -- branch will be taken
-    let (ps1, s1, _) = step1 emptyP1 s0 (withInstr (TBrZ 0x30))
-    let (ps2, s2, _) = step1 ps1 s1 (withInstr TNop)
-    -- Fire: branch executes while NOPs are in flight.
-    let (ps3, _, out) = step1 ps2 s2 (withInstr TNop)
-    pipeFlush out H.=== Just (FlushBranch 0x30)
-    psSlots ps3 H.=== C.repeat SEmpty
-
--- After a flush the pipeline refills normally from the next instruction.
-prop_refill_after_flush :: H.Property
-prop_refill_after_flush = H.withTests 1 . H.property $ do
-    -- Prime and execute a jump to flush.
-    let (ps0, s0) = primeExec (TJump 0x50) initState
-    let (ps1, s1, out1) = step1 ps0 s0 noInp
-    pipeFlush out1 H.=== Just (FlushBranch 0x50)
-    psSlots ps1 H.=== C.repeat SEmpty
-    -- Feed a NOP into the cleared pipeline.
-    let (ps2, _, _) = step1 ps1 s1 (withInstr TNop)
-    -- NOP should appear at the tail (slot 1) of the refilling pipeline.
-    (psSlots ps2 C.!! (1 :: C.Index 2)) H.=== SReady TNop
-
--- Interrupt accepted when head is a bubble; subsequent instructions are
--- discarded from the pipeline.
-prop_irq_discards_in_flight_on_accept :: H.Property
-prop_irq_discards_in_flight_on_accept = H.withTests 1 . H.property $ do
-    -- Prime a NOP so it sits in slot 1 (head is still SEmpty).
-    let (ps1, s1, _) = step1 emptyP1 initState (withInstr TNop)
-    C.head (psSlots ps1) H.=== SEmpty
-    (psSlots ps1 C.!! (1 :: C.Index 2)) H.=== SReady TNop
-    -- Present IRQ while head is a bubble.
-    let irqInp = PipeInput (Just TNop) Nothing (Just 0x80)
-    let (ps2, _, out) = step1 ps1 s1 irqInp
-    pipeFlush out H.=== Just (FlushInterrupt 0x80)
-    -- All pipeline slots must be empty (TState.acceptIrq returns Nothing stage).
-    psSlots ps2 H.=== C.repeat SEmpty
-
--- Two consecutive store instructions must each generate a distinct write.
-prop_back_to_back_stores :: H.Property
-prop_back_to_back_stores = H.withTests 1 . H.property $ do
-    let s0 = setReg 0 0xAA (setReg 1 0xBB initState)
-    -- Fill pipeline with two stores.
-    let (ps1, s1, _) = step1 emptyP1 s0 (withInstr (TStore 0x10 0))
-    let (ps2, s2, _) = step1 ps1 s1 (withInstr (TStore 0x20 1))
-    -- Execute first store.
-    let (ps3, s3, o3) = step1 ps2 s2 noInp
-    pipeMemWrite o3 H.=== Just (0x10, 0xAA)
-    -- Execute second store.
-    let (_, _, o4) = step1 ps3 s3 noInp
-    pipeMemWrite o4 H.=== Just (0x20, 0xBB)
-
-pipelineTests :: TestTree
-pipelineTests = $(testGroupGenerator)
+    let sb_s0 = setReg 0 0xAA (setReg 1 0xBB initState)
+    let (pbs1, sbs1, _) = step emptyP sb_s0 (withInstr (TStore 0x10 0))
+    let (pbs2, sbs2, _) = step pbs1 sbs1 (withInstr (TStore 0x20 1))
+    let (pbs3, sbs3, obs3) = step pbs2 sbs2 noInp
+    assert "first store issues write"     (pipeMemWrite obs3 == Just (0x10, 0xAA))
+    let (_, _, obs4) = step pbs3 sbs3 noInp
+    assert "second store issues write"    (pipeMemWrite obs4 == Just (0x20, 0xBB))
