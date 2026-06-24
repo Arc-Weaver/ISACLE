@@ -22,3 +22,10 @@ cabal.project.local~
 .HTF/
 .ghc.environment.*
 dist-newstyle/
+
+# isacle-hdl synthesis outputs
+build/
+vhdl/
+work-obj08.cf
+ARCHITECTURE.html
+memory/
