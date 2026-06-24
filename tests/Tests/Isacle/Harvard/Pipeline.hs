@@ -28,10 +28,11 @@ step :: P -> TState -> PipeInput TState -> (P, TState, PipeOutput TState)
 step = pipelineStep
 
 noInp :: PipeInput TState
-noInp = PipeInput Nothing Nothing Nothing
+noInp = PipeInput { pipeInstr = Nothing, pipeMemResp = Nothing
+                  , pipeIrqAddr = Nothing, pipeCodeWord = 0 }
 
 withInstr :: TInstr -> PipeInput TState
-withInstr i = PipeInput (Just i) Nothing Nothing
+withInstr i = noInp { pipeInstr = Just i }
 
 -- | Advance instruction to execute head (slot 0).
 primeExec :: TInstr -> TState -> (P, TState)
@@ -117,12 +118,12 @@ runPipelineTests = do
     assert "brz taken: flush"         (pipeFlush outbt == Just (FlushBranch 0x30))
 
     putStrLn "\n-- interrupt --"
-    let irqInp = PipeInput Nothing Nothing (Just 0xFF)
+    let irqInp = noInp { pipeIrqAddr = Just 0xFF }
     let (_, _, outi) = step emptyP initState irqInp
     assert "irq at bubble accepted"   (pipeFlush outi == Just (FlushInterrupt 0xFF))
     assert "irq not stalled"          (pipeStalled outi == False)
 
-    let irqInp2 = PipeInput (Just TNop) Nothing (Just 0xFF)
+    let irqInp2 = noInp { pipeInstr = Just TNop, pipeIrqAddr = Just 0xFF }
     let (pir2, _, _) = step emptyP initState irqInp2
     assert "irq clears pipeline"      (psSlots pir2 == replicate depth SEmpty)
 

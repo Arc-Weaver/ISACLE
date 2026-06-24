@@ -77,12 +77,19 @@ class ALU state => ISA state where
     toIsaStage :: Instr state -> state -> Maybe (IsaStage state)
 
     -- | Advance a running ISA-specific stage by one cycle.
-    --   Left continues in the stage; Right () signals completion.
+    --   Returns the new state, a continue/done signal, an optional data-memory
+    --   read request, and an optional data-memory write for this cycle.
+    --   Left continues the stage (pipeline remains stalled); Right () completes it.
     isaStageStep
         :: IsaStage state
-        -> (RomAddr state, Val state)   -- (code word, data RAM response)
+        -> FetchWord state              -- current code-bus word (for LPM-style reads)
+        -> Maybe (Val state)            -- data-RAM read response; Nothing if not yet available
         -> state
-        -> (state, Either (IsaStage state) ())
+        -> ( state
+           , Either (IsaStage state) ()
+           , Maybe (RamAddr state)               -- data read request (if any)
+           , Maybe (RamAddr state, Val state)    -- data write (if any)
+           )
 
     -- | True when the CPU can accept an interrupt at the next instruction
     --   boundary. Checked once per instruction boundary in the pipeline.

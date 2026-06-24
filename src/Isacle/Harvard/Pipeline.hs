@@ -8,7 +8,7 @@ module Isacle.Harvard.Pipeline
     ) where
 
 import Prelude hiding (read)
-import Data.Maybe (fromMaybe)
+
 import Isacle.Harvard.ISA
 
 -- | Pipeline register state: a list of slots (head = execute end, last = fetch end)
@@ -24,9 +24,10 @@ emptyPipe depth = PipeState (replicate depth SEmpty) 0
 
 -- | Inputs consumed each cycle.
 data PipeInput state = PipeInput
-    { pipeInstr   :: Maybe (Instr state)    -- decoded instruction from fetch
-    , pipeMemResp :: Maybe (Val state)      -- data RAM read response
-    , pipeIrqAddr :: Maybe (RomAddr state)  -- interrupt vector (Nothing = no IRQ)
+    { pipeInstr    :: Maybe (Instr state)    -- decoded instruction from fetch
+    , pipeMemResp  :: Maybe (Val state)      -- data RAM read response (Nothing if not requested)
+    , pipeIrqAddr  :: Maybe (RomAddr state)  -- interrupt vector (Nothing = no IRQ)
+    , pipeCodeWord :: FetchWord state        -- current code-bus output (for multi-word fetch / LPM)
     }
 
 -- | Outputs produced each cycle.
@@ -81,22 +82,18 @@ pipelineStep (PipeState slots lat) cpuState inp =
 
       -- ── ISA-specific multi-cycle stage ────────────────────────────────────
       SIsa stage ->
-          let memVal       = fromMaybe
-                                 (error "Pipeline: ISA stage needs memory response")
-                                 (pipeMemResp inp)
-              (cpu', done) = isaStageStep stage
-                                 (error "Pipeline: ISA stage ROM feed unimplemented; carry ROM data in stage value", memVal)
-                                 cpuState
+          let (cpu', done, mread, mwrite) =
+                  isaStageStep stage (pipeCodeWord inp) (pipeMemResp inp) cpuState
           in case done of
               Left  stage' ->
                   ( PipeState (SIsa stage' : rest) 0
                   , cpu'
-                  , PipeOutput Nothing Nothing Nothing True
+                  , PipeOutput mread mwrite Nothing True
                   )
               Right () ->
                   ( PipeState advance 0
                   , cpu'
-                  , PipeOutput Nothing Nothing Nothing False
+                  , PipeOutput mread mwrite Nothing False
                   )
 
       -- ── Waiting for data RAM response ─────────────────────────────────────

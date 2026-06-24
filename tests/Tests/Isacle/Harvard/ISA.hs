@@ -101,7 +101,7 @@ instance ISA TState where
 
     toIsaStage _ _ = Nothing
 
-    isaStageStep TIsaStage _ s = (s, Right ())
+    isaStageStep TIsaStage _ _ s = (s, Right (), Nothing, Nothing)
 
     interruptible _ = True
 
