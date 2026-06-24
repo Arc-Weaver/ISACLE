@@ -14,9 +14,9 @@ import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
-import Isacle.Hdl.Net
-import Isacle.Hdl.Types
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Net
+import Hdl.Types
+import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
@@ -46,7 +46,7 @@ uartDef
     -> PeriphDef UART sig dat (sig dat, sig Bool, sig dat)
 uartDef stat rxData = do
     field8 ReadWrite 0 "UDR" "TX write / RX read (reads return Rx buffer)"
-    (txData, txStrobe) <- onWriteStrobe 0 0
+    (txData, txStrobe) <- onWriteStrobe "udr" 0 0
     onRead 0 rxData
 
     register RW8 1 "USR" "Status"
@@ -56,7 +56,7 @@ uartDef stat rxData = do
     onRead 1 stat
 
     field8 ReadWrite 2 "UBRR" "Baud rate divisor (system clocks per baud period)"
-    baud <- onWrite 2 0
+    baud <- onWrite "ubrr" 2 0
     onRead 2 baud
 
     return (txData, txStrobe, baud)
@@ -111,10 +111,9 @@ sigGeLit n s = sigNot (sigLtLit n s)
         out <- freshWire
         emit $ NComb out PLt [wx, wl]
         pure out
-
--- | Resize a signal to @bw@ bits (truncate or zero-extend).
-sigResize :: Int -> Sig dom a -> Sig dom b
-sigResize bw s = SExpr $ do
+-- | Resize a signal to @bw@ bits using a term-level width.
+sigResizeN :: Int -> Sig dom a -> Sig dom b
+sigResizeN bw s = SExpr $ do
     ws  <- materialize s
     out <- freshWire
     emit $ NComb out (PResize bw) [ws]
@@ -182,7 +181,7 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
   where
     dom    = domId (Proxy @dom)
     datW   = fromIntegral (natVal (Proxy @(Width dat)))
-    brr16  = sigResize 16 baud :: Sig dom (Unsigned 16)
+    brr16  = sigResizeN 16 baud :: Sig dom (Unsigned 16)
 
     -- -----------------------------------------------------------------------
     -- TX state machine
@@ -286,7 +285,7 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
     txBitOut =
         let isStart = sigEqLit 1 (txSt :: Sig dom (Unsigned 2))
             isBit   = sigEqLit 2 (txSt :: Sig dom (Unsigned 2))
-            datBit  = sigBitDyn' txShift (sigResize 4 txBitN :: Sig dom dat)
+            datBit  = sigBitDyn' txShift (sigResizeN 4 txBitN :: Sig dom dat)
         in ifSig isStart sigFalse
          $ ifSig isBit   datBit
            sigTrue
@@ -305,7 +304,7 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
             isStart  = sigEqLit 1 stSig
             isBit    = sigEqLit 2 stSig
             ctrDone  = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
-            halfDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - (sigResize 16 (baud `div'` 2)))
+            halfDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - (sigResizeN 16 (baud `div'` 2)))
             bit7Done = sigGeLit 7 (rxBitN :: Sig dom (Unsigned 4))
             startRx  = isIdle .&. sigNot rxLine
             stNext   = ifSig startRx            (litW 1 2)
@@ -329,7 +328,7 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
             isIdle   = sigEqLit 0 (rxSt :: Sig dom (Unsigned 2))
             isStart  = sigEqLit 1 (rxSt :: Sig dom (Unsigned 2))
             isBit    = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
-            halfDone = sigGeLit 1 (ctrSig - sigResize 16 (baud `div'` 2))
+            halfDone = sigGeLit 1 (ctrSig - sigResizeN 16 (baud `div'` 2))
             ctrDone  = sigGeLit 1 (ctrSig - brr16)
             reset    =  (isIdle  .&. sigNot rxLine)
                     .||. (isStart .&. halfDone)
@@ -362,7 +361,7 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
             isBit   = sigEqLit 2 (rxSt :: Sig dom (Unsigned 2))
             ctrDone = sigGeLit 1 ((rxCtr :: Sig dom (Unsigned 16)) - brr16)
             sample  = isBit .&. ctrDone
-            rxBitIdx = sigResize datW rxBitN :: Sig dom dat
+            rxBitIdx = sigResizeN datW rxBitN :: Sig dom dat
             accSet  = sigSetBit accSig rxBitIdx
             accNext = ifSig sample
                           (ifSig rxLine accSet accSig)

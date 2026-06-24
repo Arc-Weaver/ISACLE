@@ -3,21 +3,7 @@
 # For more information, please see the documentation at:
 #   https://docs.haskellstack.org/en/stable/topics/lock_files
 
-packages:
-- completed:
-    hackage: clash-lib-1.8.4@sha256:6d08a798f5e2e4772290d6c480f0e3de4ef3309d737ace37f0a27281433e3adb,15721
-    pantry-tree:
-      sha256: 6c627d215c9a86520dbc61146031f820e77b68b4596c8803797a659983761b54
-      size: 24084
-  original:
-    hackage: clash-lib-1.8.4@sha256:6d08a798f5e2e4772290d6c480f0e3de4ef3309d737ace37f0a27281433e3adb,15721
-- completed:
-    hackage: clash-prelude-1.8.4@sha256:4d1d9b05cc38f6c1e856de3035ee044bfcb7666e6ebeb978aef54da840255a67,17871
-    pantry-tree:
-      sha256: bf17b67b18a59f3e2263fd63095c01179bcaa23e6e56f74ebda8f578500ba9e8
-      size: 13730
-  original:
-    hackage: clash-prelude-1.8.4@sha256:4d1d9b05cc38f6c1e856de3035ee044bfcb7666e6ebeb978aef54da840255a67,17871
+packages: []
 snapshots:
 - completed:
     sha256: 7e724f347d5969cb5e8dde9f9aae30996e3231c29d1dafd45f21f1700d4c4fcb

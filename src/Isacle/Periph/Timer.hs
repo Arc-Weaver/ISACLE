@@ -14,9 +14,9 @@ import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
-import Isacle.Hdl.Net
-import Isacle.Hdl.Types
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Net
+import Hdl.Types
+import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
@@ -47,15 +47,15 @@ timerDef
 timerDef cntSig = do
     register RW8 0 "TCCR" "Timer control"
         [ bitF ReadWrite 0 "CTC" "CTC mode: reset counter on compare match" ]
-    tccr <- onWrite 0 0
+    tccr <- onWrite "tccr" 0 0
     onRead 0 tccr
 
     field8 ReadWrite 1 "TCNT" "Counter value (write to preset)"
-    (tcntPreset, tcntWritten) <- onWriteStrobe 1 0
+    (tcntPreset, tcntWritten) <- onWriteStrobe "tcnt" 1 0
     onRead 1 cntSig
 
     field8 ReadWrite 2 "OCR" "Output compare register"
-    ocr <- onWrite 2 0
+    ocr <- onWrite "ocr" 2 0
     onRead 2 ocr
 
     return (tccr, ocr, tcntPreset, tcntWritten)

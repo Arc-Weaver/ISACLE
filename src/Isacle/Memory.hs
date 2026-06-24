@@ -1,7 +1,7 @@
 module Isacle.Memory where
 
 import Prelude (Bool)
-import Isacle.Hdl.Types (Sig)
+import Hdl.Types (Sig)
 
 -- | Synchronous single-port data RAM: read address in, write signals in, data out.
 type RamUnit dom addr a =

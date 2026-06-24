@@ -44,7 +44,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
 
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Prim (Unsigned)
 import Isacle.System.Spec (NullSig(..))
 
 -- ---------------------------------------------------------------------------
@@ -120,6 +120,8 @@ data PeriphOps (sig :: Type -> Type) dat = PeriphOps
     , sigAnd  :: sig Bool -> sig Bool -> sig Bool
       -- | Combinational mux: @sigMux sel thenSig elseSig@.
     , sigMux  :: sig Bool -> sig dat -> sig dat -> sig dat
+      -- | Attach a human-readable name hint to a signal (no-op in spec pass).
+    , sigHint :: String -> sig dat -> sig dat
     }
 
 -- | Spec / documentation ops: all hardware operations are no-ops.
@@ -131,6 +133,7 @@ nullOps = PeriphOps
     , sigZero     = NullSig
     , sigAnd      = \_ _ -> NullSig
     , sigMux      = \_ _ _ -> NullSig
+    , sigHint     = \_ s  -> s
     }
 
 -- ---------------------------------------------------------------------------
@@ -209,28 +212,31 @@ runPeriphDef ops bus def =
 -- Signal-level circuit operations
 -- ---------------------------------------------------------------------------
 
--- | Declare a registered output at @offset@.
+-- | Declare a named registered output at @offset@.
+-- The name is attached to the register flip-flop output in the HDL backend.
 onWrite
-    :: Word32
+    :: String   -- ^ register name (used as a VHDL signal hint)
+    -> Word32
     -> dat
     -> PeriphDef p sig dat (sig dat)
-onWrite off initVal = PeriphDef $ do
+onWrite name off initVal = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let wen  = biWrEqAddr bus off
         wdat = biWrData bus
-        reg  = sigReg ops initVal wen wdat
+        reg  = sigHint ops name (sigReg ops initVal wen wdat)
     pure (sigMux ops wen wdat reg)
 
 -- | Like 'onWrite' but also returns a write-strobe.
 onWriteStrobe
-    :: Word32
+    :: String   -- ^ register name (used as a VHDL signal hint)
+    -> Word32
     -> dat
     -> PeriphDef p sig dat (sig dat, sig Bool)
-onWriteStrobe off initVal = PeriphDef $ do
+onWriteStrobe name off initVal = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let wen  = biWrEqAddr bus off
         wdat = biWrData bus
-        reg  = sigReg ops initVal wen wdat
+        reg  = sigHint ops name (sigReg ops initVal wen wdat)
     pure (sigMux ops wen wdat reg, wen)
 
 -- | Wire @sig@ into the read-data mux at @offset@.

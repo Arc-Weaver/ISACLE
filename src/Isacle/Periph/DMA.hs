@@ -5,10 +5,10 @@ module Isacle.Periph.DMA
     ) where
 
 import Prelude
-import Isacle.Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..), NetM)
-import Isacle.Hdl.Types
-import Isacle.Hdl.Class (regS)
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..), NetM)
+import Hdl.Types
+import Hdl.Class (regS)
+import Hdl.Prim (Unsigned)
 
 -- | DMA transfer engine state (used in simulation / pure testing).
 --

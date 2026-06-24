@@ -25,8 +25,8 @@ import Prelude
 import Data.Word (Word32)
 import Control.Monad.Trans.State.Strict
 
-import Isacle.Hdl.Types (Sig, KnownDom, HdlType)
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Types (Sig, KnownDom, HdlType)
+import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 

@@ -3,8 +3,8 @@ module Isacle.Periph.Interrupt
     ) where
 
 import Prelude
-import Isacle.Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..))
-import Isacle.Hdl.Types
+import Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..))
+import Hdl.Types
 
 -- | Combinational priority interrupt arbiter.
 --

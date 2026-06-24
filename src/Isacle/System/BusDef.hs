@@ -27,7 +27,7 @@ import Prelude
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 import GHC.TypeLits (KnownSymbol, symbolVal)
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Prim (Unsigned)
 
 import Isacle.System.Spec (ComponentSpec(..))
 import Isacle.System.Periph (PeriphSpec)

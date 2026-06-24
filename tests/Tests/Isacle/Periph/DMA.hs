@@ -4,7 +4,7 @@ import Prelude
 import Data.Word (Word8, Word16)
 import System.Exit (exitFailure)
 
-import Isacle.Hdl.Prim (Unsigned)
+import Hdl.Prim (Unsigned)
 import Isacle.Periph.DMA (DMAState(..))
 
 assert :: String -> Bool -> IO ()

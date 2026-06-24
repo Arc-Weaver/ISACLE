@@ -9,8 +9,8 @@ module Isacle.Periph.GPIO
 
 import Prelude
 import Data.Word (Word32)
-import Isacle.Hdl.Types (KnownDom, HdlType, Sig)
-import Isacle.Hdl.Prim  (Unsigned)
+import Hdl.Types (KnownDom, HdlType, Sig)
+import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
@@ -41,11 +41,11 @@ gpioDef pinsIn = do
     onRead 0 pinsIn
 
     field8 ReadWrite 1 "DDR"  "Data direction (1 = output)"
-    ddr <- onWrite 1 0
+    ddr <- onWrite "ddr" 1 0
     onRead 1 ddr
 
     field8 ReadWrite 2 "PORT" "Output latch"
-    port <- onWrite 2 0
+    port <- onWrite "port" 2 0
     onRead 2 port
 
     return (port, ddr)
