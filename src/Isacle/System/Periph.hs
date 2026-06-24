@@ -40,6 +40,7 @@ module Isacle.System.Periph
 import Prelude
 import Data.Kind (Type)
 import Data.Word (Word8, Word32)
+import Control.Monad.Fix (MonadFix)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
@@ -194,7 +195,7 @@ data PeriphAccum sig dat = PeriphAccum
 -- @a@   — return type (the peripheral's physical output signals).
 newtype PeriphDef (p :: Type) (sig :: Type -> Type) dat a = PeriphDef
     { unPeriphDef :: ReaderT (PeriphEnv sig dat) (State (PeriphAccum sig dat)) a }
-    deriving newtype (Functor, Applicative, Monad)
+    deriving newtype (Functor, Applicative, Monad, MonadFix)
 
 -- | Run a peripheral definition.
 runPeriphDef

@@ -1,3 +1,4 @@
+{-# LANGUAGE RecursiveDo #-}
 module Isacle.Periph.Timer
     ( -- * Peripheral kind tag
       Timer
@@ -5,6 +6,8 @@ module Isacle.Periph.Timer
     , timerDef
       -- * Counter state machine
     , counterFSM
+      -- * Combined PeriphDef with FSM wired in
+    , timerDefWithFSM
       -- * Standalone circuit wrapper
     , timerUnit
     ) where
@@ -116,6 +119,23 @@ counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
 
     ovf = tick .&&. sigNot ctcMode .&&. atMax  .&&. sigNot tcntWritten
     cmp = tick .&&. ctcMode        .&&. atTop  .&&. sigNot tcntWritten
+
+-- ---------------------------------------------------------------------------
+-- Combined PeriphDef with counter FSM
+-- ---------------------------------------------------------------------------
+
+-- | 'timerDef' with 'counterFSM' wired in via a recursive binding.
+-- Use this as the @ptDef@ in a 'PeriphToken' so that 'attachPeripheral'
+-- gets real overflow and compare-match outputs instead of stubs.
+timerDefWithFSM
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Sig dom Bool              -- ^ tick / count enable
+    -> PeriphDef Timer (Sig dom) dat (Sig dom Bool, Sig dom Bool)
+                                 -- ^ (ovfIrq, cmpIrq)
+timerDefWithFSM tick = mdo
+    (tccr, ocr, tcntPreset, tcntWritten) <- timerDef cnt
+    let (cnt, ovf, cmp) = counterFSM tick tccr ocr tcntPreset tcntWritten
+    return (ovf, cmp)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper

@@ -68,8 +68,8 @@ import Isacle.System.HdlCircuit
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
     )
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
-import Isacle.Periph.UART  (uartDef, UART)
-import Isacle.Periph.Timer (timerDef, Timer)
+import Isacle.Periph.UART  (uartDefWithFSM, UART)
+import Isacle.Periph.Timer (timerDefWithFSM, Timer)
 import Isacle.ISA.CPUDef (CPUDef)
 import Isacle.ISA.Def    (ISADef)
 import Isacle.ISA.Backend.Synth    (SynthM)
@@ -492,17 +492,15 @@ execSystemDSL name (SysDSL st) =
 -- Physical outputs (TX, rxIrq, txIrq) are stubs until a serial-FSM
 -- sub-component is implemented.
 createUart
-    :: (Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
-    -> Sig dom Bool                  -- ^ RX serial line (reserved for FSM)
+    -> Sig dom Bool                  -- ^ RX serial line
     -> SysDSL dom dat (PeriphToken UART dom dat (UartPhys dom))
-createUart name _rxPin = pure $ PeriphToken
+createUart name rxPin = pure $ PeriphToken
     { ptName     = name
-    , ptDef      = uartDef 0 0 >> return UartPhys
-                       { uartTxLine = sigFalse
-                       , uartRxIrq  = sigFalse
-                       , uartTxIrq  = sigFalse
-                       }
+    , ptDef      = do
+          (txLine, rxIrq, txIrq) <- uartDefWithFSM rxPin
+          return UartPhys { uartTxLine = txLine, uartRxIrq = rxIrq, uartTxIrq = txIrq }
     , ptAddrSize = 0
     }
 
@@ -524,16 +522,15 @@ createGpio name pins = pure $ PeriphToken
 -- Physical outputs (overflow IRQ, compare-match IRQ) are stubs until a
 -- counter-FSM sub-component is implemented.
 createTimer
-    :: (Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
-    -> Sig dom Bool                  -- ^ tick / count-enable (reserved for FSM)
+    -> Sig dom Bool                  -- ^ tick / count enable
     -> SysDSL dom dat (PeriphToken Timer dom dat (TimerPhys dom))
-createTimer name _tick = pure $ PeriphToken
+createTimer name tick = pure $ PeriphToken
     { ptName     = name
-    , ptDef      = timerDef 0 >> return TimerPhys
-                       { timerOvfIrq = sigFalse
-                       , timerCmpIrq = sigFalse
-                       }
+    , ptDef      = do
+          (ovf, cmp) <- timerDefWithFSM tick
+          return TimerPhys { timerOvfIrq = ovf, timerCmpIrq = cmp }
     , ptAddrSize = 0
     }
 

@@ -1,3 +1,4 @@
+{-# LANGUAGE RecursiveDo #-}
 module Isacle.Periph.UART
     ( -- * Peripheral kind tag
       UART
@@ -5,6 +6,8 @@ module Isacle.Periph.UART
     , uartDef
       -- * Serial state machine
     , serialFSM
+      -- * Combined PeriphDef with FSM wired in
+    , uartDefWithFSM
       -- * Standalone circuit wrapper
     , uartUnit
     ) where
@@ -415,6 +418,23 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
     rxcB  :: Sig dom dat
     rxcB  = ifSig rxIrq   (litW 2 datW) (litW 0 datW)
     status = sigOrV udreB rxcB
+
+-- ---------------------------------------------------------------------------
+-- Combined PeriphDef with serial FSM
+-- ---------------------------------------------------------------------------
+
+-- | 'uartDef' with 'serialFSM' wired in via a recursive binding.
+-- Returns @(txLine, rxIrq, txIrq)@.  Use this as the @ptDef@ in a
+-- 'PeriphToken' so that 'attachPeripheral' gets real serial outputs.
+uartDefWithFSM
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    => Sig dom Bool   -- ^ RX serial line
+    -> PeriphDef UART (Sig dom) dat (Sig dom Bool, Sig dom Bool, Sig dom Bool)
+                      -- ^ (txLine, rxIrq, txIrq)
+uartDefWithFSM rxLine = mdo
+    (txData, txStrobe, baud) <- uartDef stat rxBuf
+    let (txLine, stat, rxBuf, rxIrq, txIrq) = serialFSM baud txData txStrobe rxLine
+    return (txLine, rxIrq, txIrq)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper

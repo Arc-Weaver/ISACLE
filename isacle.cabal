@@ -83,7 +83,6 @@ library
     Isacle.System.BusDef
     Isacle.System.BusArch
     Isacle.System.HdlCircuit
-    Isacle.System.HdlSystem
     Isacle.System.SystemDSL
     Isacle.System.Generate
     Isacle.ISA
