@@ -6,10 +6,11 @@ import Prelude
 import Data.Word (Word32)
 import System.Exit (exitFailure)
 
-import Isacle.Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Isacle.Hdl.Types (KnownDom(..), Sig(..))
-import Isacle.Hdl.Prim  (Unsigned)
+import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
+import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
+import Isacle.System.HdlCircuit (GpioPhys(..))
 import Isacle.System.Generate (sysExtractMemoryMap)
 
 assert :: String -> Bool -> IO ()
@@ -33,8 +34,8 @@ gpioBusSys
 gpioBusSys gpioIn = do
     gpio <- createGpio "gpio" gpioIn
     ((port, ddr), _rdData) <- createBus "databus" $ do
-        (p, d) <- attachPeripheral gpioBase gpio
-        return (p, d)
+        gpio' <- attachPeripheral gpioBase gpio
+        return (gpioPort gpio', gpioDdr gpio')
     return (port, ddr)
 
 -- ---------------------------------------------------------------------------

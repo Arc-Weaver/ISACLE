@@ -6,10 +6,11 @@ import Prelude
 import Numeric (showHex)
 import System.Exit (exitFailure)
 
-import Isacle.Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Isacle.Hdl.Types (KnownDom(..), Sig(..))
-import Isacle.Hdl.Prim  (Unsigned)
+import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
+import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
+import Isacle.System.HdlCircuit (GpioPhys(..), UartPhys(..))
 import Isacle.System.Generate (sysExtractMemoryMap, sysGenCHeader)
 
 assert :: String -> Bool -> IO ()
@@ -38,9 +39,9 @@ mySystem rxPin gpioIn = do
     gpio <- createGpio "gpio" gpioIn
 
     ((tx, port, ddr), _rdData) <- createBus "databus" $ do
-        (txLine, _rxIrq, _txIrq) <- attachPeripheral 0x0100 uart
-        (gpioPort, gpioDdr)      <- attachPeripheral 0x0300 gpio
-        return (txLine, gpioPort, gpioDdr)
+        uart' <- attachPeripheral 0x0100 uart
+        gpio' <- attachPeripheral 0x0300 gpio
+        return (uartTxLine uart', gpioPort gpio', gpioDdr gpio')
 
     return (tx, port, ddr)
 

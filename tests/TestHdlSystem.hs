@@ -3,10 +3,11 @@ module Main where
 import Prelude
 import Numeric (showHex)
 
-import Isacle.Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Isacle.Hdl.Types (KnownDom(..), Sig(..))
-import Isacle.Hdl.Prim  (Unsigned)
+import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
+import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
+import Isacle.System.HdlCircuit (GpioPhys(..), UartPhys(..))
 import Isacle.System.Generate (sysExtractMemoryMap, sysGenCHeader)
 
 data Clk
@@ -22,9 +23,9 @@ mySystem (uart0Rx, gpio0In) = do
     gpio0 <- createGpio "gpio0" gpio0In
 
     ((uart0Tx, gpio0Port, gpio0Ddr), _rdData) <- createBus "databus" $ do
-        (tx, _rxIrq, _txIrq) <- attachPeripheral 0x100 uart0
-        (port, ddr)           <- attachPeripheral 0x300 gpio0
-        return (tx, port, ddr)
+        uart0' <- attachPeripheral 0x100 uart0
+        gpio0' <- attachPeripheral 0x300 gpio0
+        return (uartTxLine uart0', gpioPort gpio0', gpioDdr gpio0')
 
     return (uart0Tx, gpio0Port, gpio0Ddr)
 
