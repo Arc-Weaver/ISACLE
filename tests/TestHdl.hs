@@ -18,7 +18,7 @@ import Hdl.Emit.Vhdl
 data Clk
 
 instance KnownDom Clk where
-    domId _ = DomId "clk" 100000000 Rising ActiveHigh
+    domId _ = DomId "clk" 100000000 Rising ActiveHigh "rst"
 
 -- ---------------------------------------------------------------------------
 -- Helpers

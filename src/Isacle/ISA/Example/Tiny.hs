@@ -34,7 +34,7 @@ import Isacle.ISA
 data TinyAlu = TinyAlu
     { gpr  :: CPURegFile 4 8
     , pc   :: CPURegister 8
-    , zero :: CPUFlag
+    , zero :: CPUFlag   -- bit 0 of the 1-bit "FLAGS" status register
     }
 
 -- ---------------------------------------------------------------------------
@@ -44,9 +44,10 @@ data TinyAlu = TinyAlu
 tinyCPUDef :: CPUDef TinyAlu
 tinyCPUDef = do
     endianness LittleEndian
-    g <- regFile "GPR" (width @4) byte
-    p <- reg    "PC"  byte
-    z <- flag   "Z"
+    g      <- regFile "GPR" (width @4) byte
+    p      <- reg    "PC"  byte
+    (_, zs)  <- flagPack @1 "FLAGS" ["Z"]
+    let z    =  head zs
     pure TinyAlu { gpr = g, pc = p, zero = z }
 
 -- ---------------------------------------------------------------------------
@@ -71,9 +72,8 @@ addDef = do
     b  <- readReg rs
     r  <- aluOp PAdd a b
     writeReg rd r
-    -- Signal-level zero detection requires a future typeclass extension;
-    -- constant Lo is a synthesis placeholder.
-    setFlag zf Lo
+    z  <- isZero r
+    setFlag zf z
 
 movDef :: (MonadALU m, AluDef m ~ TinyAlu) => m ()
 movDef = do
@@ -84,6 +84,58 @@ movDef = do
     rs <- register gpr "ss"
     v  <- readReg rs
     writeReg rd v
+
+-- | LDI rd, #n — load 4-bit immediate into register.
+-- Encoding: 01rrnnnn  (rr = dest register bits[5:4], nnnn = value bits[3:0])
+ldiDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+ldiDef = do
+    mnemonic "LDI"
+    doc      "Load immediate: rd = #n (4-bit, 0–15)"
+    encoding "01rrnnnn"
+    rd <- register gpr "rr"
+    n  <- immediate "nnnn"
+    writeReg rd n
+
+-- | ST [rd], rs — store register rs to data memory at address in rd.
+-- Encoding: 0011ssdd  (ss = data register, dd = address register)
+stDef :: (MonadALU m, AluDef m ~ TinyAlu, DataAddr m ~ Unsigned 8, Word m ~ Unsigned 8) => m ()
+stDef = do
+    mnemonic "ST"
+    doc      "Store to memory: mem[rd] = rs"
+    encoding "0011ssdd"
+    rd   <- register gpr "dd"
+    rs   <- register gpr "ss"
+    addr <- readReg rd
+    val  <- readReg rs
+    writeMem addr val
+
+-- | BRZ k — branch if Z=1 (last ADD result was zero).
+-- Encoding: 100kkkkk  (5-bit target, 0–31)
+brzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+brzDef = do
+    mnemonic "BRZ"
+    doc      "Branch if zero flag set: if Z then PC = k"
+    encoding "100kkkkk"
+    p  <- cpu pc
+    zf <- cpuFlag zero
+    z  <- getFlag zf
+    k  <- immediate "kkkkk"
+    absJumpIf p z k
+
+-- | BRNZ k — branch if Z=0 (last ADD result was nonzero).
+-- Encoding: 101kkkkk  (5-bit target, 0–31)
+brnzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+brnzDef = do
+    mnemonic "BRNZ"
+    doc      "Branch if zero flag clear: if not Z then PC = k"
+    encoding "101kkkkk"
+    p  <- cpu pc
+    zf <- cpuFlag zero
+    z  <- getFlag zf
+    k  <- immediate "kkkkk"
+    -- Take branch when z == 0 (zero flag is clear)
+    nz <- isZero z
+    absJumpIf p nz k
 
 -- | JMP encodes the target as a 6-bit immediate in bits [5:0].
 -- Requires Word m ~ Unsigned 8 so the immediate can be passed to absJump.
@@ -100,7 +152,7 @@ jmpDef = do
 -- ISA definition
 -- ---------------------------------------------------------------------------
 
-tinyISA :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => ISADef m
+tinyISA :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8, DataAddr m ~ Unsigned 8) => ISADef m
 tinyISA = defineISA ISADef
     { isaPc           = SomeCPURegister <$> cpu pc
     , isaInterruptEn  = cpuFlag zero     -- no interrupts; Z used as placeholder
@@ -114,6 +166,10 @@ tinyISA = defineISA ISADef
         [ nopDef
         , addDef
         , movDef
+        , stDef
+        , ldiDef
+        , brzDef
+        , brnzDef
         , jmpDef
         ]
     }

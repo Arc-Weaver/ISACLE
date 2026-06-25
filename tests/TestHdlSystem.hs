@@ -13,7 +13,7 @@ import Isacle.System.Generate (sysExtractMemoryMap, sysGenCHeader)
 data Clk
 instance KnownDom Clk where
     domId _ = DomId { domName = "clk", domFreqHz = 12000000
-                    , domEdge = Rising, domReset = ActiveHigh }
+                    , domEdge = Rising, domReset = ActiveHigh, domResetName = "rst" }
 
 mySystem :: (Sig Clk Bool, Sig Clk (Unsigned 8))
          -> SysDSL Clk (Unsigned 8)

@@ -196,6 +196,29 @@ executable test-tiny-cpu
     isacle,
     isacle-hdl
 
+executable test-tiny-run
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestTinyRun.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    containers,
+    isacle,
+    isacle-hdl
+
+executable test-tiny-sys
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestTinySys.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    containers,
+    directory >= 1.3,
+    isacle,
+    isacle-hdl
+
 executable test-hdl
   default-language: Haskell2010
   hs-source-dirs: tests

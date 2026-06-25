@@ -18,6 +18,8 @@ module Hdl.Net
     , hintWire
       -- * Memoised primitive emission
     , lookupOrEmit
+      -- * SExpr identity memoization
+    , memoSExpr
       -- * Multi-entity design
     , Design
       -- * Builder monad
@@ -57,10 +59,11 @@ data ResetPolarity = ActiveHigh | ActiveLow
     deriving (Show, Eq)
 
 data DomId = DomId
-    { domName    :: String
-    , domFreqHz  :: Natural
-    , domEdge    :: ClockEdge
-    , domReset   :: ResetPolarity
+    { domName      :: String
+    , domFreqHz    :: Natural
+    , domEdge      :: ClockEdge
+    , domReset     :: ResetPolarity
+    , domResetName :: String
     } deriving (Show, Eq)
 
 -- ---------------------------------------------------------------------------
@@ -94,6 +97,7 @@ data PrimOp
     | PSlice Int Int
     | PConcat
     | PResize Int
+    | PSignedResize Int   -- ^ sign-extend from src width to target width, return unsigned
     | PLit Integer Int
     | PShiftL   -- ^ logical shift left  (a, amount)
     | PShiftR   -- ^ logical shift right (a, amount)
@@ -188,12 +192,13 @@ type Design = Map.Map String [NetNode]
 -- ---------------------------------------------------------------------------
 
 data NetSt = NetSt
-    { netNodes     :: [NetNode]
-    , netWireCount :: WireId
-    , netHier      :: [String]
-    , netDeferred  :: [NetM ()]
-    , netDesign    :: Design      -- sub-entity definitions accumulated here
-    , netMemo      :: Map.Map (PrimOp, [WireId]) WireId
+    { netNodes      :: [NetNode]
+    , netWireCount  :: WireId
+    , netHier       :: [String]
+    , netDeferred   :: [NetM ()]
+    , netDesign     :: Design      -- sub-entity definitions accumulated here
+    , netMemo       :: Map.Map (PrimOp, [WireId]) WireId
+    , netSExprMemo  :: Map.Map Int WireId  -- StableName hash → wire (prevents SExpr re-alloc)
     }
 
 instance Show NetSt where
@@ -208,21 +213,33 @@ newtype NetM a = NetM { _unNetM :: State NetSt a }
 
 initSt :: NetSt
 initSt = NetSt
-    { netNodes     = []
-    , netWireCount = 0
-    , netHier      = []
-    , netDeferred  = []
-    , netDesign    = Map.empty
-    , netMemo      = Map.empty
+    { netNodes      = []
+    , netWireCount  = 0
+    , netHier       = []
+    , netDeferred   = []
+    , netDesign     = Map.empty
+    , netMemo       = Map.empty
+    , netSExprMemo  = Map.empty
     }
+
+-- | Drain deferred actions in rounds until none remain.
+-- Required when deferred actions (e.g. NReg emissions) themselves materialize
+-- new SExprs that add further deferred actions (e.g. mutually-recursive
+-- registers).  StableName memoization in 'materialize' guarantees termination.
+drainDeferred :: NetSt -> NetSt
+drainDeferred st
+    | null (netDeferred st) = st
+    | otherwise =
+        let deferred   = reverse (netDeferred st)
+            (_, st') = runState (mapM_ _unNetM deferred) st { netDeferred = [] }
+        in drainDeferred st'
 
 -- | Run a circuit, returning the top-level node list and accumulated sub-entity design.
 runNetM :: NetM a -> (a, [NetNode], Design)
 runNetM (NetM m) = (a, reverse (netNodes finalSt), netDesign finalSt)
   where
-    (a, st0)    = runState m initSt
-    deferred    = reverse (netDeferred st0)
-    (_, finalSt) = runState (mapM_ _unNetM deferred) st0 { netDeferred = [] }
+    (a, st0) = runState m initSt
+    finalSt  = drainDeferred st0
 
 -- | Flat single-entity extraction (backward-compatible).
 execNetM :: NetM a -> [NetNode]
@@ -268,6 +285,20 @@ lookupOrEmit op ins = NetM $ do
             modify $ \s -> s { netMemo = Map.insert (op, ins) w (netMemo s) }
             pure w
 
+-- | Memoize an 'SExpr' action by its 'StableName' hash.
+-- When the same action thunk is materialized more than once (e.g. in deferred
+-- rounds), the second call returns the wire allocated on the first call rather
+-- than running the action again and creating an orphaned fresh wire.
+memoSExpr :: NetM WireId -> Int -> NetM WireId
+memoSExpr m key = NetM $ do
+    memo <- gets netSExprMemo
+    case Map.lookup key memo of
+        Just wid -> pure wid
+        Nothing  -> do
+            wid <- _unNetM m
+            modify $ \s -> s { netSExprMemo = Map.insert key wid (netSExprMemo s) }
+            pure wid
+
 -- | Schedule an action for after the main body (used by registers for
 -- feedback-safe deferred NReg emission).
 defer :: NetM () -> NetM ()
@@ -291,9 +322,8 @@ inBlock instName entityName inWireIds body = NetM $ do
     -- Run the body in a fresh sub-entity state (local wire counter from 0).
     let subSt0 = initSt { netDesign = netDesign st0 }
     let (bodyResult, subSt') = runState (_unNetM body) subSt0
-    -- Drain deferred actions within the sub-entity.
-    let deferred = reverse (netDeferred subSt')
-    let (_, subSt) = runState (mapM_ _unNetM deferred) subSt' { netDeferred = [] }
+    -- Drain deferred actions within the sub-entity (multi-round for mutual recursion).
+    let subSt   = drainDeferred subSt'
     let subNodes = reverse (netNodes subSt)
     -- Build input port map by zipping discovered NInput names with caller's wires.
     let inputNodes = [ n | n@NInput{} <- subNodes ]

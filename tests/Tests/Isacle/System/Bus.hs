@@ -19,7 +19,7 @@ assert msg True  = putStrLn ("ok:   " ++ msg)
 
 data Clk
 instance KnownDom Clk where
-    domId _ = DomId "clk" 12000000 Rising ActiveHigh
+    domId _ = DomId "clk" 12000000 Rising ActiveHigh "rst"
 
 -- ---------------------------------------------------------------------------
 -- Test system: single GPIO peripheral on a data bus

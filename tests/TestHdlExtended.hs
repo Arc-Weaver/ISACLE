@@ -19,11 +19,11 @@ import Hdl.Emit.Vhdl
 
 data Clk
 instance KnownDom Clk where
-    domId _ = DomId "clk" 100_000_000 Rising ActiveHigh
+    domId _ = DomId "clk" 100_000_000 Rising ActiveHigh "rst"
 
 data SlowClk
 instance KnownDom SlowClk where
-    domId _ = DomId "slow_clk" 1_000_000 Rising ActiveHigh
+    domId _ = DomId "slow_clk" 1_000_000 Rising ActiveHigh "nrst"
 
 -- ---------------------------------------------------------------------------
 -- Helpers

@@ -97,11 +97,15 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     let resetEntries = runResetDef (isaReset isaDef) aluRec
     let resetRegMap  = Map.fromList
             [ (n, v) | ResetRegEntry n (Unsigned v) <- resetEntries ]
-    let resetFlagMap = Map.fromList
-            [ (n, b) | ResetFlagEntry n b <- resetEntries ]
+    -- Accumulate per-bit flag reset contributions into per-register initial values.
+    let resetFlagContribs = Map.fromListWith (.|.)
+            [ (rn, if b == Hi then 1 `shiftL` bp else 0)
+            | ResetFlagEntry rn bp b <- resetEntries ]
 
     -- -----------------------------------------------------------------------
     -- Scalar registers (NReg, deferred)
+    -- Status registers are included here — flagPack adds them to schRegisters.
+    -- Their initial value merges resetReg and resetFlag contributions.
     -- -----------------------------------------------------------------------
 
     scalarRegs <- forM (schRegisters schema) $ \(name, w) -> do
@@ -109,6 +113,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
         nxtW <- freshWire
         enW  <- freshWire
         let initVal = Map.findWithDefault 0 name resetRegMap
+                  .|. Map.findWithDefault 0 name resetFlagContribs
         defer $ emit $ NReg outW nxtW (Just enW) (SomeBits initVal w) domInfo
         hintWire outW name
         hintWire nxtW (name ++ "_nxt")
@@ -124,21 +129,6 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
             Nothing              -> freshWire
 
     -- -----------------------------------------------------------------------
-    -- Flags (1-bit NReg, deferred)
-    -- -----------------------------------------------------------------------
-
-    flags <- forM (schFlags schema) $ \name -> do
-        outW <- freshWire
-        nxtW <- freshWire
-        enW  <- freshWire
-        let initBit = Map.findWithDefault Lo name resetFlagMap
-            initVal = case initBit of { Lo -> 0; Hi -> 1 }
-        defer $ emit $ NReg outW nxtW (Just enW) (SomeBits initVal 1) domInfo
-        hintWire outW ("flag_" ++ name)
-        hintWire nxtW ("flag_" ++ name ++ "_nxt")
-        return (name, outW, nxtW, enW)
-
-    -- -----------------------------------------------------------------------
     -- Register-file info table (from CPUSchema)
     -- -----------------------------------------------------------------------
 
@@ -147,13 +137,62 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
             [ (n, (c, w)) | (n, c, w) <- schRegFiles schema ]
 
     -- -----------------------------------------------------------------------
-    -- Run each instruction body
+    -- Status register map: name → (width, [flag names MSB-first])
+    -- Used for the combined flag+scalar write arbiter.
     -- -----------------------------------------------------------------------
+
+    let statusRegMap = Map.fromList
+            [ (n, (w, fs)) | (n, w, fs) <- schStatusRegs schema ]
+
+    -- -----------------------------------------------------------------------
+    -- Flag reader: extract a single bit from the status register output wire.
+    -- -----------------------------------------------------------------------
+
+    let getFlagFn :: String -> Int -> NetM WireId
+        getFlagFn regName bitPos = case Map.lookup regName scalarRegMap of
+            Nothing -> freshWire
+            Just (_, regOutW, _, _) -> do
+                out <- freshWire
+                emit $ NComb out (N.PSlice bitPos bitPos) [regOutW]
+                return out
+
+    -- -----------------------------------------------------------------------
+    -- Alias-aware data memory reader
+    -- For each aliasReg entry, builds a comparator and mux so that reads from
+    -- the alias address return the register value instead of SRAM data.
+    -- -----------------------------------------------------------------------
+
+    let scReadMemFnAlias :: WireId -> NetM WireId
+        scReadMemFnAlias addrW =
+            foldl' (\accM (regName, aliasAddr) -> do
+                acc <- accM
+                let mSrc = fmap (\(rw, rout, _, _) -> (rout, rw))
+                                (Map.lookup regName scalarRegMap)
+                case mSrc of
+                    Nothing -> return acc
+                    Just (srcW, srcBits) -> do
+                        addrLitW <- litWire aliasAddr addrBits
+                        cmpW <- freshWire
+                        emit $ NComb cmpW N.PEq [addrW, addrLitW]
+                        dataW <- case compare srcBits wordBits of
+                            EQ -> return srcW
+                            LT -> do { w <- freshWire
+                                     ; emit $ NComb w (N.PResize wordBits) [srcW]
+                                     ; return w }
+                            GT -> do { w <- freshWire
+                                     ; emit $ NComb w (N.PSlice (wordBits - 1) 0) [srcW]
+                                     ; return w }
+                        muxW <- freshWire
+                        emit $ NComb muxW N.PMux [cmpW, dataW, acc]
+                        return muxW)
+                (return dmemRdDataW)
+                (schAliasRegs schema)
 
     results <- forM (isaInstrs isaDef) $ \instr ->
         runSynthM aluRec instrWireId scReadRegFn
-                  (const (return dmemRdDataW))
+                  scReadMemFnAlias
                   (const (return cmemRdDataW))
+                  getFlagFn
                   instr
 
     -- -----------------------------------------------------------------------
@@ -217,35 +256,106 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
                 emit $ NComb (rrOutWire rr) N.POr [rdOutW, rdOutW]
 
     -- -----------------------------------------------------------------------
-    -- Write arbiters — scalar registers
+    -- Alias register write decode
+    -- When writeMem targets an aliased data-space address, route it to the
+    -- aliased architectural register via a ScalarWriteReq.
+    -- Status registers (e.g. SREG at 0x5F) are now plain scalar registers,
+    -- so they are handled here too — the combined flag+scalar arbiter below
+    -- merges whole-register writes with individual flag writes.
     -- -----------------------------------------------------------------------
 
-    let allScalarWrites = concatMap srScalarWrites results
+    let allMemWrites = concatMap srMemWrites results
+
+    aliasScalarWriteReqs <- fmap concat $ forM (schAliasRegs schema) $
+        \(regName, aliasAddr) ->
+            case Map.lookup regName scalarRegMap of
+                Nothing -> return []
+                Just (regW, regOutW, _, _) -> forM allMemWrites $ \mw -> do
+                    addrLitW <- litWire aliasAddr addrBits
+                    cmpW  <- freshWire
+                    emit  $ NComb cmpW N.PEq [mwAddrWire mw, addrLitW]
+                    gated <- freshWire
+                    emit  $ NComb gated N.PAnd [mwMatchWire mw, cmpW]
+                    if regW == wordBits
+                        then return (ScalarWriteReq gated regName (mwDataWire mw))
+                        else do
+                            hiW   <- freshWire
+                            emit  $ NComb hiW (N.PSlice (regW - 1) wordBits) [regOutW]
+                            fullW <- freshWire
+                            emit  $ NComb fullW N.PConcat [hiW, mwDataWire mw]
+                            return (ScalarWriteReq gated regName fullW)
+
+    -- -----------------------------------------------------------------------
+    -- Write arbiters — scalar registers and status registers
+    --
+    -- Status registers (in statusRegMap) use a combined bit-level arbiter:
+    -- each bit is driven by either a flag write (setFlag) or a whole-register
+    -- write (writeReg / alias write), whichever fires.  Regular scalar
+    -- registers use the standard mux-tree arbiter.
+    -- -----------------------------------------------------------------------
+
+    let allScalarWrites = concatMap srScalarWrites results ++ aliasScalarWriteReqs
+    let allFlagWrites   = concatMap srFlagWrites results
     let scalarWritesByReg :: Map String [ScalarWriteReq]
         scalarWritesByReg = foldl' (\m r -> Map.insertWith (++) (swRegName r) [r] m)
                                     Map.empty allScalarWrites
 
     pcName <- extractPcName aluRec isaDef
 
-    forM_ scalarRegs $ \(name, w, _outW, nxtW, enW) -> do
-        let writes = Map.findWithDefault [] name scalarWritesByReg
+    forM_ scalarRegs $ \(name, w, regOutW, nxtW, enW) -> do
+        let scWrites = Map.findWithDefault [] name scalarWritesByReg
 
         if name == pcName
             then do
-                let (_, _, pcOutW, _, _) = head
-                        [ s | s@(n, _, _, _, _) <- scalarRegs, n == name ]
                 litOneW  <- litWire 1 w
                 pcIncW   <- do { o <- freshWire
-                               ; emit $ NComb o N.PAdd [pcOutW, litOneW]
+                               ; emit $ NComb o N.PAdd [regOutW, litOneW]
                                ; return o }
                 pcNxtW   <- buildMuxTree
-                                [(swMatchWire r, swDataWire r) | r <- writes]
+                                [(swMatchWire r, swDataWire r) | r <- scWrites]
                                 pcIncW
                 litOneEn <- litWire 1 1
                 driveWire nxtW pcNxtW
                 driveWire enW  litOneEn
-            else do
-                case writes of
+
+        else case Map.lookup name statusRegMap of
+            Just (_, flagNames) -> do
+                -- Combined arbiter: per-bit mux merging flag writes and
+                -- whole-register scalar writes.  Flag writes take priority
+                -- (they appear first in buildMuxTree).
+                let bitAssigns = zip (reverse [0 .. w - 1]) flagNames
+                bitNextWires <- forM bitAssigns $ \(bitPos, _) -> do
+                    curBitW <- freshWire
+                    emit $ NComb curBitW (N.PSlice bitPos bitPos) [regOutW]
+                    -- Flag writes at this bit position
+                    let fwPairs = [ (fwMatchWire fw, fwValueWire fw)
+                                  | fw <- allFlagWrites
+                                  , fwRegName fw == name
+                                  , fwBitPos  fw == bitPos ]
+                    -- Scalar writes: extract this bit from the written word
+                    scPairs <- forM scWrites $ \sw -> do
+                        bitExtW <- freshWire
+                        emit $ NComb bitExtW (N.PSlice bitPos bitPos) [swDataWire sw]
+                        return (swMatchWire sw, bitExtW)
+                    buildMuxTree (fwPairs ++ scPairs) curBitW
+                -- Concatenate bits MSB-first into new register value
+                sregNextW <- case bitNextWires of
+                    [] -> litWire 0 w
+                    (msbW : restBits) -> foldl' (\accM bw -> do
+                        acc <- accM
+                        out <- freshWire
+                        emit $ NComb out N.PConcat [acc, bw]
+                        return out) (return msbW) restBits
+                -- Enable if any write (flag or scalar) fired
+                let allMatchWires = map fwMatchWire (filter ((== name) . fwRegName) allFlagWrites)
+                                 ++ map swMatchWire scWrites
+                enOrW <- buildOrTree allMatchWires
+                driveWire enW  enOrW
+                driveWire nxtW sregNextW
+
+            Nothing -> do
+                -- Regular scalar register arbiter
+                case scWrites of
                     [] -> do
                         litZeroEn <- litWire 0 1
                         litZeroD  <- litWire 0 w
@@ -261,31 +371,6 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
                         driveWire nxtW nxtMux
 
     -- -----------------------------------------------------------------------
-    -- Write arbiters — flags
-    -- -----------------------------------------------------------------------
-
-    let allFlagWrites = concatMap srFlagWrites results
-    let flagWritesByName :: Map String [FlagWriteReq]
-        flagWritesByName = foldl' (\m r -> Map.insertWith (++) (fwFlagName r) [r] m)
-                                   Map.empty allFlagWrites
-
-    forM_ flags $ \(name, _outW, nxtW, enW) -> do
-        let writes = Map.findWithDefault [] name flagWritesByName
-        case writes of
-            [] -> do
-                litZeroEn <- litWire 0 1
-                litZeroD  <- litWire 0 1
-                driveWire enW  litZeroEn
-                driveWire nxtW litZeroD
-            ws -> do
-                enOrW <- buildOrTree (map fwMatchWire ws)
-                let FlagWriteConst _ _ b = head ws
-                    bVal = case b of { Lo -> 0; Hi -> 1 }
-                valW  <- litWire bVal 1
-                driveWire enW  enOrW
-                driveWire nxtW valW
-
-    -- -----------------------------------------------------------------------
     -- Data memory read address mux
     -- -----------------------------------------------------------------------
 
@@ -299,7 +384,6 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     -- Data memory write arbiter
     -- -----------------------------------------------------------------------
 
-    let allMemWrites = concatMap srMemWrites results
     (dmemWrEnW, dmemWrAddrW, dmemWrDatW) <- case allMemWrites of
         [] -> (,,) <$> litWire 0 1
                    <*> litWire 0 addrBits

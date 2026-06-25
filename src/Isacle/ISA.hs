@@ -28,7 +28,6 @@ module Isacle.ISA
     , endianness
     , regFile
     , reg
-    , flag
     , flagPack
     , aliasReg
     , aliasFile

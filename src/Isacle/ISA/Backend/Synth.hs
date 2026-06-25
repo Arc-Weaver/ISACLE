@@ -70,6 +70,9 @@ data SynthCtx alu = SynthCtx
       --   address separately using 'srMemReads'.
     , scReadCode  :: WireId -> NetM WireId
       -- ^ code-memory reader (for LPM-style instructions).
+    , scGetFlag   :: String -> Int -> NetM WireId
+      -- ^ flag bit reader: @regName → bitPos → 1-bit output wire@.
+      --   Emits a PSlice node to extract the bit from the status register.
     }
 
 -- ---------------------------------------------------------------------------
@@ -114,12 +117,12 @@ data MemReadReq = MemReadReq
     , mrAddrWire  :: WireId
     } deriving (Show)
 
--- | Flag write request.  Currently only constant writes are produced;
--- signal-level flag ops are a planned typeclass extension.
-data FlagWriteReq = FlagWriteConst
+-- | Flag write request: set one bit of a status register when the instruction fires.
+data FlagWriteReq = FlagWriteReq
     { fwMatchWire :: WireId
-    , fwFlagName  :: String
-    , fwValue     :: Bit
+    , fwRegName   :: String   -- ^ status register name
+    , fwBitPos    :: Int      -- ^ bit position (0 = LSB)
+    , fwValueWire :: WireId   -- ^ 1-bit value wire
     } deriving (Show)
 
 -- ---------------------------------------------------------------------------
@@ -361,15 +364,52 @@ instance KnownNat wordW => MonadALU (SynthM alu wordW addrW codeWordW codeAddrW)
                     MemWriteReq matchW (fromIntegral addrWire) clamped
                     : ssMemWrites s }
 
-    getFlag (CPUFlag _) = return Lo
+    getFlag (CPUFlag { cpuFlagReg = regName, cpuFlagBit = bitPos }) = SynthM $ do
+        ctx <- ask
+        w <- lift $ lift $ scGetFlag ctx regName bitPos
+        return (Unsigned (fromIntegral w))
 
-    setFlag (CPUFlag name) b = SynthM $ do
+    setFlag (CPUFlag { cpuFlagReg = regName, cpuFlagBit = bitPos }) (Unsigned valW) = SynthM $ do
         st <- get
         case ssMatchWire st of
             Nothing     -> return ()
             Just matchW ->
                 modify $ \s -> s { ssFlagWrites =
-                    FlagWriteConst matchW name b : ssFlagWrites s }
+                    FlagWriteReq matchW regName bitPos (fromIntegral valW) : ssFlagWrites s }
+
+    absJumpIf (CPURegister key) (Unsigned condW) (Unsigned targetW) = SynthM $ do
+        st <- get
+        case ssMatchWire st of
+            Nothing     -> return ()
+            Just matchW -> do
+                gatedW <- lift $ lift $ do
+                    out <- freshWire
+                    emit $ NComb out N.PAnd [matchW, fromIntegral condW]
+                    return out
+                modify $ \s -> s { ssScalarWrites =
+                    ScalarWriteReq gatedW key (fromIntegral targetW) : ssScalarWrites s }
+
+    signExtendBits = \(v :: Unsigned k) -> go v Proxy
+      where
+        go :: forall k n. (KnownNat k, KnownNat n)
+           => Unsigned k -> Proxy n -> SynthM alu wordW addrW codeWordW codeAddrW (Unsigned n)
+        go (Unsigned srcW) proxy = SynthM $ lift $ lift $ do
+            let dstW = fromIntegral (natVal proxy) :: Int
+            out <- freshWire
+            emit $ NComb out (N.PSignedResize dstW) [fromIntegral srcW]
+            return (Unsigned (fromIntegral out))
+
+    isZero = \(v :: Unsigned n) -> go v Proxy
+      where
+        go :: KnownNat n => Unsigned n -> Proxy n -> SynthM alu wordW addrW codeWordW codeAddrW (Unsigned 1)
+        go (Unsigned wa) proxy = SynthM $ lift $ lift $ do
+            let bw    = fromIntegral (natVal proxy) :: Int
+                w     = fromIntegral wa :: WireId
+            zeroW <- freshWire
+            emit $ NComb zeroW (N.PLit 0 bw) []
+            out   <- freshWire
+            emit $ NComb out N.PEq [w, zeroW]
+            return (Unsigned (fromIntegral out))
 
     aluOp PNot (Unsigned wa) _ = SynthM $ lift $ lift $ do
         out <- freshWire
@@ -410,14 +450,15 @@ instance KnownNat wordW => MonadHarvardALU (SynthM alu wordW addrW codeWordW cod
 
 -- | Run one instruction body, collecting all combinational side effects.
 runSynthM :: alu
-          -> WireId                           -- ^ instruction word wire
-          -> (String -> WireId -> NetM WireId) -- ^ scalar register reader
-          -> (WireId -> NetM WireId)           -- ^ data memory reader
-          -> (WireId -> NetM WireId)           -- ^ code memory reader
+          -> WireId                             -- ^ instruction word wire
+          -> (String -> WireId -> NetM WireId)  -- ^ scalar register reader
+          -> (WireId -> NetM WireId)             -- ^ data memory reader
+          -> (WireId -> NetM WireId)             -- ^ code memory reader
+          -> (String -> Int -> NetM WireId)      -- ^ flag bit reader: regName → bitPos → 1-bit wire
           -> SynthM alu wordW addrW codeWordW codeAddrW ()
           -> NetM SynthResult
-runSynthM aluRec instrWire readRegFn readMemFn readCodeFn (SynthM m) = do
-    let ctx = SynthCtx aluRec instrWire readRegFn readMemFn readCodeFn
+runSynthM aluRec instrWire readRegFn readMemFn readCodeFn getFlagFn (SynthM m) = do
+    let ctx = SynthCtx aluRec instrWire readRegFn readMemFn readCodeFn getFlagFn
     (_, st) <- runStateT (runReaderT m ctx) initSynthSt
     return SynthResult
         { srMatchWire    = ssMatchWire st
@@ -434,6 +475,7 @@ runSynthM aluRec instrWire readRegFn readMemFn readCodeFn (SynthM m) = do
 -- from ISADef fields (which only read the ALU record and emit no nodes).
 evalSynthM :: alu -> SynthM alu wordW addrW codeWordW codeAddrW a -> NetM a
 evalSynthM aluRec (SynthM m) = do
-    let ctx = SynthCtx aluRec 0 (\_ _ -> return 0) (const (return 0)) (const (return 0))
+    let ctx = SynthCtx aluRec 0 (\_ _ -> return 0) (const (return 0))
+                               (const (return 0)) (\_ _ -> return 0)
     (a, _) <- runStateT (runReaderT m ctx) initSynthSt
     return a

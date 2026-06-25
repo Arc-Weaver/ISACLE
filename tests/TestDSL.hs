@@ -23,7 +23,7 @@ assert msg True  = putStrLn ("ok:   " ++ msg)
 
 data Clk
 instance KnownDom Clk where
-    domId _ = DomId "clk" 12000000 Rising ActiveHigh
+    domId _ = DomId "clk" 12000000 Rising ActiveHigh "rst"
 
 -- ---------------------------------------------------------------------------
 -- System description: UART at 0x0100, GPIO at 0x0300

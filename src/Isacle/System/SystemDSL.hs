@@ -166,6 +166,7 @@ data PeriphSlot dom dat = PeriphSlot
     , psSize      :: Word32      -- address window in bytes
     , psRdData    :: WireId      -- pre-allocated system-level wire; peripheral drives this
     , psPhysWires :: [WireId]    -- pre-allocated system-level wires for physical outputs
+    , psPhysMeta  :: [PortSpec]  -- metadata (name, width, dom) for each physical output
     , psSpec      :: PeriphSpec
     , psRun       :: WireId -> NetM ()
       -- ^ Instantiates the peripheral sub-entity at the system level.
@@ -200,7 +201,7 @@ newtype BusDSL dom dat a = BusDSL (StateT (BusDSLState dom dat) NetM a)
 -- @
 attachPeripheral
     :: forall p dom dat a.
-       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), HdlPhys a)
+       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), HdlPhys a, HdlPorts a)
     => Word32
     -> PeriphToken p dom dat a
     -> BusDSL dom dat a
@@ -254,6 +255,7 @@ attachPeripheral base token = BusDSL $ do
             , psSize      = size
             , psRdData    = rdDataW
             , psPhysWires = physWires
+            , psPhysMeta  = portSpecs (Proxy @a)
             , psSpec      = spec
             , psRun       = runPeriph
             }
@@ -357,7 +359,9 @@ createBus busName (BusDSL busSt) = SysDSL $ do
                           , map (\(_, w, _) -> w) (init ports) )
 
     -- Instantiate each peripheral entity at the system level (siblings of bus).
+    -- Then promote their physical output wires to top-level ports.
     lift $ zipWithM_ psRun slots weGatedParentWires
+    lift $ mapM_ promotePhysOuts slots
 
     let bh = BusHandle
                 { bhWrAddr = wrAddr
@@ -374,6 +378,10 @@ createBus busName (BusDSL busSt) = SysDSL $ do
     domInfo = domId (Proxy @dom)
     datW    = fromIntegral (natVal (Proxy @(Width dat)))
     addrW   = 32 :: Int
+    promotePhysOuts slot =
+        zipWithM_ (\wid ps ->
+            emit $ NOutput wid (psName slot ++ "_" ++ portName ps) (portWidth ps) (portDom ps)
+        ) (psPhysWires slot) (psPhysMeta slot)
 
 -- ---------------------------------------------------------------------------
 -- IRQ controller
@@ -418,50 +426,80 @@ createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
            -> [Integer]
            -> SysDSL dom dat ()
 createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
-    let codeWordB = fromIntegral (natVal (Proxy @codeWordW)) :: Int
+    let codeWordB    = fromIntegral (natVal (Proxy @codeWordW))  :: Int
+    let wordBits     = fromIntegral (natVal (Proxy @(Width dat))) :: Int
+    let addrBits     = fromIntegral (natVal (Proxy @addrW))       :: Int
+    let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW))   :: Int
+    let domInfo      = domId (Proxy @dom)
 
-    -- Pre-allocate CPU input wires (driven after synthesis)
-    instrWordW  <- lift freshWire
-    dmemRdDataW <- lift freshWire
-    cmemRdDataW <- lift freshWire
-    lift $ hintWire instrWordW  "instr_word"
-    lift $ hintWire dmemRdDataW "data_rd_data"
+    -- Pre-allocate parent-side wires that map to the CPU's input ports.
+    -- These are driven in the parent context after the sub-entity is built.
+    instrWordParW  <- lift freshWire
+    dmemRdDataParW <- lift freshWire
+    cmemRdDataParW <- lift freshWire
 
-    -- Synthesise CPU core; get memory interface wire IDs
-    cmi <- lift $ synthHarvardCPU'
-               @dom @(Width dat) @addrW @codeWordW @codeAddrW
-               cpuDef isaDef instrWordW dmemRdDataW cmemRdDataW
+    -- Synthesise the CPU inside a named sub-entity so it appears as a
+    -- distinct entity in the VHDL hierarchy and is independently testable.
+    ((), cpuPorts) <- lift $ inBlock instName instName
+        [instrWordParW, dmemRdDataParW, cmemRdDataParW] $ do
+            -- Input ports (order must match the parent wire list above).
+            instrWordW  <- freshWire
+            dmemRdDataW <- freshWire
+            cmemRdDataW <- freshWire
+            emit $ NInput instrWordW  "instr_word"   codeWordB domInfo
+            emit $ NInput dmemRdDataW "data_rd_data" wordBits  domInfo
+            emit $ NInput cmemRdDataW "code_rd_data" codeWordB domInfo
 
-    -- Name key interface signals
-    lift $ do
-        hintWire (cmiCodeRdAddr cmi) "code_addr"
-        hintWire (cmiDataRdAddr cmi) "data_rd_addr"
-        hintWire (cmiDataWrEn   cmi) "data_wr_en"
-        hintWire (cmiDataWrAddr cmi) "data_wr_addr"
-        hintWire (cmiDataWrData cmi) "data_wr_data"
+            cmi <- synthHarvardCPU'
+                       @dom @(Width dat) @addrW @codeWordW @codeAddrW
+                       cpuDef isaDef instrWordW dmemRdDataW cmemRdDataW
 
-    -- Code ROM: combinational lookup, addressed by PC
-    let romSize = max 1 (length romWords)
-    lift $ emit $ NRom instrWordW (cmiCodeRdAddr cmi) romSize codeWordB romWords
+            hintWire (cmiCodeRdAddr cmi) "code_addr"
+            hintWire (cmiDataRdAddr cmi) "data_rd_addr"
+            hintWire (cmiDataWrEn   cmi) "data_wr_en"
+            hintWire (cmiDataWrAddr cmi) "data_wr_addr"
+            hintWire (cmiDataWrData cmi) "data_wr_data"
 
-    -- Second ROM port at PC+1 for 2-word instructions (STS, LDS, CALL, JMP)
+            -- Output ports — order determines index in cpuPorts list.
+            emit $ NOutput (cmiCodeRdAddr cmi) "code_addr"    codeAddrBits domInfo
+            emit $ NOutput (cmiDataRdAddr cmi) "data_rd_addr" addrBits     domInfo
+            emit $ NOutput (cmiDataWrEn   cmi) "data_wr_en"  1             domInfo
+            emit $ NOutput (cmiDataWrAddr cmi) "data_wr_addr" addrBits     domInfo
+            emit $ NOutput (cmiDataWrData cmi) "data_wr_data" wordBits     domInfo
+
+    -- Resolve parent wires for each CPU output port by name.
+    let findPort name = case [ w | (n, w, _) <- cpuPorts, n == name ] of
+            (w:_) -> w
+            []    -> error ("createHarvardCPU: missing output port " ++ name)
+        codeAddrParW   = findPort "code_addr"
+        dataRdAddrParW = findPort "data_rd_addr"
+        dataWrEnParW   = findPort "data_wr_en"
+        dataWrAddrParW = findPort "data_wr_addr"
+        dataWrDataParW = findPort "data_wr_data"
+
+    -- Code ROMs live in the parent context, addressed by the CPU's PC output.
+    let romCapacity = 2 ^ codeAddrBits
+        romData     = take romCapacity (romWords ++ repeat 0)
+    lift $ emit $ NRom instrWordParW codeAddrParW romCapacity codeWordB romData
+
+    -- Second ROM port at PC+1 for 2-word instructions.
     lift $ do
         lit1W    <- freshWire
         pcPlus1W <- freshWire
-        emit $ NComb lit1W    (PLit 1 (cmiCodeAddrW cmi)) []
-        emit $ NComb pcPlus1W PAdd [cmiCodeRdAddr cmi, lit1W]
-        emit $ NRom cmemRdDataW pcPlus1W romSize codeWordB romWords
+        emit $ NComb lit1W    (PLit 1 codeAddrBits) []
+        emit $ NComb pcPlus1W PAdd [codeAddrParW, lit1W]
+        emit $ NRom cmemRdDataParW pcPlus1W romCapacity codeWordB romData
 
-    -- Wire CPU data outputs → bus master wires, resizing addresses 16→32
+    -- Wire CPU data outputs → bus master wires, resizing addresses if needed.
     lift $ do
-        wrAddrR <- resizeTo (cmiDataAddrW cmi) (bhAddrW dataBus) (cmiDataWrAddr cmi)
-        rdAddrR <- resizeTo (cmiDataAddrW cmi) (bhAddrW dataBus) (cmiDataRdAddr cmi)
+        wrAddrR <- resizeTo addrBits (bhAddrW dataBus) dataWrAddrParW
+        rdAddrR <- resizeTo addrBits (bhAddrW dataBus) dataRdAddrParW
         alias (bhWrAddr dataBus) wrAddrR
-        alias (bhWrData dataBus) (cmiDataWrData cmi)
-        alias (bhWrEn   dataBus) (cmiDataWrEn   cmi)
+        alias (bhWrData dataBus) dataWrDataParW
+        alias (bhWrEn   dataBus) dataWrEnParW
         alias (bhRdAddr dataBus) rdAddrR
-        -- Wire bus aggregated read data → CPU data input
-        alias dmemRdDataW (bhRdData dataBus)
+        -- Bus read data → CPU data input (drives the parent-side input wire)
+        alias dmemRdDataParW (bhRdData dataBus)
 
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
 

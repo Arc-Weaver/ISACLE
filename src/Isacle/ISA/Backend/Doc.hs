@@ -86,8 +86,10 @@ instance MonadALU (DocM alu) where
     writeReg _ _ = return ()
     readMem _    = return (Unsigned 0)
     writeMem _ _ = return ()
-    getFlag _    = return Lo
+    getFlag _    = return 0
     setFlag _ _  = return ()
+    isZero _        = return 0
+    absJumpIf _ _ _ = return ()
     aluOp _ x _  = return x
 
 instance MonadHarvardALU (DocM alu) where

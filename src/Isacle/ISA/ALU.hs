@@ -1,8 +1,13 @@
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 module Isacle.ISA.ALU where
 
 import Prelude hiding (Word)
 import Data.Kind (Type)
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (natVal)
 import Hdl.Bits
 import Isacle.ISA.Types
 
@@ -84,8 +89,25 @@ class Monad m => MonadALU m where
     -- Flag operations
     -- ------------------------------------------------------------------
 
-    getFlag :: CPUFlag -> m Bit
-    setFlag :: CPUFlag -> Bit -> m ()
+    getFlag :: CPUFlag -> m (Unsigned 1)
+    setFlag :: CPUFlag -> Unsigned 1 -> m ()
+
+    -- | Sign-extend a k-bit value to n bits, interpreting the source as 2's
+    -- complement signed.  Default uses Haskell signed wrapping (correct for
+    -- simulation); the synthesis backend overrides this to emit PSignedResize.
+    signExtendBits :: forall k n. (KnownNat k, KnownNat n) => Unsigned k -> m (Unsigned n)
+    signExtendBits v =
+        let w   = fromIntegral (natVal (Proxy @k)) :: Int
+            raw = toInteger v
+            sgn = raw >= (1 `shiftL` (w - 1))
+            ext = if sgn then raw - (1 `shiftL` w) else raw
+        in pure (fromInteger ext)
+
+    -- | Test whether an n-bit value is zero, returning a 1-bit result.
+    isZero :: KnownNat n => Unsigned n -> m (Unsigned 1)
+
+    -- | Conditional absolute jump: write target to pcReg only when cond == 1.
+    absJumpIf :: KnownNat w => CPURegister w -> Unsigned 1 -> Unsigned w -> m ()
 
     -- ------------------------------------------------------------------
     -- ALU operations

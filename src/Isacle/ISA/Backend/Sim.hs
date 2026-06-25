@@ -40,7 +40,6 @@ import Isacle.ISA.Encoding
 --   Single registers use their declared name: @\"SP\"@, @\"PC\"@.
 data SimCPU = SimCPU
     { scRegs  :: Map String Integer
-    , scFlags :: Map String Bit
     } deriving (Show, Eq)
 
 -- | Full simulation state: CPU state plus separate data and code memories,
@@ -53,7 +52,7 @@ data SimState = SimState
     } deriving (Show)
 
 emptySim :: SimState
-emptySim = SimState (SimCPU Map.empty Map.empty) IntMap.empty IntMap.empty Nothing
+emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing
 
 -- ---------------------------------------------------------------------------
 -- Simulation monad
@@ -156,13 +155,26 @@ instance MonadALU (SimM alu wordW addrW codeWordW codeAddrW) where
         let Unsigned v = val
         modify $ \st -> st { ssDataMem = IntMap.insert (fromIntegral addr) v (ssDataMem st) }
 
-    getFlag (CPUFlag name) = SimM $ do
+    -- Flags are stored as bits inside the status register (scRegs).
+    -- The register value is read/written with a bitmask at the flag's bit position.
+    getFlag (CPUFlag { cpuFlagReg = regName, cpuFlagBit = bitPos }) = SimM $ do
         st <- get
-        return (Map.findWithDefault Lo name (scFlags (ssCPU st)))
+        let regVal = Map.findWithDefault 0 regName (scRegs (ssCPU st))
+        return (fromInteger ((regVal `shiftR` bitPos) .&. 1))
 
-    setFlag (CPUFlag name) b = SimM $
-        modify $ \st -> st { ssCPU = (ssCPU st)
-            { scFlags = Map.insert name b (scFlags (ssCPU st)) } }
+    setFlag (CPUFlag { cpuFlagReg = regName, cpuFlagBit = bitPos }) (Unsigned v) = SimM $ do
+        let mask   = 1 `shiftL` bitPos
+            bitVal = if v /= 0 then mask else 0
+        modify $ \st ->
+            let old = Map.findWithDefault 0 regName (scRegs (ssCPU st))
+                new = (old .&. complement mask) .|. bitVal
+            in st { ssCPU = (ssCPU st)
+                    { scRegs = Map.insert regName new (scRegs (ssCPU st)) } }
+
+    isZero (Unsigned v) = return (if v == 0 then 1 else 0)
+
+    absJumpIf pcReg (Unsigned cond) target =
+        if cond /= 0 then writeReg pcReg target else return ()
 
     -- | ALU operation; result is masked to @w@ bits so PNot is correct.
     aluOp :: forall w. KnownNat w => ALUPrim -> Unsigned w -> Unsigned w -> SimM alu wordW addrW codeWordW codeAddrW (Unsigned w)

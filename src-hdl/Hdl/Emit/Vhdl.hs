@@ -7,12 +7,11 @@ module Hdl.Emit.Vhdl
     ) where
 
 import Prelude
-import Data.List (intercalate, nub, sort)
+import Data.List (intercalate, nub, partition, sort)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import System.FilePath ((</>))
-
 import Hdl.Net
 import Hdl.Entity (ElabEntity(..))
 
@@ -160,9 +159,25 @@ allClockDomains design nodes = nub (directClocks ++ subClocks)
 -- Common subexpression elimination
 -- ---------------------------------------------------------------------------
 
+-- | Peephole identity rules: return the canonical wire when the operation
+-- is a no-op (a or a, a and a), so the node can be dropped entirely.
+identityWire :: PrimOp -> [WireId] -> Maybe WireId
+identityWire POr  [a, b] | a == b = Just a
+identityWire PAnd [a, b] | a == b = Just a
+identityWire _    _               = Nothing
+
+-- | Peephole constant-fold rules: rewrite the operation to a PLit constant.
+-- Returns the new (op, ins) to substitute in-place so PLit CSE deduplicates it.
+constantFold :: [NetNode] -> PrimOp -> [WireId] -> Maybe (PrimOp, [WireId])
+constantFold allNodes PXor [a, b] | a == b =
+    let w = inferWidth a allNodes
+    in Just (PLit 0 w, [])
+constantFold _ _ _ = Nothing
+
 cse :: [NetNode] -> [NetNode]
 cse nodes = map (rewrite finalSubst) kept
   where
+
     wireHints :: Map.Map WireId String
     wireHints = Map.fromList [ (nHintWire n, nHintName n) | n@NHint{} <- nodes ]
 
@@ -172,13 +187,23 @@ cse nodes = map (rewrite finalSubst) kept
     go subst comb reg (n : rest) = case n of
         NComb out op ins ->
             let ins' = map (sub subst) ins
-                key  = (op, ins')
-            in case Map.lookup key comb of
-                Just canon ->
+                isHinted = Map.member out wireHints
+            in case identityWire op ins' of
+                Just canon | not isHinted ->
+                    -- a op a → a: drop node, substitute out → canon
                     go (Map.insert out canon subst) comb reg rest
-                Nothing    ->
-                    let (kept', s) = go subst (Map.insert key out comb) reg rest
-                    in (NComb out op ins' : kept', s)
+                _ -> case constantFold nodes op ins' of
+                    Just (op', ins'') ->
+                        -- rewrite to constant, re-queue so PLit CSE deduplicates it
+                        go subst comb reg (NComb out op' ins'' : rest)
+                    Nothing ->
+                        let key = (op, ins')
+                        in case Map.lookup key comb of
+                            Just canon | not isHinted ->
+                                go (Map.insert out canon subst) comb reg rest
+                            _ ->
+                                let (kept', s) = go subst (Map.insert key out comb) reg rest
+                                in (NComb out op (map (sub s) ins') : kept', s)
         NReg out inp en initV dom ->
             let inp' = sub subst inp
                 en'  = fmap (sub subst) en
@@ -189,10 +214,10 @@ cse nodes = map (rewrite finalSubst) kept
                     go (Map.insert out canon subst) comb reg rest
                 Nothing    ->
                     let (kept', s) = go subst comb (Map.insert key out reg) rest
-                    in (NReg out inp' en' initV dom : kept', s)
+                    in (NReg out (sub s inp') (fmap (sub s) en') initV dom : kept', s)
         _ ->
             let (kept', s) = go subst comb reg rest
-            in (rewrite subst n : kept', s)
+            in (rewrite s (rewrite subst n) : kept', s)
 
     sub subst w = fromMaybe w (Map.lookup w subst)
 
@@ -230,7 +255,8 @@ buildNameMap nodes = Map.unions [inputMap, hintMap, litMap, regMap, internalMap]
         [ nPortName n | n@NOutput{} <- nodes ]
     hintMap = Map.fromList
         [ (nHintWire n, safeHint (nHintWire n) (nHintName n))
-        | n@NHint{} <- nodes ]
+        | n@NHint{} <- nodes
+        , not (isLitWire (nHintWire n) nodes) ]
     safeHint wid h
         | Set.member h portNames    = h ++ if isReg wid then "_r" else "_s"
         | Set.member h vhdlReserved = h ++ "_s"
@@ -293,9 +319,11 @@ entityDecl design name nodes
         ]
   where
     allPorts =
-        [ ppPortLine VIn  (domName d) VStdLogic            | d <- allClockDomains design nodes ]
-     ++ [ ppPortLine VIn  (nPortName n) (wireVType (nWidth n)) | n@NInput{}  <- nodes ]
-     ++ [ ppPortLine VOut (nPortName n) (wireVType (nWidth n)) | n@NOutput{} <- nodes ]
+        [ ppPortLine VIn  (domName d)      VStdLogic            | d <- doms ]
+     ++ [ ppPortLine VIn  (domResetName d) VStdLogic            | d <- doms ]
+     ++ [ ppPortLine VIn  (nPortName n) (wireVType (nWidth n))  | n@NInput{}  <- nodes ]
+     ++ [ ppPortLine VOut (nPortName n) (wireVType (nWidth n))  | n@NOutput{} <- nodes ]
+    doms = allClockDomains design nodes
 
 -- | Render a port list with semicolons on all but the final entry.
 portLines :: [String] -> [String]
@@ -374,27 +402,39 @@ toStmt :: Design -> NameMap -> [NetNode] -> NetNode -> [String]
 toStmt _      _  _  NInput{}                = []
 toStmt _      _  _  NHint{}                 = []
 toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses
-toStmt _      nm _  (NMem out rdA _ _ _ _ _ _ _) =
-    [ "  " ++ lookupWire nm out ++ " <= "
-             ++ ramSigName out
-             ++ "(to_integer(" ++ lookupWire nm rdA ++ "));" ]
+toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
+    -- Truncate addr to the minimum bits that can index sz entries before to_integer
+    -- so that out-of-range addresses (e.g. 0xFFFFFE00) don't overflow INTEGER.
+    let addr  = lookupWire nm rdA
+        nbits = ceiling (logBase 2 (fromIntegral (max sz 2) :: Double)) :: Int
+        raddr = "resize(" ++ addr ++ ", " ++ show nbits ++ ")"
+    in [ "  " ++ lookupWire nm out ++ " <= "
+             ++ ramSigName out ++ "(to_integer(" ++ raddr ++ "))"
+             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
 toStmt _      nm _  (NRom out rdA _ _ _) =
-    [ "  " ++ lookupWire nm out ++ " <= "
-             ++ romSigName out
-             ++ "(to_integer(" ++ lookupWire nm rdA ++ "));" ]
+    let addr = lookupWire nm rdA
+    in [ "  " ++ lookupWire nm out ++ " <= "
+             ++ romSigName out ++ "(to_integer(" ++ addr ++ "))"
+             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
 toStmt _      _  _  (NComb _ (PLit _ _) []) = []  -- handled by archDecls
 toStmt _      nm _  (NOutput inp pname _ _) =
     [ "  " ++ pname ++ " <= " ++ lookupWire nm inp ++ ";" ]
 toStmt _      nm ns (NComb out op ins) =
-    [ "  " ++ lookupWire nm out ++ " <= " ++ combExpr nm ns op ins ++ ";" ]
+    let expr = combExpr nm ns op ins
+        stmt = case (op, ins) of
+            (PShiftL, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
+            (PShiftR, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
+            _                  -> expr
+    in [ "  " ++ lookupWire nm out ++ " <= " ++ stmt ++ ";" ]
 toStmt design nm _  (NSubInst instNm entRef inPorts outPorts) =
     let (libName, entName) = case entRef of
             LocalEntity  e   -> ("work", e)
             ExternEntity l e -> (l, e)
-        childClks = case localEntityName entRef >>= (`Map.lookup` design) of
+        childDoms = case localEntityName entRef >>= (`Map.lookup` design) of
             Nothing    -> []
-            Just child -> map domName (allClockDomains design child)
-        clkPorts  = [ (ck, ck) | ck <- childClks ]
+            Just child -> allClockDomains design child
+        clkPorts  = [ (domName d,      domName d)      | d <- childDoms ]
+                 ++ [ (domResetName d, domResetName d)  | d <- childDoms ]
         allPorts  = clkPorts
                  ++ [ (pn, lookupWire nm w)  | (pn, w)    <- inPorts  ]
                  ++ [ (pn, lookupWire nm w)  | (pn, w, _) <- outPorts ]
@@ -410,40 +450,57 @@ toStmt design nm _  (NSubInst instNm entRef inPorts outPorts) =
 clockProcesses :: NameMap -> [NetNode] -> [String]
 clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
   where
-    domGroups :: Map.Map String [NetNode]
+    domGroups :: Map.Map String (DomId, [NetNode])
     domGroups = foldr addNode Map.empty (filter isClocked nodes)
     isClocked NReg{} = True
     isClocked NMem{} = True
     isClocked _      = False
-    addNode n = Map.insertWith (++) (domName (clockDom n)) [n]
-    clockDom (NReg _ _ _ _ dom)        = dom
-    clockDom (NMem _ _ _ _ _ _ _ _ dom)= dom
-    clockDom _                         = error "clockDom: not a clocked node"
+    addNode n = Map.insertWith (\(d, xs) (_, ys) -> (d, xs ++ ys))
+                               (domName (clockDom n))
+                               (clockDom n, [n])
+    clockDom (NReg _ _ _ _ dom)         = dom
+    clockDom (NMem _ _ _ _ _ _ _ _ dom) = dom
+    clockDom _                          = error "clockDom: not a clocked node"
 
-    emitProc (clkName, clkNodes) =
-        [ "  process(" ++ clkName ++ ")"
+    emitProc (_, (dom, domNodes)) =
+        let clkName  = domName dom
+            rstName  = domResetName dom
+            rstCond  = case domReset dom of
+                ActiveHigh -> rstName ++ " = '1'"
+                ActiveLow  -> rstName ++ " = '0'"
+            (regNodes, memNodes) = partition isReg (reverse domNodes)
+            isReg NReg{} = True; isReg _ = False
+        in
+        [ "  process(" ++ clkName ++ ", " ++ rstName ++ ")"
         , "  begin"
-        , "    if rising_edge(" ++ clkName ++ ") then"
+        , "    if " ++ rstCond ++ " then"
         ]
-        ++ concatMap nodeBody (reverse clkNodes)
+        ++ concatMap resetBody regNodes
+        ++ [ "    elsif rising_edge(" ++ clkName ++ ") then" ]
+        ++ concatMap clockedBody memNodes
+        ++ concatMap clockedBody regNodes
         ++ [ "    end if;"
            , "  end process;"
            ]
 
-    nodeBody (NReg out inp Nothing _ _) =
+    resetBody (NReg out _ _ initV _) =
+        [ "      " ++ lookupWire nm out ++ " <= " ++ ppLit initV ++ ";" ]
+    resetBody _ = []
+
+    clockedBody (NReg out inp Nothing _ _) =
         [ "      " ++ lookupWire nm out ++ " <= " ++ lookupWire nm inp ++ ";" ]
-    nodeBody (NReg out inp (Just enW) _ _) =
+    clockedBody (NReg out inp (Just enW) _ _) =
         [ "      if " ++ lookupWire nm enW ++ " = '1' then"
         , "        " ++ lookupWire nm out ++ " <= " ++ lookupWire nm inp ++ ";"
         , "      end if;"
         ]
-    nodeBody (NMem out _ wrA wrD wrEn _ _ _ _) =
+    clockedBody (NMem out _ wrA wrD wrEn _ _ _ _) =
         [ "      if " ++ lookupWire nm wrEn ++ " = '1' then"
         , "        " ++ ramSigName out ++ "(to_integer("
                      ++ lookupWire nm wrA ++ ")) <= " ++ lookupWire nm wrD ++ ";"
         , "      end if;"
         ]
-    nodeBody _ = []
+    clockedBody _ = []
 
 -- ---------------------------------------------------------------------------
 -- Combinational expressions
@@ -451,6 +508,8 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
 
 combExpr :: NameMap -> [NetNode] -> PrimOp -> [WireId] -> String
 combExpr nm ns op ins = case (op, ins) of
+    (POr,   [a,b]) | a == b -> w a   -- identity: hinted a or a → a
+    (PAnd,  [a,b]) | a == b -> w a   -- identity: hinted a and a → a
     (PAdd,  [a,b]) -> binOp ns " + "   a b
     (PSub,  [a,b]) -> binOp ns " - "   a b
     (PMul,  [a,b]) ->
@@ -490,6 +549,8 @@ combExpr nm ns op ins = case (op, ins) of
            else if tgt == 1
                 then w a ++ "(0)"
                 else w a ++ "(" ++ show (tgt-1) ++ " downto 0)"
+    (PSignedResize tgt, [a]) ->
+        "unsigned(resize(signed(" ++ w a ++ "), " ++ show tgt ++ "))"
     (PLit v bw, []) -> ppLit (SomeBits v bw)
     (PShiftL, [a,b]) -> "shift_left("  ++ w a ++ ", to_integer(" ++ w b ++ "))"
     (PShiftR, [a,b]) -> "shift_right(" ++ w a ++ ", to_integer(" ++ w b ++ "))"
@@ -535,6 +596,7 @@ inferWidth wid nodes = case filter (drives wid) nodes of
 inferOpWidth :: PrimOp -> [WireId] -> [NetNode] -> Int
 inferOpWidth (PLit _ w)     _         _ = w
 inferOpWidth (PResize w)    _         _ = w
+inferOpWidth (PSignedResize w) _      _ = w
 inferOpWidth (PSlice hi lo) _         _ = hi - lo + 1
 inferOpWidth PConcat        ins       ns = sum (map (`inferWidth` ns) ins)
 inferOpWidth PEq            _         _  = 1

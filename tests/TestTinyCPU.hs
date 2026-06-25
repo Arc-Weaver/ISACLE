@@ -14,7 +14,7 @@ import Isacle.ISA.Example.Tiny
 data Sys
 
 instance KnownDom Sys where
-    domId _ = DomId "sys" 50000000 Rising ActiveHigh
+    domId _ = DomId "sys" 50000000 Rising ActiveHigh "rst"
 
 main :: IO ()
 main = do

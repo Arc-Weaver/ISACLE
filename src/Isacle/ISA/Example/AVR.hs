@@ -4,7 +4,7 @@
 module Isacle.ISA.Example.AVR where
 
 import Prelude hiding (Word)
-import Hdl.Bits
+import Hdl.Bits hiding ((!!))
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -28,20 +28,14 @@ data AVRAlu = AVRAlu
 avrCPUDef :: CPUDef AVRAlu
 avrCPUDef = do
     endianness LittleEndian
-    g  <- regFile "GPR" (width @32) byte
+    g   <- regFile "GPR" (width @32) byte
     sp' <- reg    "SP"  w16
     pc' <- reg    "PC"  (width @22)
-    c  <- flag "C"
-    z  <- flag "Z"
-    n  <- flag "N"
-    v  <- flag "V"
-    s  <- flag "S"
-    h  <- flag "H"
-    t  <- flag "T"
-    i  <- flag "I"
-    sreg <- flagPack @8 "SREG" [i, t, h, s, v, n, z, c]
-    aliasFile g    "0x00 + regIndex"
-    aliasReg  sp'  0x5D
+    (sreg, fs) <- flagPack @8 "SREG" ["I","T","H","S","V","N","Z","C"]
+    let i = fs!!0; t = fs!!1; h = fs!!2; s = fs!!3
+        v = fs!!4; n = fs!!5; z = fs!!6; c = fs!!7
+    aliasFile g   "0x00 + regIndex"
+    aliasReg  sp' 0x5D
     aliasReg  sreg 0x5F
     pure AVRAlu
         { gpr       = g
@@ -74,8 +68,9 @@ addDef = do
     b  <- readReg rr
     r  <- aluOp PAdd a b
     writeReg rd r
-    setFlag z (boolToBit (r == 0))
-    setFlag n (msb r)
+    zf <- isZero r
+    setFlag z zf
+    setFlag n (bitToU1 (msb r))
 
 rjmpDef :: (MonadALU m, AluDef m ~ AVRAlu) => m ()
 rjmpDef = do

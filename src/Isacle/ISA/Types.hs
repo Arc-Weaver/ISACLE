@@ -37,7 +37,13 @@ byte = width @8
 -- These are opaque handles produced by CPUDef and consumed by MonadALU
 -- ---------------------------------------------------------------------------
 
-newtype CPUFlag                            = CPUFlag    String
+-- | A flag is a named bit within a status register.
+-- The status register is the primary storage; flags are just bit-addressed views into it.
+data CPUFlag = CPUFlag
+    { cpuFlagReg :: String   -- ^ name of the containing status register
+    , cpuFlagBit :: Int      -- ^ bit position within the register (0 = LSB)
+    } deriving (Show, Eq)
+
 newtype CPURegister (w    :: Nat)          = CPURegister String
 newtype CPURegFile  (count :: Nat) (w :: Nat) = CPURegFile  String
 

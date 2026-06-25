@@ -24,9 +24,8 @@ newtype CPUDef a = CPUDef (Writer CPUSchema a)
 data CPUSchema = CPUSchema
     { schEndianness :: Endianness
     , schRegFiles   :: [(String, Int, Int)]          -- name, count, element width
-    , schRegisters  :: [(String, Int)]               -- name, width
-    , schFlags      :: [String]                      -- flag name
-    , schStatusRegs :: [(String, Int, [String])]      -- name, width, constituent flags
+    , schRegisters  :: [(String, Int)]               -- name, width (includes status registers)
+    , schStatusRegs :: [(String, Int, [String])]     -- name, width, flag names MSB-first
     , schAliasRegs  :: [(String, Integer)]           -- reg name, data address
     , schAliasFiles :: [(String, String)]            -- regfile name, address function desc
     }
@@ -36,14 +35,13 @@ instance Semigroup CPUSchema where
         { schEndianness = schEndianness a
         , schRegFiles   = schRegFiles   a <> schRegFiles   b
         , schRegisters  = schRegisters  a <> schRegisters  b
-        , schFlags      = schFlags      a <> schFlags      b
         , schStatusRegs = schStatusRegs a <> schStatusRegs b
         , schAliasRegs  = schAliasRegs  a <> schAliasRegs  b
         , schAliasFiles = schAliasFiles a <> schAliasFiles b
         }
 
 instance Monoid CPUSchema where
-    mempty = CPUSchema LittleEndian [] [] [] [] [] []
+    mempty = CPUSchema LittleEndian [] [] [] [] []
 
 runCPUDef :: CPUDef a -> (a, CPUSchema)
 runCPUDef (CPUDef w) = runWriter w
@@ -69,15 +67,22 @@ reg name _sw = CPUDef $ do
     tell mempty { schRegisters = [(name, fromIntegral (natVal (Proxy @w)))] }
     pure (CPURegister name)
 
-flag :: String -> CPUDef CPUFlag
-flag name = CPUDef $ do
-    tell mempty { schFlags = [name] }
-    pure (CPUFlag name)
-
-flagPack :: forall n. KnownNat n => String -> [CPUFlag] -> CPUDef (CPURegister n)
-flagPack name fs = CPUDef $ do
-    tell mempty { schStatusRegs = [(name, fromIntegral (natVal (Proxy @n)), [nm | CPUFlag nm <- fs])] }
-    pure (CPURegister name)
+-- | Declare a status register: a single NReg that holds packed flag bits.
+-- @flagNames@ is ordered MSB-first; the first name is the highest bit.
+-- Returns the register reference and one CPUFlag per name, in the same order.
+flagPack :: forall n. KnownNat n
+         => String -> [String]
+         -> CPUDef (CPURegister n, [CPUFlag])
+flagPack regName flagNames = CPUDef $ do
+    let w = fromIntegral (natVal (Proxy @n))
+        flags = zipWith (\bitPos _ -> CPUFlag regName bitPos)
+                        (reverse [0 .. length flagNames - 1])
+                        flagNames
+    tell mempty
+        { schRegisters  = [(regName, w)]
+        , schStatusRegs = [(regName, w, flagNames)]
+        }
+    pure (CPURegister regName, flags)
 
 -- Declare that a register is readable/writable via a data space address.
 -- The pipeline uses these to detect hazards across the register/memory boundary.

@@ -17,7 +17,7 @@ newtype ResetDef alu a = ResetDef { runResetDef :: alu -> [ResetEntry] }
 
 data ResetEntry
     = forall w. ResetRegEntry  String (Unsigned w)
-    | ResetFlagEntry String Bit
+    | ResetFlagEntry String Int Bit   -- ^ status register name, bit position, value
 
 instance Applicative (ResetDef alu) where
     pure _  = ResetDef (const [])
@@ -35,8 +35,8 @@ resetReg sel val = ResetDef $ \alu ->
 
 resetFlag :: (alu -> CPUFlag) -> Bit -> ResetDef alu ()
 resetFlag sel val = ResetDef $ \alu ->
-    let CPUFlag name = sel alu
-    in [ResetFlagEntry name val]
+    let CPUFlag { cpuFlagReg = rn, cpuFlagBit = bp } = sel alu
+    in [ResetFlagEntry rn bp val]
 
 -- ---------------------------------------------------------------------------
 -- ISADef

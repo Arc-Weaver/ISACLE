@@ -18,7 +18,7 @@ import Hdl.Emit.Vhdl
 
 data SysClk
 instance KnownDom SysClk where
-    domId _ = DomId "clk" 100_000_000 Rising ActiveHigh
+    domId _ = DomId "clk" 100_000_000 Rising ActiveHigh "rst"
 
 -- ---------------------------------------------------------------------------
 -- 1. PWM generator

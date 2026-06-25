@@ -20,6 +20,7 @@ module Hdl.Types
     , sigShiftRDyn
     , sigBit
     , sigBitDyn
+    , (!)
       -- * Bitwise operations on any signal type
     , sigBwAnd
     , sigBwOr
@@ -43,6 +44,8 @@ import GHC.TypeLits (KnownNat, Nat, natVal)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import Data.Coerce (coerce)
+import System.Mem.StableName (makeStableName, hashStableName)
+import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
     ( Generic, Rep, from, to
     , M1(..), K1(..), U1(..)
@@ -64,7 +67,8 @@ data Sig (dom :: k) a
 
 materialize :: Sig dom a -> NetM WireId
 materialize (SWire wid) = pure wid
-materialize (SExpr m)   = m
+materialize (SExpr m)   = memoSExpr m key
+  where key = unsafePerformIO (hashStableName <$> makeStableName m)
 
 -- ---------------------------------------------------------------------------
 -- Num instance — combinational arithmetic
@@ -149,6 +153,11 @@ sigBit :: Int -> Sig dom a -> Sig dom Bool
 sigBit n s = SExpr $ do
     ws <- materialize s
     lookupOrEmit (PSlice n n) [ws]
+
+infixl 9 !
+-- | Bit-index operator: @sig ! n@ extracts bit @n@ (0 = LSB).
+(!) :: Sig dom a -> Int -> Sig dom Bool
+(!) = flip sigBit
 
 -- ---------------------------------------------------------------------------
 -- Bitwise operations on arbitrary signal types
@@ -259,6 +268,12 @@ class HdlPorts a where
 
     default fromWireIds :: (Generic a, PortLayout (Rep a)) => [WireId] -> a
     fromWireIds ws = to (fst (layoutDecode @(Rep a) ws))
+
+instance HdlPorts () where
+    portCount   _ = 0
+    portSpecs   _ = []
+    toWireIds   _ = return []
+    fromWireIds _ = ()
 
 instance (HdlType a, KnownDom dom) => HdlPorts (Sig dom a) where
     portCount _ = 1
