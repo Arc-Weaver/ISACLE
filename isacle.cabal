@@ -93,6 +93,7 @@ library
     Isacle.ISA.Example.AVR
     Isacle.ISA.Example.Tiny
     Isacle.ISA.Encoding
+    Isacle.ISA.VonNeumann
     Isacle.ISA.Backend.Doc
     Isacle.ISA.Backend.Sim
     Isacle.ISA.Backend.Synth

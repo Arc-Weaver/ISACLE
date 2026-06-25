@@ -39,8 +39,8 @@ module Isacle.ISA
     , MonadALU(..)
       -- * MonadHarvardALU
     , MonadHarvardALU(..)
-      -- * Context save
-    , ContextItem(..)
+      -- * MonadIRQ
+    , MonadIRQ(..)
       -- * ISA definition
     , ISADef(..)
     , ResetDef
@@ -58,8 +58,6 @@ module Isacle.ISA
     , indirectReadPostInc
     , indirectReadPreDec
     , indirectReadOffset
-      -- * Context save helpers
-    , saveWordReg
       -- * Encoding utilities
     , EncodingInfo(..)
     , FieldName
@@ -80,6 +78,7 @@ module Isacle.ISA
     , emptySim
     , runInstr
     , execInstr
+    , runIrq
       -- * Synthesis backend
     , SynthCtx(..)
     , SynthResult(..)

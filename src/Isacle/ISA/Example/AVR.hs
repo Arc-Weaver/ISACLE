@@ -117,12 +117,9 @@ avrISA :: ( MonadHarvardALU m, AluDef m ~ AVRAlu
           , Word m ~ Unsigned 8, DataAddr m ~ Unsigned 16
           ) => ISADef m
 avrISA = defineISA ISADef
-    { isaPc           = SomeCPURegister <$> cpu pc
-    , isaInterruptEn  = cpuFlag interrupt
-    , isaInterruptVec = SomeCPURegister <$> cpu pc
-    , isaSupervisor   = Nothing
-    , isaContextSave  = [ saveWordReg sp ]
-    , isaReset = do
+    { isaPc            = SomeCPURegister <$> cpu pc
+    , isaInterruptBody = Nothing
+    , isaReset         = do
         resetReg  pc 0x0000
         resetReg  sp 0x21FF
         resetFlag carry     Lo

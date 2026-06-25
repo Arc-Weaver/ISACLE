@@ -15,24 +15,22 @@ import GHC.TypeLits (Nat)
 --     read    — what data RAM address to fetch before execute (if any)
 --     compute — how the instruction transforms state (registers, flags)
 --     write   — what data RAM address/value to store after execute (if any)
---     move    — where the PC goes next (Nothing = sequential)
 class ALU state where
     type Instr   state
     type RamAddr state
-    type RomAddr state
     type Val     state
 
     read    :: Instr state -> state -> Maybe (RamAddr state)
     compute :: Instr state -> Maybe (Val state) -> state -> state
     write   :: Instr state -> state -> Maybe (RamAddr state, Val state)
-    move    :: Instr state -> state -> Maybe (RomAddr state)
 
 -- ---------------------------------------------------------------------------
--- Extended pipeline qualities
+-- Harvard ISA interface
 -- ---------------------------------------------------------------------------
 
--- | Pipeline-visible qualities beyond the base ALU.
---   Covers instruction latency, multi-cycle ISA stages, and interrupts.
+-- | Pipeline-visible qualities for a Harvard-architecture ISA.
+--   Extends 'ALU' with a separate read-only code address space and the
+--   PC-redirection method ('move').
 --
 --   The two fetch-related associated types make the Harvard code-bus interface
 --   explicit at the type level:
@@ -44,11 +42,9 @@ class ALU state where
 --   @MaxFetch state@ — static upper bound on instruction width in FetchWords.
 --     - 2 for AVR (1- or 2-word instructions)
 --     - 3 for MCS-51 (1-, 2-, or 3-byte instructions)
---
---   The runtime decision of how many words a specific opcode needs is made
---   by 'instrFetch'.
-class ALU state => ISA state where
-    type IsaStage state
+class ALU state => HarvardISA state where
+    -- | Code-bus address type (separate from data RAM address).
+    type RomAddr   state
 
     -- | Code-bus unit type.  Determines the width of the synchronous code ROM
     --   output port in synthesised hardware.
@@ -56,7 +52,10 @@ class ALU state => ISA state where
 
     -- | Static upper bound on instruction width in 'FetchWord' units.
     --   Used to size the fetch buffer at elaboration time.
-    type MaxFetch state :: Nat
+    type MaxFetch  state :: Nat
+
+    -- | Where the PC goes next.  Nothing = sequential (PC advances by instrFetch).
+    move :: Instr state -> state -> Maybe (RomAddr state)
 
     -- | Pipeline stages this instruction occupies. 1 = single-cycle.
     --   Use >1 for fixed-latency multi-cycle ops (MUL, barrel shift, etc.).
@@ -71,37 +70,14 @@ class ALU state => ISA state where
     instrFetch :: Instr state -> Int
     instrFetch _ = 1
 
-    -- | Dispatch to an ISA-specific multi-cycle stage when the generic
-    --   pipeline cannot model the instruction (CALL, RET, LPM, etc.).
-    --   Nothing means the generic path handles this instruction.
-    toIsaStage :: Instr state -> state -> Maybe (IsaStage state)
-
-    -- | Advance a running ISA-specific stage by one cycle.
-    --   Returns the new state, a continue/done signal, an optional data-memory
-    --   read request, and an optional data-memory write for this cycle.
-    --   Left continues the stage (pipeline remains stalled); Right () completes it.
-    isaStageStep
-        :: IsaStage state
-        -> FetchWord state              -- current code-bus word (for LPM-style reads)
-        -> Maybe (Val state)            -- data-RAM read response; Nothing if not yet available
-        -> state
-        -> ( state
-           , Either (IsaStage state) ()
-           , Maybe (RamAddr state)               -- data read request (if any)
-           , Maybe (RamAddr state, Val state)    -- data write (if any)
-           )
-
     -- | True when the CPU can accept an interrupt at the next instruction
     --   boundary. Checked once per instruction boundary in the pipeline.
     interruptible :: state -> Bool
 
     -- | Accept a pending interrupt: apply any state side-effects (e.g. clear
-    --   the IE flag) and optionally enter an ISA-specific stage to save the
-    --   return address. Nothing means a direct jump with no save overhead.
-    acceptIrq
-        :: state
-        -> RomAddr state
-        -> (state, Maybe (IsaStage state))
+    --   the IE flag) and jump to the interrupt vector.  The backend handles
+    --   saving the return address.
+    acceptIrq :: state -> RomAddr state -> state
 
 -- ---------------------------------------------------------------------------
 -- Flush
@@ -122,15 +98,15 @@ newtype StallEvent ramaddr
     = StallReadAfterWrite ramaddr
     deriving (Show, Eq)
 
--- | Flush and stall condition detection, fully separated from the pipeline
---   mechanics that act on them.
+-- | Flush and stall condition detection for Harvard-architecture pipelines,
+--   fully separated from the pipeline mechanics that act on them.
 --
 --   Requires @Eq (RamAddr state)@ so addresses can be compared for the
 --   read-after-write check.
 --
 --   Rule: both methods must depend only on *committed* instruction and
 --   state — never on speculative in-flight pipeline state.
-class (ISA state, Eq (RamAddr state)) => HasFlush state where
+class (HarvardISA state, Eq (RamAddr state)) => HasFlushH state where
 
     -- | Default: flush iff @move@ is taken. ISAs with exceptions or other
     --   redirect causes override this.
@@ -138,7 +114,7 @@ class (ISA state, Eq (RamAddr state)) => HasFlush state where
         :: Instr state
         -> state
         -> Maybe (FlushEvent (RomAddr state))
-    flushCondition instr state = FlushBranch <$> move instr state
+    flushCondition instr s = FlushBranch <$> move instr s
 
     -- | Default: stall iff write address exactly equals read address.
     --   ISAs with store forwarding, banked memory, or aliasing override this.
@@ -155,11 +131,10 @@ class (ISA state, Eq (RamAddr state)) => HasFlush state where
 -- ---------------------------------------------------------------------------
 
 -- | A single slot in the N-deep pipeline. Parameterised directly on the
---   instruction and stage types so the pipeline machinery does not need
---   an ISA constraint — only the ISA implementation does.
-data Slot instr stage
+--   instruction type so the pipeline machinery does not need an ISA constraint
+--   — only the ISA implementation does.
+data Slot instr
     = SEmpty                -- bubble / no-op
     | SReady   instr        -- decoded, awaiting execute
     | SMemRead instr        -- stalled: data RAM response in flight
-    | SIsa     stage        -- ISA-specific multi-cycle in progress
     deriving (Show, Eq)

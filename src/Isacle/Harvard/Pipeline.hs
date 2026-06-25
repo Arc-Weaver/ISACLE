@@ -13,13 +13,13 @@ import Isacle.Harvard.ISA
 
 -- | Pipeline register state: a list of slots (head = execute end, last = fetch end)
 --   plus a latency countdown.
-data PipeState instr stage = PipeState
-    { psSlots   :: [Slot instr stage]
+data PipeState instr = PipeState
+    { psSlots   :: [Slot instr]
     , psLatency :: Int
     } deriving (Show, Eq)
 
 -- | All-bubble initial state for a pipeline of @depth@ stages.
-emptyPipe :: Int -> PipeState instr stage
+emptyPipe :: Int -> PipeState instr
 emptyPipe depth = PipeState (replicate depth SEmpty) 0
 
 -- | Inputs consumed each cycle.
@@ -27,7 +27,7 @@ data PipeInput state = PipeInput
     { pipeInstr    :: Maybe (Instr state)    -- decoded instruction from fetch
     , pipeMemResp  :: Maybe (Val state)      -- data RAM read response (Nothing if not requested)
     , pipeIrqAddr  :: Maybe (RomAddr state)  -- interrupt vector (Nothing = no IRQ)
-    , pipeCodeWord :: FetchWord state        -- current code-bus output (for multi-word fetch / LPM)
+    , pipeCodeWord :: FetchWord state        -- current code-bus output (for multi-word fetch)
     }
 
 -- | Outputs produced each cycle.
@@ -46,11 +46,11 @@ data PipeOutput state = PipeOutput
 -- fetch unit is redirected via 'pipeFlush'. On a stall 'pipeStalled' is True
 -- and the fetch unit must re-present the same instruction next cycle.
 pipelineStep
-    :: forall state. HasFlush state
-    => PipeState (Instr state) (IsaStage state)
+    :: forall state. HasFlushH state
+    => PipeState (Instr state)
     -> state
     -> PipeInput state
-    -> ( PipeState (Instr state) (IsaStage state)
+    -> ( PipeState (Instr state)
        , state
        , PipeOutput state
        )
@@ -67,10 +67,8 @@ pipelineStep (PipeState slots lat) cpuState inp =
       SEmpty ->
           case pipeIrqAddr inp of
               Just irqAddr | interruptible cpuState ->
-                  let (cpu', mstage) = acceptIrq cpuState irqAddr
-                      headSlot       = maybe SEmpty SIsa mstage
-                      slots'         = headSlot : replicate (depth - 1) SEmpty
-                  in ( PipeState slots' 0
+                  let cpu' = acceptIrq cpuState irqAddr
+                  in ( PipeState cleared 0
                      , cpu'
                      , PipeOutput Nothing Nothing (Just (FlushInterrupt irqAddr)) False
                      )
@@ -78,22 +76,6 @@ pipelineStep (PipeState slots lat) cpuState inp =
                   ( PipeState advance 0
                   , cpuState
                   , PipeOutput Nothing Nothing Nothing False
-                  )
-
-      -- ── ISA-specific multi-cycle stage ────────────────────────────────────
-      SIsa stage ->
-          let (cpu', done, mread, mwrite) =
-                  isaStageStep stage (pipeCodeWord inp) (pipeMemResp inp) cpuState
-          in case done of
-              Left  stage' ->
-                  ( PipeState (SIsa stage' : rest) 0
-                  , cpu'
-                  , PipeOutput mread mwrite Nothing True
-                  )
-              Right () ->
-                  ( PipeState advance 0
-                  , cpu'
-                  , PipeOutput mread mwrite Nothing False
                   )
 
       -- ── Waiting for data RAM response ─────────────────────────────────────
@@ -126,27 +108,21 @@ pipelineStep (PipeState slots lat) cpuState inp =
                   , cpuState
                   , PipeOutput Nothing Nothing Nothing True
                   )
-              else case toIsaStage instr cpuState of
-                  Just stage ->
-                      ( PipeState (SIsa stage : rest) 0
-                      , cpuState
-                      , PipeOutput Nothing Nothing Nothing True
-                      )
-                  Nothing ->
-                      case read instr cpuState of
-                          Just addr ->
-                              ( PipeState (SMemRead instr : rest) 0
-                              , cpuState
-                              , PipeOutput (Just addr) Nothing Nothing True
-                              )
-                          Nothing ->
-                              let cpu'   = compute instr Nothing cpuState
-                                  mwrite = write instr cpu'
-                                  mflush = flushCondition instr cpu'
-                                  slots' = case mflush of
-                                               Just _  -> cleared
-                                               Nothing -> advance
-                              in ( PipeState slots' 0
-                                 , cpu'
-                                 , PipeOutput Nothing mwrite mflush False
-                                 )
+              else
+                  case read instr cpuState of
+                      Just addr ->
+                          ( PipeState (SMemRead instr : rest) 0
+                          , cpuState
+                          , PipeOutput (Just addr) Nothing Nothing True
+                          )
+                      Nothing ->
+                          let cpu'   = compute instr Nothing cpuState
+                              mwrite = write instr cpu'
+                              mflush = flushCondition instr cpu'
+                              slots' = case mflush of
+                                           Just _  -> cleared
+                                           Nothing -> advance
+                          in ( PipeState slots' 0
+                             , cpu'
+                             , PipeOutput Nothing mwrite mflush False
+                             )

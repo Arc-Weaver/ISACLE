@@ -30,8 +30,9 @@ module Isacle.ISA.Backend.Synth
     , FlagWriteReq(..)
       -- * Synthesis monad
     , SynthM
-      -- * Runner
+      -- * Runners
     , runSynthM
+    , runSynthMIrq
     , evalSynthM
     ) where
 
@@ -43,7 +44,7 @@ import Data.Map.Strict (Map)
 import Control.Monad.Reader
 import Control.Monad.State.Strict
 
-import GHC.TypeLits (KnownNat, natVal)
+import GHC.TypeLits (natVal)
 import Hdl.Bits
 import Hdl.Net (NetM, WireId, NetNode(..), freshWire, emit)
 import qualified Hdl.Net as N
@@ -57,22 +58,26 @@ import Isacle.ISA.Encoding
 
 -- | Context supplied by the CPU synthesis pass for one instruction slot.
 data SynthCtx alu = SynthCtx
-    { scAlu       :: alu
-    , scInstrWire :: WireId
+    { scAlu        :: alu
+    , scInstrWire  :: WireId
       -- ^ instruction word wire (sliced to extract field bits)
-    , scReadReg   :: String -> WireId -> NetM WireId
+    , scReadReg    :: String -> WireId -> NetM WireId
       -- ^ scalar-register reader: @rfname → (ignored) → current-value wire@.
       --   Only called for scalar registers (no \':\' in key).
       --   Register-file reads are collected as 'RegReadReq' instead.
-    , scReadMem   :: WireId -> NetM WireId
+    , scReadMem    :: WireId -> NetM WireId
       -- ^ data-memory reader: @addr-wire → data-wire@.
       --   Typically returns a pre-allocated NInput wire; the caller routes the
       --   address separately using 'srMemReads'.
-    , scReadCode  :: WireId -> NetM WireId
+    , scReadCode   :: WireId -> NetM WireId
       -- ^ code-memory reader (for LPM-style instructions).
-    , scGetFlag   :: String -> Int -> NetM WireId
+    , scGetFlag    :: String -> Int -> NetM WireId
       -- ^ flag bit reader: @regName → bitPos → 1-bit output wire@.
       --   Emits a PSlice node to extract the bit from the status register.
+    , scIrqPending :: Maybe WireId
+      -- ^ 1-bit @irq_pending@ input wire; Just when in an IRQ body context.
+    , scIrqVector  :: Maybe WireId
+      -- ^ @irq_vector@ input wire; Just when in an IRQ body context.
     }
 
 -- ---------------------------------------------------------------------------
@@ -431,6 +436,23 @@ instance KnownNat wordW => MonadALU (SynthM alu wordW addrW codeWordW codeAddrW)
             emit $ NComb out (N.PLit v bw) []
             return (Unsigned (fromIntegral out))
 
+    resizeBits = \(v :: Unsigned k) -> go v Proxy
+      where
+        go :: forall k n. (KnownNat k, KnownNat n)
+           => Unsigned k -> Proxy n
+           -> SynthM alu wordW addrW codeWordW codeAddrW (Unsigned n)
+        go (Unsigned srcW) pn = SynthM $ lift $ lift $ do
+            let srcBits = fromIntegral (natVal (Proxy @k)) :: Int
+                dstBits = fromIntegral (natVal pn) :: Int
+            if srcBits == dstBits
+                then return (Unsigned (fromIntegral srcW))
+                else do
+                    out <- freshWire
+                    if dstBits < srcBits
+                        then emit $ NComb out (N.PSlice (dstBits - 1) 0) [fromIntegral srcW]
+                        else emit $ NComb out (N.PResize dstBits) [fromIntegral srcW]
+                    return (Unsigned (fromIntegral out))
+
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU instance
 -- ---------------------------------------------------------------------------
@@ -445,8 +467,46 @@ instance KnownNat wordW => MonadHarvardALU (SynthM alu wordW addrW codeWordW cod
         return (Unsigned (fromIntegral dataWire))
 
 -- ---------------------------------------------------------------------------
--- Runner
+-- MonadIRQ instance
 -- ---------------------------------------------------------------------------
+
+instance KnownNat wordW => MonadIRQ (SynthM alu wordW addrW codeWordW codeAddrW) where
+    type IrqAddrW (SynthM alu wordW addrW codeWordW codeAddrW) = codeAddrW
+
+    irqVector = SynthM $ do
+        ctx <- ask
+        case scIrqVector ctx of
+            Just w  -> return (Unsigned (fromIntegral w))
+            Nothing -> return (Unsigned 0)
+
+    irqGate condAction = do
+        Unsigned condW <- condAction
+        SynthM $ do
+            st <- get
+            case ssMatchWire st of
+                Nothing     -> return ()
+                Just matchW -> do
+                    gatedW <- lift $ lift $ do
+                        out <- freshWire
+                        emit $ NComb out N.PAnd [matchW, fromIntegral condW]
+                        return out
+                    modify $ \s -> s { ssMatchWire = Just gatedW }
+
+-- ---------------------------------------------------------------------------
+-- Runners
+-- ---------------------------------------------------------------------------
+
+-- | Collect 'SynthResult' from the current monad state.
+collectResult :: SynthSt -> SynthResult
+collectResult st = SynthResult
+    { srMatchWire    = ssMatchWire st
+    , srRegWrites    = reverse (ssRegWrites st)
+    , srScalarWrites = reverse (ssScalarWrites st)
+    , srRegReads     = reverse (ssRegReads st)
+    , srMemWrites    = reverse (ssMemWrites st)
+    , srMemReads     = reverse (ssMemReads st)
+    , srFlagWrites   = reverse (ssFlagWrites st)
+    }
 
 -- | Run one instruction body, collecting all combinational side effects.
 runSynthM :: alu
@@ -459,16 +519,27 @@ runSynthM :: alu
           -> NetM SynthResult
 runSynthM aluRec instrWire readRegFn readMemFn readCodeFn getFlagFn (SynthM m) = do
     let ctx = SynthCtx aluRec instrWire readRegFn readMemFn readCodeFn getFlagFn
+                       Nothing Nothing
     (_, st) <- runStateT (runReaderT m ctx) initSynthSt
-    return SynthResult
-        { srMatchWire    = ssMatchWire st
-        , srRegWrites    = reverse (ssRegWrites st)
-        , srScalarWrites = reverse (ssScalarWrites st)
-        , srRegReads     = reverse (ssRegReads st)
-        , srMemWrites    = reverse (ssMemWrites st)
-        , srMemReads     = reverse (ssMemReads st)
-        , srFlagWrites   = reverse (ssFlagWrites st)
-        }
+    return (collectResult st)
+
+-- | Run an interrupt body with 'irq_pending' as the initial match wire.
+-- 'irqGate' calls inside the body may further refine the match condition.
+runSynthMIrq :: alu
+             -> WireId                             -- ^ irq_pending wire
+             -> WireId                             -- ^ irq_vector wire
+             -> (String -> WireId -> NetM WireId)  -- ^ scalar register reader
+             -> (WireId -> NetM WireId)             -- ^ data memory reader
+             -> (WireId -> NetM WireId)             -- ^ code memory reader
+             -> (String -> Int -> NetM WireId)      -- ^ flag bit reader
+             -> SynthM alu wordW addrW codeWordW codeAddrW ()
+             -> NetM SynthResult
+runSynthMIrq aluRec irqPendW irqVecW readRegFn readMemFn readCodeFn getFlagFn (SynthM m) = do
+    let ctx    = SynthCtx aluRec 0 readRegFn readMemFn readCodeFn getFlagFn
+                          (Just irqPendW) (Just irqVecW)
+    let initSt = initSynthSt { ssMatchWire = Just irqPendW }
+    (_, st) <- runStateT (runReaderT m ctx) initSt
+    return (collectResult st)
 
 -- | Run a 'SynthM' action in a dummy context, threading through the current
 -- 'NetM' state.  Used by the CPU synthesis pass to extract register/flag names
@@ -477,5 +548,6 @@ evalSynthM :: alu -> SynthM alu wordW addrW codeWordW codeAddrW a -> NetM a
 evalSynthM aluRec (SynthM m) = do
     let ctx = SynthCtx aluRec 0 (\_ _ -> return 0) (const (return 0))
                                (const (return 0)) (\_ _ -> return 0)
+                               Nothing Nothing
     (a, _) <- runStateT (runReaderT m ctx) initSynthSt
     return a

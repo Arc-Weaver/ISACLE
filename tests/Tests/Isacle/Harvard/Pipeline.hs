@@ -7,7 +7,7 @@ import Isacle.Harvard.ISA
 import Isacle.Harvard.Pipeline
 
 import Tests.Isacle.Harvard.ISA
-    ( TState(..), TInstr(..), TIsaStage(..)
+    ( TState(..), TInstr(..)
     , initState, withZero, setReg, getReg
     )
 
@@ -19,7 +19,7 @@ assert msg True  = putStrLn ("ok:   " ++ msg)
 -- 2-deep pipeline helpers
 -- ---------------------------------------------------------------------------
 
-type P = PipeState TInstr TIsaStage
+type P = PipeState TInstr
 
 emptyP :: P
 emptyP = emptyPipe 2

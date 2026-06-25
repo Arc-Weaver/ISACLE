@@ -12,6 +12,7 @@ module Isacle.ISA.Backend.Sim
       -- * Runners
     , runInstr
     , execInstr
+    , runIrq
     ) where
 
 import Prelude hiding (Word)
@@ -45,14 +46,15 @@ data SimCPU = SimCPU
 -- | Full simulation state: CPU state plus separate data and code memories,
 -- and the encoding parsed from the current instruction body.
 data SimState = SimState
-    { ssCPU      :: SimCPU
-    , ssDataMem  :: IntMap Integer   -- ^ byte-addressable data memory
-    , ssCodeMem  :: IntMap Integer   -- ^ word-addressable code memory (Harvard)
-    , ssEncoding :: Maybe EncodingInfo -- ^ parsed by 'encoding' call in instr body
+    { ssCPU         :: SimCPU
+    , ssDataMem     :: IntMap Integer    -- ^ byte-addressable data memory
+    , ssCodeMem     :: IntMap Integer    -- ^ word-addressable code memory (Harvard)
+    , ssEncoding    :: Maybe EncodingInfo -- ^ parsed by 'encoding' call in instr body
+    , ssIrqGateOpen :: Bool              -- ^ False after irqGate sees a 0 condition
     } deriving (Show)
 
 emptySim :: SimState
-emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing
+emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing True
 
 -- ---------------------------------------------------------------------------
 -- Simulation monad
@@ -63,7 +65,8 @@ emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing
 --   via the 'EncodingInfo' stored in 'SimState' (set by 'encoding').
 data SimCtx alu = SimCtx
     { sxAlu       :: alu
-    , sxInstrWord :: Integer   -- ^ raw instruction word to decode
+    , sxInstrWord :: Integer        -- ^ raw instruction word to decode
+    , sxIrqVec    :: Maybe Integer  -- ^ IRQ vector address; Just when in runIrq
     }
 
 -- | Simulation backend for 'MonadALU'.
@@ -141,19 +144,23 @@ instance MonadALU (SimM alu wordW addrW codeWordW codeAddrW) where
     -- | Write a register; mask to the declared bit width before storing.
     writeReg :: forall w. KnownNat w => CPURegister w -> Unsigned w -> SimM alu wordW addrW codeWordW codeAddrW ()
     writeReg (CPURegister name) val = SimM $ do
-        let w    = fromIntegral (natVal (Proxy @w)) :: Int
-            mask = (1 `shiftL` w) - 1
-            Unsigned raw = val
-        modify $ \st -> st { ssCPU = (ssCPU st)
-            { scRegs = Map.insert name (raw .&. mask) (scRegs (ssCPU st)) } }
+        open <- gets ssIrqGateOpen
+        if not open then return () else do
+            let w    = fromIntegral (natVal (Proxy @w)) :: Int
+                mask = (1 `shiftL` w) - 1
+                Unsigned raw = val
+            modify $ \st -> st { ssCPU = (ssCPU st)
+                { scRegs = Map.insert name (raw .&. mask) (scRegs (ssCPU st)) } }
 
     readMem (Unsigned addr) = SimM $ do
         st <- get
         return (Unsigned (IntMap.findWithDefault 0 (fromIntegral addr) (ssDataMem st)))
 
     writeMem (Unsigned addr) val = SimM $ do
-        let Unsigned v = val
-        modify $ \st -> st { ssDataMem = IntMap.insert (fromIntegral addr) v (ssDataMem st) }
+        open <- gets ssIrqGateOpen
+        if not open then return () else do
+            let Unsigned v = val
+            modify $ \st -> st { ssDataMem = IntMap.insert (fromIntegral addr) v (ssDataMem st) }
 
     -- Flags are stored as bits inside the status register (scRegs).
     -- The register value is read/written with a bitmask at the flag's bit position.
@@ -163,13 +170,15 @@ instance MonadALU (SimM alu wordW addrW codeWordW codeAddrW) where
         return (fromInteger ((regVal `shiftR` bitPos) .&. 1))
 
     setFlag (CPUFlag { cpuFlagReg = regName, cpuFlagBit = bitPos }) (Unsigned v) = SimM $ do
-        let mask   = 1 `shiftL` bitPos
-            bitVal = if v /= 0 then mask else 0
-        modify $ \st ->
-            let old = Map.findWithDefault 0 regName (scRegs (ssCPU st))
-                new = (old .&. complement mask) .|. bitVal
-            in st { ssCPU = (ssCPU st)
-                    { scRegs = Map.insert regName new (scRegs (ssCPU st)) } }
+        open <- gets ssIrqGateOpen
+        if not open then return () else do
+            let mask   = 1 `shiftL` bitPos
+                bitVal = if v /= 0 then mask else 0
+            modify $ \st ->
+                let old = Map.findWithDefault 0 regName (scRegs (ssCPU st))
+                    new = (old .&. complement mask) .|. bitVal
+                in st { ssCPU = (ssCPU st)
+                        { scRegs = Map.insert regName new (scRegs (ssCPU st)) } }
 
     isZero (Unsigned v) = return (if v == 0 then 1 else 0)
 
@@ -196,6 +205,14 @@ instance MonadALU (SimM alu wordW addrW codeWordW codeAddrW) where
         return (fromInteger (raw .&. mask))
 
 
+    resizeBits = \(v :: Unsigned k) -> go v Proxy
+      where
+        go :: forall k n. (KnownNat k, KnownNat n)
+           => Unsigned k -> Proxy n -> SimM alu wordW addrW codeWordW codeAddrW (Unsigned n)
+        go (Unsigned v) pn =
+            let mask = (1 `shiftL` fromIntegral (natVal pn)) - 1
+            in return (fromInteger (v .&. mask))
+
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU instance
 -- ---------------------------------------------------------------------------
@@ -209,6 +226,22 @@ instance MonadHarvardALU (SimM alu wordW addrW codeWordW codeAddrW) where
         return (Unsigned (IntMap.findWithDefault 0 (fromIntegral addr) (ssCodeMem st)))
 
 -- ---------------------------------------------------------------------------
+-- MonadIRQ instance
+-- ---------------------------------------------------------------------------
+
+instance KnownNat codeAddrW => MonadIRQ (SimM alu wordW addrW codeWordW codeAddrW) where
+    type IrqAddrW (SimM alu wordW addrW codeWordW codeAddrW) = codeAddrW
+
+    irqVector = SimM $ do
+        ctx <- ask
+        return (maybe 0 fromInteger (sxIrqVec ctx))
+
+    irqGate condAction = do
+        Unsigned cond <- condAction
+        SimM $ modify $ \st ->
+            st { ssIrqGateOpen = ssIrqGateOpen st && cond /= 0 }
+
+-- ---------------------------------------------------------------------------
 -- Runners
 -- ---------------------------------------------------------------------------
 
@@ -220,7 +253,8 @@ runInstr :: alu                    -- ^ ALU record (handles for register names)
          -> SimState
          -> SimState
 runInstr aluRec instrWord (SimM m) st =
-    execState (runReaderT m (SimCtx aluRec instrWord)) st
+    execState (runReaderT m (SimCtx aluRec instrWord Nothing))
+              (st { ssIrqGateOpen = True })
 
 -- | 'runInstr' starting from 'emptySim' — useful for unit-testing single
 --   instruction bodies in isolation.
@@ -229,6 +263,18 @@ execInstr :: alu
           -> SimM alu wordW addrW codeWordW codeAddrW ()
           -> SimState
 execInstr aluRec instrWord m = runInstr aluRec instrWord m emptySim
+
+-- | Run an interrupt body against the given simulation state.
+-- The interrupt body executes as if the interrupt is pending; 'irqGate'
+-- inside the body may suppress writes if the gate condition is not met.
+runIrq :: alu
+       -> Integer  -- ^ IRQ vector address (supplied by interrupt controller)
+       -> SimM alu wordW addrW codeWordW codeAddrW ()
+       -> SimState
+       -> SimState
+runIrq aluRec irqVec (SimM m) st =
+    execState (runReaderT m (SimCtx aluRec 0 (Just irqVec)))
+              (st { ssIrqGateOpen = True })
 
 -- ---------------------------------------------------------------------------
 -- Internal ALU helpers

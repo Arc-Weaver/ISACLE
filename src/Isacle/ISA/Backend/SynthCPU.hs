@@ -67,6 +67,8 @@ data CpuMemIface = CpuMemIface
     , cmiDataAddrW  :: Int
     , cmiWordW      :: Int
     , cmiCodeWordW  :: Int
+    , cmiIrqPending :: Maybe WireId  -- ^ Just w when ISA has an interrupt body
+    , cmiIrqVector  :: Maybe WireId  -- ^ Just w when ISA has an interrupt body
     }
 
 -- | Synthesise a complete single-cycle Harvard CPU from a 'CPUDef' and
@@ -88,10 +90,11 @@ synthHarvardCPU' :: forall dom wordW addrW codeWordW codeAddrW alu.
                  -> NetM CpuMemIface
 synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     let (aluRec, schema) = runCPUDef cpuDef
-    let domInfo  = domId (Proxy @dom)
-    let wordBits = fromIntegral (natVal (Proxy @wordW))     :: Int
-    let addrBits = fromIntegral (natVal (Proxy @addrW))     :: Int
-    let codeBits = fromIntegral (natVal (Proxy @codeWordW)) :: Int
+    let domInfo      = domId (Proxy @dom)
+    let wordBits     = fromIntegral (natVal (Proxy @wordW))     :: Int
+    let addrBits     = fromIntegral (natVal (Proxy @addrW))     :: Int
+    let codeBits     = fromIntegral (natVal (Proxy @codeWordW)) :: Int
+    let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW)) :: Int
 
     -- Build reset value maps from isaReset
     let resetEntries = runResetDef (isaReset isaDef) aluRec
@@ -195,11 +198,26 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
                   getFlagFn
                   instr
 
+    -- Interrupt body synthesis (if ISA declares one)
+    irqData <- case isaInterruptBody isaDef of
+        Nothing   -> return Nothing
+        Just body -> do
+            irqPendW <- freshWire
+            emit $ NInput irqPendW "irq_pending" 1 domInfo
+            irqVecW  <- freshWire
+            emit $ NInput irqVecW "irq_vector" codeAddrBits domInfo
+            r <- runSynthMIrq aluRec irqPendW irqVecW
+                     scReadRegFn scReadMemFnAlias
+                     (const (return cmemRdDataW)) getFlagFn body
+            return (Just (irqPendW, irqVecW, r))
+
+    let allResults = results ++ maybe [] (\(_, _, r) -> [r]) irqData
+
     -- -----------------------------------------------------------------------
     -- Write arbiters — register files
     -- -----------------------------------------------------------------------
 
-    let allRegWrites = concatMap srRegWrites results
+    let allRegWrites = concatMap srRegWrites allResults
 
     let regWritesByRf :: Map String [RegWriteReq]
         regWritesByRf = foldl' (\m r -> Map.insertWith (++) (rwRfName r) [r] m)
@@ -207,7 +225,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
 
     -- Collect the set of rf names that appear in reads (without flattening order).
     let readRfNames :: [String]
-        readRfNames = nub [ rrRfName rr | r <- results, rr <- srRegReads r ]
+        readRfNames = nub [ rrRfName rr | r <- allResults, rr <- srRegReads r ]
 
     let involvedRfs = Map.keys regWritesByRf
                    ++ filter (`Map.notMember` regWritesByRf) readRfNames
@@ -231,7 +249,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
         let instrSlots :: [(WireId, [RegReadReq])]
             instrSlots =
                 [ (matchW, filter ((== rfname) . rrRfName) (srRegReads r))
-                | r <- results
+                | r <- allResults
                 , any ((== rfname) . rrRfName) (srRegReads r)
                 , Just matchW <- [srMatchWire r]
                 ]
@@ -264,7 +282,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     -- merges whole-register writes with individual flag writes.
     -- -----------------------------------------------------------------------
 
-    let allMemWrites = concatMap srMemWrites results
+    let allMemWrites = concatMap srMemWrites allResults
 
     aliasScalarWriteReqs <- fmap concat $ forM (schAliasRegs schema) $
         \(regName, aliasAddr) ->
@@ -294,8 +312,8 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     -- registers use the standard mux-tree arbiter.
     -- -----------------------------------------------------------------------
 
-    let allScalarWrites = concatMap srScalarWrites results ++ aliasScalarWriteReqs
-    let allFlagWrites   = concatMap srFlagWrites results
+    let allScalarWrites = concatMap srScalarWrites allResults ++ aliasScalarWriteReqs
+    let allFlagWrites   = concatMap srFlagWrites allResults
     let scalarWritesByReg :: Map String [ScalarWriteReq]
         scalarWritesByReg = foldl' (\m r -> Map.insertWith (++) (swRegName r) [r] m)
                                     Map.empty allScalarWrites
@@ -374,7 +392,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
     -- Data memory read address mux
     -- -----------------------------------------------------------------------
 
-    let allMemReads = concatMap srMemReads results
+    let allMemReads = concatMap srMemReads allResults
     dmemRdAddrW <- case allMemReads of
         [] -> litWire 0 addrBits
         rs -> buildMuxTree [ (mrMatchWire r, mrAddrWire r) | r <- rs ]
@@ -404,8 +422,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
             Just (_, outW, _, _) -> outW
             Nothing              -> instrWireId
 
-    let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW)) :: Int
-        pcRegWidth   = case Map.lookup pcName scalarRegMap of
+    let pcRegWidth = case Map.lookup pcName scalarRegMap of
             Just (w, _, _, _) -> w
             Nothing            -> 0
     pcAddrW <- if codeAddrBits == pcRegWidth
@@ -427,6 +444,8 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW = do
         , cmiDataAddrW  = addrBits
         , cmiWordW      = wordBits
         , cmiCodeWordW  = codeBits
+        , cmiIrqPending = fmap (\(p,_,_) -> p) irqData
+        , cmiIrqVector  = fmap (\(_,v,_) -> v) irqData
         }
 
 -- | Standalone wrapper: synthesises the CPU with all memory interface signals

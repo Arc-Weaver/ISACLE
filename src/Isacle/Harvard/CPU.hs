@@ -4,7 +4,7 @@ import Prelude
 import Data.Maybe (fromMaybe)
 import Isacle.Harvard.ISA
 
--- | Execute one decoded instruction using an 'ALU', advancing the program counter.
+-- | Execute one decoded instruction using a 'HarvardISA', advancing the program counter.
 --
 --   The write address is computed from the PRE-compute state so that
 --   post-increment/pre-decrement pointer updates in 'compute' do not
@@ -13,7 +13,7 @@ import Isacle.Harvard.ISA
 --   Returns @(new_state, maybe_write, next_pc)@.
 runInstruction
     :: forall state
-     . (ALU state, Num (RomAddr state))
+     . (HarvardISA state, Num (RomAddr state))
     => (state -> RomAddr state)             -- getPC
     -> (state -> RomAddr state -> state)    -- setPC
     -> (Instr state -> RomAddr state)       -- instruction size in fetch words

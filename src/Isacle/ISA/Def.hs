@@ -1,4 +1,5 @@
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE TypeFamilies #-}
 module Isacle.ISA.Def where
 
 import Prelude
@@ -47,28 +48,19 @@ resetFlag sel val = ResetDef $ \alu ->
 
 data ISADef m = ISADef
     { -- | Which register drives instruction fetch
-      isaPc          :: m SomeCPURegister
+      isaPc            :: m SomeCPURegister
 
-      -- | Flag that gates interrupt acceptance
-    , isaInterruptEn :: m CPUFlag
-
-      -- | Register loaded with the interrupt vector on acceptance
-    , isaInterruptVec :: m SomeCPURegister
-
-      -- | State saved on interrupt / call, in push order.
-      -- Each item must be exactly one data word wide; wider values
-      -- must be packed first. Byte order follows CPUDef endianness.
-    , isaContextSave :: [ContextItem m]
-
-      -- | Optional privilege/supervisor mode flag.
-      -- Nothing for architectures with no privilege levels.
-    , isaSupervisor  :: Maybe (m CPUFlag)
+      -- | Interrupt service routine body, or Nothing for no IRQ support.
+      -- Written using the same MonadALU DSL as regular instructions.
+      -- Use irqGate to add an additional gate condition (e.g. the global IE flag);
+      -- use irqVector to read the externally-supplied vector address.
+    , isaInterruptBody :: Maybe (m ())
 
       -- | Power-on reset state for all declared state elements
-    , isaReset       :: ResetDef (AluDef m) ()
+    , isaReset         :: ResetDef (AluDef m) ()
 
       -- | The instruction definitions
-    , isaInstrs      :: [m ()]
+    , isaInstrs        :: [m ()]
     }
 
 -- Existential wrapper so isaPc / isaInterruptVec don't fix the width

@@ -91,11 +91,17 @@ instance MonadALU (DocM alu) where
     isZero _        = return 0
     absJumpIf _ _ _ = return ()
     aluOp _ x _  = return x
+    resizeBits _  = return 0
 
 instance MonadHarvardALU (DocM alu) where
     type CodeAddr (DocM alu) = Unsigned 16
     type CodeWord (DocM alu) = Unsigned 16
     readCode _ = return (Unsigned 0)
+
+instance MonadIRQ (DocM alu) where
+    type IrqAddrW (DocM alu) = 16
+    irqVector = return 0
+    irqGate _ = return ()
 
 -- ---------------------------------------------------------------------------
 -- Runners

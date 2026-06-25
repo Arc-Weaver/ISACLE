@@ -40,9 +40,6 @@ data TInstr
     | TMul   TReg TReg
     deriving (Show, Eq)
 
-data TIsaStage = TIsaStage
-    deriving (Show, Eq)
-
 initState :: TState
 initState = TState [0,0,0,0] 0 False
 
@@ -62,7 +59,6 @@ setReg r v s = s { tRegs = take r (tRegs s) ++ [v] ++ drop (r+1) (tRegs s) }
 instance ALU TState where
     type Instr   TState = TInstr
     type RamAddr TState = TAddr
-    type RomAddr TState = TAddr
     type Val     TState = TVal
 
     read (TLoad _ a) _ = Just a
@@ -83,31 +79,27 @@ instance ALU TState where
     write (TStore a rs) s = Just (a, getReg rs s)
     write _             _ = Nothing
 
+-- ---------------------------------------------------------------------------
+-- HarvardISA instance
+-- ---------------------------------------------------------------------------
+
+instance HarvardISA TState where
+    type RomAddr   TState = TAddr
+    type FetchWord TState = Word8
+    type MaxFetch  TState = 1
+
     move (TJump a) _ = Just a
     move (TBrZ  a) s = if tZero s then Just a else Nothing
     move _         _ = Nothing
 
--- ---------------------------------------------------------------------------
--- ISA instance
--- ---------------------------------------------------------------------------
-
-instance ISA TState where
-    type IsaStage  TState = TIsaStage
-    type FetchWord TState = Word8
-    type MaxFetch  TState = 1
-
     latency (TMul _ _) = 2
     latency _          = 1
 
-    toIsaStage _ _ = Nothing
-
-    isaStageStep TIsaStage _ _ s = (s, Right (), Nothing, Nothing)
-
     interruptible _ = True
 
-    acceptIrq s _ = (s, Nothing)
+    acceptIrq s _ = s
 
-instance HasFlush TState
+instance HasFlushH TState
 
 stall :: TAddr -> TAddr -> Maybe (StallEvent TAddr)
 stall = stallCondition @TState
@@ -132,7 +124,7 @@ runIsaTests = do
     assert "write TLoad returns Nothing"   (write (TLoad 0 0x42) initState == Nothing)
     assert "write TJump returns Nothing"   (write (TJump 0x20) initState == Nothing)
 
-    putStrLn "\n-- ALU.move --"
+    putStrLn "\n-- HarvardISA.move --"
     assert "move TJump always taken"          (move (TJump 0x20) initState == Just 0x20)
     assert "move TBrZ taken when zero set"    (move (TBrZ 0x30) (withZero True initState) == Just 0x30)
     assert "move TBrZ not taken when clear"   (move (TBrZ 0x30) (withZero False initState) == Nothing)
@@ -181,14 +173,13 @@ runIsaTests = do
     assert "instrFetch TMul = 1"  (instrFetch @TState (TMul 0 1) == 1)
 
     putStrLn "\n-- interrupts --"
-    assert "interruptible = True"              (interruptible initState == True)
-    assert "acceptIrq returns no stage"        (snd (acceptIrq initState (0x10 :: TAddr)) == Nothing)
+    assert "interruptible = True"             (interruptible initState == True)
+    assert "acceptIrq preserves state"        (acceptIrq initState (0x10 :: TAddr) == initState)
     let sr = setReg 0 0x42 initState
-    assert "acceptIrq does not modify state"   (fst (acceptIrq sr (0x10 :: TAddr)) == sr)
+    assert "acceptIrq does not modify state"  (acceptIrq sr (0x10 :: TAddr) == sr)
 
     putStrLn "\n-- Slot constructors --"
-    assert "SEmpty == SEmpty"  ((SEmpty :: Slot TInstr TIsaStage) == SEmpty)
-    assert "SReady holds instr" ((SReady TNop :: Slot TInstr TIsaStage) == SReady TNop)
-    assert "SMemRead holds instr" ((SMemRead (TLoad 0 0x42) :: Slot TInstr TIsaStage) == SMemRead (TLoad 0 0x42))
-    assert "SIsa holds stage"  ((SIsa TIsaStage :: Slot TInstr TIsaStage) == SIsa TIsaStage)
-    assert "SEmpty /= SReady"  ((SEmpty :: Slot TInstr TIsaStage) /= SReady TNop)
+    assert "SEmpty == SEmpty"     ((SEmpty :: Slot TInstr) == SEmpty)
+    assert "SReady holds instr"   ((SReady TNop :: Slot TInstr) == SReady TNop)
+    assert "SMemRead holds instr" ((SMemRead (TLoad 0 0x42) :: Slot TInstr) == SMemRead (TLoad 0 0x42))
+    assert "SEmpty /= SReady"     ((SEmpty :: Slot TInstr) /= SReady TNop)

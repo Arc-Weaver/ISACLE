@@ -2,6 +2,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 module Isacle.ISA.ALU where
 
 import Prelude hiding (Word)
@@ -10,15 +11,6 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 import Hdl.Bits
 import Isacle.ISA.Types
-
--- ---------------------------------------------------------------------------
--- ContextItem
--- Items saved to the stack on interrupt or subroutine call.
--- Any register width is allowed; the backend handles packing/splitting
--- into data-space words according to the CPU's endianness.
--- ---------------------------------------------------------------------------
-
-data ContextItem m = forall w. KnownNat w => SaveWord (m (Unsigned w))
 
 -- ---------------------------------------------------------------------------
 -- MonadALU
@@ -87,10 +79,33 @@ class Monad m => MonadALU m where
 
     -- ------------------------------------------------------------------
     -- Flag operations
+    --
+    -- Flags are bit-addressed views into status registers.
+    -- The low-level primitives (getFlag / setFlag) take an explicit CPUFlag
+    -- handle.  The higher-level readFlag / writeFlag take a selector in the
+    -- same style as 'cpu', so call sites need no intermediate binding.
+    --
+    -- readFlag mcsCY   ≡   getFlag =<< cpuFlag mcsCY
+    -- writeFlag mcsCY v ≡  cpuFlag mcsCY >>= \f -> setFlag f v
     -- ------------------------------------------------------------------
 
     getFlag :: CPUFlag -> m (Unsigned 1)
     setFlag :: CPUFlag -> Unsigned 1 -> m ()
+
+    readFlag :: (AluDef m -> CPUFlag) -> m (Unsigned 1)
+    readFlag sel = getFlag =<< cpuFlag sel
+
+    writeFlag :: (AluDef m -> CPUFlag) -> Unsigned 1 -> m ()
+    writeFlag sel v = cpuFlag sel >>= \f -> setFlag f v
+
+    -- | Resize a k-bit value to n bits: zero-extends when n > k, truncates
+    -- (takes lower n bits) when n < k.
+    -- Default: masks to the lower n bits (correct for simulation).
+    resizeBits :: forall k n. (KnownNat k, KnownNat n) => Unsigned k -> m (Unsigned n)
+    resizeBits v =
+        let n    = fromIntegral (natVal (Proxy @n)) :: Int
+            mask = (1 `shiftL` n) - 1
+        in pure (fromInteger (toInteger v .&. mask))
 
     -- | Sign-extend a k-bit value to n bits, interpreting the source as 2's
     -- complement signed.  Default uses Haskell signed wrapping (correct for
@@ -159,6 +174,31 @@ class MonadALU m => MonadHarvardALU m where
     type CodeWord m :: Type
 
     readCode :: CodeAddr m -> m (CodeWord m)
+
+-- ---------------------------------------------------------------------------
+-- MonadIRQ
+-- Extends MonadALU with interrupt-vector access and interrupt gating.
+-- Separate from MonadALU so ISAs without IRQ support carry no overhead.
+-- ---------------------------------------------------------------------------
+
+class MonadALU m => MonadIRQ m where
+    -- | Bit width of the interrupt vector address.
+    -- For Harvard architectures this equals the code-address width (pcW);
+    -- for Von Neumann it equals the data-address width.
+    -- Exposing the width as a Nat lets callers use 'resizeBits' to coerce the
+    -- vector into the PC register width without an extra constraint.
+    type IrqAddrW m :: Nat
+
+    -- | Return the externally-supplied interrupt vector address.
+    -- Wired to an @irq_vector@ input port in hardware so an interrupt
+    -- controller outside the core can drive it.
+    irqVector :: m (Unsigned (IrqAddrW m))
+
+    -- | Condition all subsequent writes in the current do-block on the given
+    -- 1-bit signal, similar to Haskell's @guard@ but for hardware writes.
+    -- In synthesis the condition is ANDed with the current match wire; in
+    -- simulation the body is skipped when the condition evaluates to 0.
+    irqGate :: m (Unsigned 1) -> m ()
 
 -- ---------------------------------------------------------------------------
 -- Common helpers
@@ -237,12 +277,3 @@ indirectReadOffset ptrReg offset = do
     ptr <- readReg ptrReg
     readMem (bitCoerce (ptr + offset))
 
--- ---------------------------------------------------------------------------
--- Context save helpers
--- Build ContextItem values for isaContextSave lists.
--- ---------------------------------------------------------------------------
-
--- | Save a register into the context. Any register width is valid;
--- the backend packs it into data-space words using the CPU's endianness.
-saveWordReg :: (MonadALU m, KnownNat w) => (AluDef m -> CPURegister w) -> ContextItem m
-saveWordReg sel = SaveWord (readReg =<< cpu sel)

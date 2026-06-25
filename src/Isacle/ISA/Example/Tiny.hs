@@ -154,12 +154,9 @@ jmpDef = do
 
 tinyISA :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8, DataAddr m ~ Unsigned 8) => ISADef m
 tinyISA = defineISA ISADef
-    { isaPc           = SomeCPURegister <$> cpu pc
-    , isaInterruptEn  = cpuFlag zero     -- no interrupts; Z used as placeholder
-    , isaInterruptVec = SomeCPURegister <$> cpu pc
-    , isaSupervisor   = Nothing
-    , isaContextSave  = []
-    , isaReset        = do
+    { isaPc            = SomeCPURegister <$> cpu pc
+    , isaInterruptBody = Nothing
+    , isaReset         = do
         resetReg  pc   0x00
         resetFlag zero Lo
     , isaInstrs       =
