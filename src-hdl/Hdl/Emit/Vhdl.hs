@@ -8,7 +8,7 @@ module Hdl.Emit.Vhdl
 
 import Prelude
 import Data.Char (toLower)
-import Data.List (intercalate, nub, partition, sort)
+import Data.List (foldl', intercalate, nub, partition, sort)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -275,11 +275,39 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
         [ nPortName n | n@NInput{}  <- nodes ] ++
         [ nPortName n | n@NOutput{} <- nodes ]
     groupedWires = Map.keysSet groupMap
-    hintMap = Map.fromList
+
+    -- Per-wire chosen hint (last hint on a wire wins, as before).
+    wireHint = Map.fromList
         [ (nHintWire n, safeHint (nHintWire n) (nHintName n))
         | n@NHint{} <- nodes
         , not (isLitWire (nHintWire n) nodes)
         , not (Set.member (nHintWire n) groupedWires) ]
+
+    -- Names already claimed by ports, group records, literal constants and
+    -- output-register aliases — these are fixed, so colliding hints defer.
+    reservedNames = Set.unions
+        [ portNames
+        , Set.fromList (Map.elems groupMap)
+        , Set.fromList (Map.elems litMap)
+        , Set.fromList (Map.elems regMap)
+        ]
+
+    -- Two distinct wires must never share a VHDL signal name (it would emit a
+    -- duplicate declaration / multiple drivers).  Many hints legitimately
+    -- derive the same readable name across instructions (e.g. a per-instruction
+    -- GPR read forward, or @GPR_d_sub_GPR_r@ in several ALU ops), so suffix
+    -- collisions with _2, _3, … while keeping the first occurrence pristine.
+    hintMap = fst $ foldl' assign (Map.empty, reservedNames) (Map.toAscList wireHint)
+      where
+        assign (m, used) (wid, base) =
+            let nm = uniqueName base used
+            in (Map.insert wid nm m, Set.insert nm used)
+        uniqueName base used
+            | not (Set.member base used) = base
+            | otherwise = head [ c | i <- [(2 :: Int) ..]
+                                   , let c = base ++ "_" ++ show i
+                                   , not (Set.member c used) ]
+
     safeHint wid h
         | Set.member h portNames    = h ++ if isReg wid then "_r" else "_s"
         | Set.member h vhdlReserved = h ++ "_s"
