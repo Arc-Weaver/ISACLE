@@ -1,122 +1,134 @@
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE KindSignatures             #-}
+{-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DerivingStrategies         #-}
 -- | The IR-builder monad: running an instruction body in it produces the
--- 'InstrIR' source of truth (annotations + ordered statements).  This is the
--- target the surface 'MonadALU' interface will build into — it accumulates
--- 'IStmt's in program order and mints 'ReadTok's for ordered reads.
+-- 'InstrIR' source of truth.  This is the /single/ 'MonadALU' instance —
+-- backends (@Synth@, @Sim@, @Doc@) are renderers over the resulting 'InstrIR'
+-- rather than separate, leaky interpreters.
 --
--- The point of this module is that the value flowing through a body is an
--- 'IExpr' (via the 'Term' class), so @sp - 1@ constructs @'IBin' 'PSub'@ — a
--- value — rather than doing integer arithmetic on a smuggled wire id.  Nothing
--- here knows about 'Hdl.Net.WireId's; lowering to wires happens later, in the
--- synthesis renderer.
+-- The value a body computes with is an 'IExpr', so @sp - 1@ builds
+-- @IBin PSub@ — a value — and the synthesiser lowers it to a real subtractor.
+-- No 'Hdl.Net.WireId' ever appears here.
 module Isacle.ISA.Build
     ( ISABuild
     , runISABuild
-      -- * Builder operations (mirror the MonadALU surface, value type = IExpr)
-    , setMnemonic
-    , setDoc
-    , setEncoding
-    , readRegB
-    , writeRegB
-    , readMemB
-    , writeMemB
-    , readCodeB
-    , writeFlagB
-    , jumpIfB
-    , immB
-    , litB
     ) where
 
-import Prelude
-import Control.Monad.State.Strict
+import Prelude hiding (Word)
 import GHC.TypeLits (KnownNat)
+import Control.Monad.Reader
+import Control.Monad.State.Strict
 
-import Isacle.ISA.Types (CPUFlag)
+import Isacle.ISA.Types
+import Isacle.ISA.Encoding (fieldKey)
+import Isacle.ISA.ALU
 import Isacle.ISA.IR
 
 -- ---------------------------------------------------------------------------
--- Builder state
+-- Builder state and monad
 -- ---------------------------------------------------------------------------
 
 data BuildSt = BuildSt
     { bsMnemonic :: Maybe String
     , bsDoc      :: Maybe String
     , bsEncoding :: Maybe String
-    , bsStmts    :: [IStmt]   -- ^ accumulated in reverse (program order on finish)
-    , bsReadCtr  :: Int       -- ^ next ReadTok id
+    , bsGate     :: Maybe (IExpr 1)
+    , bsStmts    :: [IStmt]   -- ^ reverse program order
+    , bsReadCtr  :: Int
     }
 
 initBuildSt :: BuildSt
-initBuildSt = BuildSt Nothing Nothing Nothing [] 0
+initBuildSt = BuildSt Nothing Nothing Nothing Nothing [] 0
 
-newtype ISABuild a = ISABuild (State BuildSt a)
+-- | Builds an 'InstrIR'.  Carries the ALU record (for 'cpu'/'register') in a
+-- reader and accumulates statements in state.  The width parameters pin the
+-- data/code word and address widths via the associated types.
+newtype ISABuild alu (wordW :: k) (addrW :: k) (cwW :: k) (caW :: k) a
+    = ISABuild (ReaderT alu (State BuildSt) a)
     deriving newtype (Functor, Applicative, Monad)
 
--- | Run a body, producing its 'InstrIR'.
-runISABuild :: ISABuild a -> InstrIR
-runISABuild (ISABuild m) =
-    let st = execState m initBuildSt
-    in InstrIR (bsMnemonic st) (bsDoc st) (bsEncoding st) (reverse (bsStmts st))
+-- | Run an instruction body, producing its 'InstrIR'.
+runISABuild :: alu -> ISABuild alu wordW addrW cwW caW () -> InstrIR
+runISABuild alu (ISABuild m) =
+    let st = execState (runReaderT m alu) initBuildSt
+    in InstrIR (bsMnemonic st) (bsDoc st) (bsEncoding st)
+               (bsGate st) (reverse (bsStmts st))
 
--- ---------------------------------------------------------------------------
--- Primitive operations
--- ---------------------------------------------------------------------------
-
-emitStmt :: IStmt -> ISABuild ()
+emitStmt :: IStmt -> ISABuild alu wordW addrW cwW caW ()
 emitStmt s = ISABuild $ modify $ \st -> st { bsStmts = s : bsStmts st }
 
-freshRead :: ISABuild ReadTok
+freshRead :: ISABuild alu wordW addrW cwW caW ReadTok
 freshRead = ISABuild $ do
     n <- gets bsReadCtr
     modify $ \st -> st { bsReadCtr = n + 1 }
     pure (ReadTok n)
 
-setMnemonic :: String -> ISABuild ()
-setMnemonic s = ISABuild $ modify $ \st -> st { bsMnemonic = Just s }
+-- | Parse a 'CPURegister' name into a 'RegRef': @"rf:field"@ is a register-file
+-- slot, anything else a scalar register.
+toRegRef :: String -> RegRef w
+toRegRef key
+    | (':' `elem` key) =
+        let (rf, rest) = break (== ':') key in RegFile rf (FieldRef (drop 1 rest))
+    | otherwise = RegScalar key
 
-setDoc :: String -> ISABuild ()
-setDoc s = ISABuild $ modify $ \st -> st { bsDoc = Just s }
+-- ---------------------------------------------------------------------------
+-- The one MonadALU instance
+-- ---------------------------------------------------------------------------
 
-setEncoding :: String -> ISABuild ()
-setEncoding s = ISABuild $ modify $ \st -> st { bsEncoding = Just s }
+instance (KnownNat wordW, KnownNat addrW)
+      => MonadALU (ISABuild alu wordW addrW cwW caW) where
+    type AluDef   (ISABuild alu wordW addrW cwW caW) = alu
+    type Word     (ISABuild alu wordW addrW cwW caW) = IExpr wordW
+    type DataAddr (ISABuild alu wordW addrW cwW caW) = IExpr addrW
 
--- | Register read is a pure value reference (no ordered effect).
-readRegB :: KnownNat w => RegRef w -> ISABuild (IExpr w)
-readRegB = pure . IReadReg
+    cpu sel     = ISABuild (asks sel)
+    cpuFlag sel = ISABuild (asks sel)
 
-writeRegB :: KnownNat w => RegRef w -> IExpr w -> ISABuild ()
-writeRegB ref e = emitStmt (SWriteReg ref e)
+    register sel field = ISABuild $ do
+        alu <- ask
+        let CPURegFile rfname = sel alu
+        pure (CPURegister (rfname ++ ":" ++ fieldKey field))
 
--- | Memory read is an ordered effect; its result is referred to via 'IReadRes'.
-readMemB :: KnownNat w => IExpr aw -> ISABuild (IExpr w)
-readMemB addr = do
-    tok <- freshRead
-    emitStmt (SReadMem tok addr)
-    pure (IReadRes tok)
+    immediate field = pure (IField (FieldRef (fieldKey field)))
 
-writeMemB :: IExpr aw -> IExpr ww -> ISABuild ()
-writeMemB a d = emitStmt (SWriteMem a d)
+    mnemonic nm = ISABuild $ modify $ \s -> s { bsMnemonic = Just nm }
+    doc      d  = ISABuild $ modify $ \s -> s { bsDoc      = Just d  }
+    encoding e  = ISABuild $ modify $ \s -> s { bsEncoding = Just e  }
 
--- | Code read (second instruction word, LPM) — also an ordered effect.
-readCodeB :: KnownNat w => IExpr aw -> ISABuild (IExpr w)
-readCodeB addr = do
-    tok <- freshRead
-    emitStmt (SReadCode tok addr)
-    pure (IReadRes tok)
+    readReg  (CPURegister key)   = pure (IReadReg (toRegRef key))
+    writeReg (CPURegister key) e = emitStmt (SWriteReg (toRegRef key) e)
 
-writeFlagB :: CPUFlag -> IExpr 1 -> ISABuild ()
-writeFlagB f e = emitStmt (SWriteFlag f e)
+    readMem  addr = do { tok <- freshRead; emitStmt (SReadMem tok addr); pure (IReadRes tok) }
+    writeMem addr val = emitStmt (SWriteMem addr val)
 
-jumpIfB :: KnownNat w => RegRef w -> IExpr 1 -> IExpr w -> ISABuild ()
-jumpIfB pc cond tgt = emitStmt (SJumpIf pc cond tgt)
+    getFlag flag   = pure (IFlagRead flag)
+    setFlag flag v = emitStmt (SWriteFlag flag v)
 
--- | A decoded instruction field as a value.
-immB :: KnownNat w => String -> ISABuild (IExpr w)
-immB k = pure (IField (FieldRef k))
+    absJumpIf (CPURegister key) cond tgt =
+        emitStmt (SJumpIf (toRegRef key) cond tgt)
+    -- aluOp / litC / resizeBits / signExtendBits / isZero use the Term-based
+    -- class defaults.
 
--- | A literal value.
-litB :: KnownNat w => Integer -> ISABuild (IExpr w)
-litB = pure . ILit
+instance (KnownNat wordW, KnownNat addrW, KnownNat cwW, KnownNat caW)
+      => MonadHarvardALU (ISABuild alu wordW addrW cwW caW) where
+    type CodeAddr (ISABuild alu wordW addrW cwW caW) = IExpr caW
+    type CodeWord (ISABuild alu wordW addrW cwW caW) = IExpr cwW
+
+    readCode addr = do { tok <- freshRead; emitStmt (SReadCode tok addr); pure (IReadRes tok) }
+
+instance (KnownNat wordW, KnownNat addrW, KnownNat caW)
+      => MonadIRQ (ISABuild alu wordW addrW cwW caW) where
+    type IrqAddrW (ISABuild alu wordW addrW cwW caW) = caW
+
+    irqVector = pure IIrqVector
+
+    irqGate condAction = do
+        cond <- condAction
+        ISABuild $ modify $ \s ->
+            s { bsGate = Just (maybe cond (\g -> tBin PAnd g cond) (bsGate s)) }

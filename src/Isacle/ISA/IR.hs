@@ -41,6 +41,12 @@ module Isacle.ISA.IR
     , Term(..)
       -- * Canonical instance: the annotated IR expression
     , IExpr(..)
+      -- * Bit-width adapters (named to match Hdl.Bits so bodies are unchanged)
+    , zeroExtend
+    , signExtend
+    , truncateB
+    , bitCoerce
+    , slice
       -- * Ordered effects and the per-instruction IR
     , IStmt(..)
     , InstrIR(..)
@@ -88,6 +94,8 @@ data IExpr (w :: Nat) where
     IField   :: KnownNat w => FieldRef -> IExpr w
     IReadReg :: KnownNat w => RegRef w -> IExpr w
     IReadRes :: KnownNat w => ReadTok -> IExpr w
+    IFlagRead :: CPUFlag -> IExpr 1                -- ^ read one status-register bit
+    IIrqVector :: KnownNat w => IExpr w            -- ^ external interrupt-vector input
     IBin     :: KnownNat w => ALUPrim -> IExpr w -> IExpr w -> IExpr w
     IUn      :: KnownNat w => ALUPrim -> IExpr w -> IExpr w
     IResize  :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
@@ -95,6 +103,8 @@ data IExpr (w :: Nat) where
     IZeroExt :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
     ITrunc   :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
     IIsZero  :: KnownNat k => IExpr k -> IExpr 1
+    ISlice   :: (KnownNat k, KnownNat w) => Int -> Int -> IExpr k -> IExpr w
+      -- ^ @ISlice hi lo e@ — bits [hi..lo] inclusive of @e@, as a @w@-bit value.
     INamed   :: KnownNat w => String -> IExpr w -> IExpr w
 
 deriving instance Show (IExpr w)
@@ -111,6 +121,7 @@ class Term (t :: Nat -> Type) where
     tZeroExt :: (KnownNat k, KnownNat w) => t k -> t w
     tTrunc   :: (KnownNat k, KnownNat w) => t k -> t w
     tIsZero  :: KnownNat k => t k -> t 1
+    tSlice   :: (KnownNat k, KnownNat w) => Int -> Int -> t k -> t w
     tNamed   :: KnownNat w => String -> t w -> t w
 
 instance Term IExpr where
@@ -122,6 +133,7 @@ instance Term IExpr where
     tZeroExt = IZeroExt
     tTrunc   = ITrunc
     tIsZero  = IIsZero
+    tSlice   = ISlice
     tNamed   = INamed
 
 -- | The instance that matters: @sp - 1@ builds @'IBin' 'PSub' sp ('ILit' 1)@,
@@ -134,6 +146,26 @@ instance KnownNat w => Num (IExpr w) where
     abs a       = a
     signum _    = ILit 1
     fromInteger = ILit
+
+-- ---------------------------------------------------------------------------
+-- Bit-width adapters — named to match the Hdl.Bits functions bodies call, so
+-- migrating a body only changes its value type, not its call sites.
+-- ---------------------------------------------------------------------------
+
+zeroExtend :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
+zeroExtend = IZeroExt
+
+signExtend :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
+signExtend = ISignExt
+
+truncateB :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
+truncateB = ITrunc
+
+bitCoerce :: (KnownNat k, KnownNat w) => IExpr k -> IExpr w
+bitCoerce = IResize
+
+slice :: (KnownNat k, KnownNat w) => Int -> Int -> IExpr k -> IExpr w
+slice = ISlice
 
 -- ---------------------------------------------------------------------------
 -- Ordered effects and the per-instruction IR
@@ -157,8 +189,9 @@ data InstrIR = InstrIR
     { iirMnemonic :: Maybe String   -- ^ → @match_\<mnemonic\>@, field-wire prefix
     , iirDoc      :: Maybe String
     , iirEncoding :: Maybe String   -- ^ encoding pattern (e.g. @"0000_11rd…"@)
+    , iirGate     :: Maybe (IExpr 1)-- ^ extra match condition (irqGate); ANDed in
     , iirStmts    :: [IStmt]        -- ^ program order
     } deriving (Show)
 
 emptyInstrIR :: InstrIR
-emptyInstrIR = InstrIR Nothing Nothing Nothing []
+emptyInstrIR = InstrIR Nothing Nothing Nothing Nothing []
