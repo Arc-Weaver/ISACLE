@@ -472,7 +472,7 @@ archDecls nm nodes =
     -- All other driven wires (registers, combinational outputs).
     -- Skip wires that are declared as part of an NGroup record.
     [ VDSig (lookupWire nm wid) (ppType (wireVTypeR (reprOf wid nodes) (inferWidth wid nodes)))
-            (fmap ppLit (regInit wid nodes))
+            (fmap (ppLitR (reprOf wid nodes)) (regInit wid nodes))
     | wid <- sort (Map.keys nm)
     , not (isInputWire wid nodes)
     , not (isLitWire wid nodes)
@@ -610,7 +610,7 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
            ]
 
     resetBody (NReg out _ _ initV _) =
-        [ "      " ++ lookupWire nm out ++ " <= " ++ ppLit initV ++ ";" ]
+        [ "      " ++ lookupWire nm out ++ " <= " ++ ppLitR (reprOf out nodes) initV ++ ";" ]
     resetBody _ = []
 
     clockedBody (NReg out inp Nothing _ _) =
@@ -750,3 +750,11 @@ inferOpWidth _              []       _  = 1
 ppLit :: SomeBits -> String
 ppLit (SomeBits v 1) = if v == 0 then "'0'" else "'1'"
 ppLit (SomeBits v w) = "to_unsigned(" ++ show v ++ ", " ++ show w ++ ")"
+
+-- | Repr-aware literal: a signed wire's constant\/init must be @to_signed@ (with
+-- the bit pattern reinterpreted as a signed value), not @to_unsigned@.
+ppLitR :: Repr -> SomeBits -> String
+ppLitR RSigned (SomeBits v w)
+    | w > 1 = "to_signed(" ++ show signedVal ++ ", " ++ show w ++ ")"
+  where signedVal = if v >= 2 ^ (w - 1) then v - 2 ^ w else v
+ppLitR _ sb = ppLit sb
