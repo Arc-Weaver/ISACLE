@@ -124,7 +124,10 @@ renderInstrSim :: Integer        -- ^ raw instruction word
                -> InstrIR
                -> SimState -> SimState
 renderInstrSim instrWord mIrqVec ir st0 =
-    if not gateOpen then st0 else foldl' apply st0 (iirStmts ir)
+    -- Expose this instruction's parsed encoding on the result so callers can
+    -- recover it (e.g. to build a decode table) after running a body.
+    let st1 = st0 { ssEncoding = enc }
+    in if not gateOpen then st1 else foldl' apply st1 (iirStmts ir)
   where
     enc   = fmap parseEncoding (iirEncoding ir)
     regs0 = scRegs (ssCPU st0)
