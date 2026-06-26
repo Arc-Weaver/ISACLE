@@ -166,8 +166,11 @@ lowerExpr_ ctx e = nWire <$> lowerExpr ctx e
 -- ---------------------------------------------------------------------------
 
 regName :: RegRef w -> String
-regName (RegScalar n)            = n
-regName (RegFile f (FieldRef k)) = f ++ "_" ++ k
+regName (RegScalar n)              = n
+regName (RegFile f (FieldRef k) o)
+    | null k    = f ++ "_r" ++ show o          -- constant index Rn
+    | o /= 0    = f ++ "_" ++ k ++ "_p" ++ show o
+    | otherwise = f ++ "_" ++ k
 
 -- | Name a binary result after its operands, e.g. @sp \"sub\" => sp_sub@.
 -- Only names when at least one operand carries a name, to avoid noise.

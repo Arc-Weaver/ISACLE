@@ -61,13 +61,13 @@ operandsS s = case s of
     SJumpIf r c t  -> regOperand r ++ operandsE c ++ operandsE t
 
 regOperand :: RegRef w -> [OperandSpec]
-regOperand (RegFile rf (FieldRef k)) = [OpRegister k rf]
-regOperand (RegScalar _)             = []
+regOperand (RegFile rf (FieldRef k) o) = [OpRegister (if null k then show o else k) rf]
+regOperand (RegScalar _)               = []
 
 operandsE :: IExpr w -> [OperandSpec]
 operandsE e = case e of
     IField (FieldRef k)                -> [OpImmediate k]
-    IReadReg (RegFile rf (FieldRef k)) -> [OpRegister k rf]
+    IReadReg (RegFile rf (FieldRef k) o) -> [OpRegister (if null k then show o else k) rf]
     IReadReg (RegScalar _)             -> []
     IReadRes _                         -> []
     IFlagRead _                        -> []

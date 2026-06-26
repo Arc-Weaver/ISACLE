@@ -72,7 +72,9 @@ newtype FieldRef = FieldRef { frKey :: String }
 -- for signal naming.
 data RegRef (w :: Nat)
     = RegScalar String              -- ^ scalar register (e.g. @"SP"@, @"PC"@)
-    | RegFile   String FieldRef     -- ^ register-file slot: file name + index field
+    | RegFile   String FieldRef Int -- ^ register-file slot: file name, index field,
+                                    --   and a constant added to the index (for
+                                    --   sub-range encodings, e.g. AVR R16–R31 → +16)
     deriving (Eq, Show)
 
 -- | Identifies one ordered memory/code read so its result expression

@@ -131,21 +131,54 @@ renderSynth ctx mBase ir = do
         col    = mconcat (map collectS (iirStmts ir))
                    <> maybe mempty collectE (iirGate ir)
         fieldKeys = nub (colFields col)
-        regReads  = nub (colRegReads col)
+        regReads  = nub (colRegReads col)   -- (rf, field, offset)
+        idxKeys   = nub (colIdx col)        -- (field, offset) used as a regfile index
 
     -- Field-extraction wires (shared by immediates and register-file indices).
     fieldPairs <- mapM (\k -> (,) k <$> extractFieldNamed mEnc instrW (iirMnemonic ir) k)
                        fieldKeys
     let fieldMap = Map.fromList fieldPairs
 
-    -- One read port per distinct (register file, index field).
-    regTriples <- mapM (\(rf, k) -> do
+    -- Base match wire — computed early so it can stand in as a fallback wire.
+    base <- case mBase of
+        Just w  -> pure w
+        Nothing -> case mEnc of
+            Just e  -> buildMatchWire e instrW
+            Nothing -> litW 1 1
+    case (mBase, iirMnemonic ir) of
+        (Nothing, Just nm) -> hintWire base ("match_" ++ nm)
+        _                  -> pure ()
+
+    -- Register-file index wires.  Offset 0 is the raw field; a non-zero offset
+    -- (sub-range encoding, e.g. AVR @ldi@ → R16..R31) adds a constant, producing
+    -- a real adder so the index reaches the high half of the file.
+    idxPairs <- mapM (\(k, off) ->
+                    if null k
+                        then do  -- constant index: a literal, no field
+                            w <- litW (fromIntegral off) (rcWordW ctx)
+                            hintWire w (mnemPrefix (iirMnemonic ir) ("r" ++ show off ++ "_idx"))
+                            pure ((k, off), w)
+                        else do
+                            let fw = Map.findWithDefault base k fieldMap
+                            if off == 0
+                                then pure ((k, off), fw)
+                                else do
+                                    ext  <- freshWire; emit $ NComb ext (N.PResize (rcWordW ctx)) [fw]
+                                    offW <- litW (fromIntegral off) (rcWordW ctx)
+                                    s    <- freshWire; emit $ NComb s N.PAdd [ext, offW]
+                                    hintWire s (mnemPrefix (iirMnemonic ir) (k ++ "_idx"))
+                                    pure ((k, off), s))
+                   idxKeys
+    let idxMap = Map.fromList idxPairs
+        idxWire k off = Map.findWithDefault base (k, off) idxMap
+
+    -- One read port per distinct (register file, index field, offset).
+    regTriples <- mapM (\(rf, k, off) -> do
                             outW <- freshWire
-                            hintWire outW (rf ++ "_" ++ k)
-                            let idxW = Map.findWithDefault outW k fieldMap
-                            pure ((rf, k), outW, RegReadReq rf idxW outW))
+                            hintWire outW (rf ++ "_" ++ slotTag k off)
+                            pure ((rf, k, off), outW, RegReadReq rf (idxWire k off) outW))
                        regReads
-    let regOutMap   = Map.fromList [ ((rf,k), o) | ((rf,k), o, _) <- regTriples ]
+    let regOutMap   = Map.fromList [ (key, o) | (key, o, _) <- regTriples ]
         regReadReqs = [ r | (_, _, r) <- regTriples ]
 
     -- Read-result wires: data reads get a fresh wire (driven by the sequencer);
@@ -156,20 +189,10 @@ renderSynth ctx mBase ir = do
                     _                       -> pure []) (iirStmts ir)
     let tokMap = Map.fromList tokPairs
 
-    -- Base match wire.
-    base <- case mBase of
-        Just w  -> pure w
-        Nothing -> case mEnc of
-            Just e  -> buildMatchWire e instrW
-            Nothing -> litW 1 1
-    case (mBase, iirMnemonic ir) of
-        (Nothing, Just nm) -> hintWire base ("match_" ++ nm)
-        _                  -> pure ()
-
     let lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
-                  RegScalar n             -> rcReadScalar ctx n
-                  RegFile rf (FieldRef k) -> pure (Map.findWithDefault base (rf, k) regOutMap)
+                  RegScalar n                 -> rcReadScalar ctx n
+                  RegFile rf (FieldRef k) off -> pure (Map.findWithDefault base (rf, k, off) regOutMap)
             , lcField     = \(FieldRef k) -> pure (Map.findWithDefault base k fieldMap)
             , lcReadRes   = \(ReadTok t)  -> pure (Map.findWithDefault (rcDataBus ctx) t tokMap)
             , lcReadFlag  = \f -> rcGetFlag ctx (cpuFlagReg f) (cpuFlagBit f)
@@ -187,9 +210,9 @@ renderSynth ctx mBase ir = do
     r <- renderInstr lctx ir
 
     -- Map the lowered Rendered into request structures.
-    let splitW (RegWrite (RegScalar n) w)             = Left  (ScalarWriteReq matchW n w)
-        splitW (RegWrite (RegFile rf (FieldRef k)) w) =
-            Right (RegWriteReq matchW rf (Map.findWithDefault base k fieldMap) w)
+    let splitW (RegWrite (RegScalar n) w)                 = Left  (ScalarWriteReq matchW n w)
+        splitW (RegWrite (RegFile rf (FieldRef k) off) w) =
+            Right (RegWriteReq matchW rf (idxWire k off) w)
         (scalarWs, regWs) = partitionEithers (map splitW (rRegWrites r))
 
     memWrites <- mapM (\(a, d) -> do
@@ -217,8 +240,20 @@ renderSynth ctx mBase ir = do
         }
 
 regRefName :: RegRef w -> String
-regRefName (RegScalar n)   = n
-regRefName (RegFile  n _)  = n
+regRefName (RegScalar n)    = n
+regRefName (RegFile  n _ _) = n
+
+-- | Name a register-file slot: a field key (with optional @_pN@ offset) or, for
+-- a constant index (empty key), the index number @rN@.
+slotTag :: String -> Int -> String
+slotTag k off
+    | null k    = "r" ++ show off
+    | off == 0  = k
+    | otherwise = k ++ "_p" ++ show off
+
+-- | Prefix a name with the instruction mnemonic when one is present.
+mnemPrefix :: Maybe String -> String -> String
+mnemPrefix mnem s = maybe s (\m -> m ++ "_" ++ s) mnem
 
 -- | Extract a field's bits from the instruction word (or a fresh wire when the
 -- encoding lacks it), named @\<mnemonic\>_\<key\>@.
@@ -241,42 +276,55 @@ litW v w = do { o <- freshWire; emit $ NComb o (N.PLit v w) []; pure o }
 -- ---------------------------------------------------------------------------
 
 data Collected = Collected
-    { colRegReads :: [(String, String)]   -- (register file, index field)
-    , colFields   :: [String]             -- field keys (immediates + indices)
+    { colRegReads :: [(String, String, Int)]  -- (register file, index field, offset)
+    , colFields   :: [String]                 -- field keys (immediates + indices)
+    , colIdx      :: [(String, Int)]          -- (index field, offset) used as a regfile index
     }
 
 instance Semigroup Collected where
-    Collected a b <> Collected c d = Collected (a ++ c) (b ++ d)
+    Collected a b c <> Collected d e f = Collected (a ++ d) (b ++ e) (c ++ f)
 instance Monoid Collected where
-    mempty = Collected [] []
+    mempty = Collected [] [] []
+
+-- | Collect the field key and index wire a register /reference/ needs.  A write
+-- destination contributes its index field (so it gets extracted) and its index
+-- wire, but — unlike a read — needs no read port.
+-- | An empty field key denotes a constant register index (the index is the
+-- offset, lowered to a literal): no field is extracted for it.
+fieldsOf :: String -> [String]
+fieldsOf k = [ k | not (null k) ]
+
+collectRef :: RegRef w -> Collected
+collectRef (RegScalar _)               = mempty
+collectRef (RegFile _ (FieldRef k) o)  = Collected [] (fieldsOf k) [(k, o)]
 
 collectE :: IExpr w -> Collected
 collectE e = case e of
-    ILit _                              -> mempty
-    IField (FieldRef k)                 -> Collected [] [k]
-    IReadReg (RegScalar _)              -> mempty
-    IReadReg (RegFile rf (FieldRef k))  -> Collected [(rf, k)] [k]
-    IReadRes _                          -> mempty
-    IFlagRead _                         -> mempty
-    IIrqVector                          -> mempty
-    IBin _ a b                          -> collectE a <> collectE b
-    IUn _ a                             -> collectE a
-    IResize a                           -> collectE a
-    ISignExt a                          -> collectE a
-    IZeroExt a                          -> collectE a
-    ITrunc a                            -> collectE a
-    IIsZero a                           -> collectE a
-    ISlice _ _ a                        -> collectE a
-    INamed _ a                          -> collectE a
+    ILit _                                  -> mempty
+    IField (FieldRef k)                     -> Collected [] [k] []
+    IReadReg (RegScalar _)                  -> mempty
+    IReadReg (RegFile rf (FieldRef k) o)    -> Collected [(rf, k, o)] (fieldsOf k) [(k, o)]
+    IReadRes _                              -> mempty
+    IFlagRead _                             -> mempty
+    IIrqVector                              -> mempty
+    IBin _ a b                              -> collectE a <> collectE b
+    IUn _ a                                 -> collectE a
+    IResize a                               -> collectE a
+    ISignExt a                              -> collectE a
+    IZeroExt a                              -> collectE a
+    ITrunc a                                -> collectE a
+    IIsZero a                               -> collectE a
+    ISlice _ _ a                            -> collectE a
+    INamed _ a                              -> collectE a
 
 collectS :: IStmt -> Collected
 collectS s = case s of
     SReadMem  _ a      -> collectE a
     SReadCode _ a      -> collectE a
-    SWriteReg _ e      -> collectE e
+    SWriteReg r e      -> collectRef r <> collectE e
     SWriteMem a d      -> collectE a <> collectE d
     SWriteFlag _ e     -> collectE e
-    SJumpIf _ c t      -> collectE c <> collectE t
+    SJumpIf r c t      -> collectRef r <> collectE c <> collectE t
 
 -- ---------------------------------------------------------------------------
 -- Netlist helpers (shared with the CPU pass)

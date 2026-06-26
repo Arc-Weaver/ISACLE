@@ -233,7 +233,18 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                              (Just irqPendW) (runISABuild aluRec body)
             return (Just (irqPendW, irqVecW, r))
 
-    let allResults = results ++ maybe [] (\(_, _, r) -> [r]) irqData
+    let allResults0 = results ++ maybe [] (\(_, _, r) -> [r]) irqData
+
+    -- Route every data-memory read through the alias mux: a read whose address
+    -- matches a memory-mapped register (SP at 0x5D, SREG at 0x5F, …) returns the
+    -- live architectural register value instead of SRAM data.  For an address
+    -- that matches nothing — or an ISA with no aliases — this is the SRAM bus
+    -- unchanged.  Done per read so each port compares its own address.
+    allResults <- forM allResults0 $ \r -> do
+        mrs <- forM (srMemReads r) $ \rr -> do
+            busW <- scReadMemFnAlias (mrAddrWire rr)
+            return rr { mrBusWire = busW }
+        return r { srMemReads = mrs }
 
     -- Execution sequencer: drives read-result wires, supplies the per-access
     -- cycle gate ('esGate') and the architectural-commit enable ('esCommit').

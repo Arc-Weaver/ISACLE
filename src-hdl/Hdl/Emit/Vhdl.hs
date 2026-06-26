@@ -86,8 +86,14 @@ ppDecl (VDSig   n t (Just v))= "  signal " ++ n ++ " : " ++ t ++ " := " ++ v ++ 
 memBaseName :: WireId -> NameMap -> String
 memBaseName wid nm =
     case Map.lookup wid nm of
-        Just h  -> map toLower (takeWhile (/= '_') h)
-        Nothing -> "ram_" ++ show wid
+        -- A semantic hint ("GPR_rd0" → "gpr"); but an internal "w<id>" name is
+        -- the read wire's own name, so the array must get a distinct name or it
+        -- collides with the wire (duplicate signal + self-reference).
+        Just h | not (isInternalName h) -> map toLower (takeWhile (/= '_') h)
+        _                               -> "ram_" ++ show wid
+  where
+    isInternalName ('w':rest) = not (null rest) && all (`elem` ['0'..'9']) rest
+    isInternalName _          = False
 
 memTypeName :: WireId -> NameMap -> String
 memTypeName wid nm = memBaseName wid nm ++ "_t"

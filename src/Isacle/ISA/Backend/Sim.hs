@@ -79,7 +79,7 @@ evalE env = go
         ILit v                              -> maskTo (widthOfE e0) v
         IField (FieldRef k)                 -> field k
         IReadReg (RegScalar n)              -> maskTo (widthOfE e0) (reg n)
-        IReadReg (RegFile rf (FieldRef k))  -> maskTo (widthOfE e0) (reg (rf ++ ":" ++ show (field k)))
+        IReadReg (RegFile rf (FieldRef k) o) -> maskTo (widthOfE e0) (reg (rf ++ ":" ++ show (field k + fromIntegral o)))
         IReadRes (ReadTok t)                -> IntMap.findWithDefault 0 t (evToks env)
         IFlagRead (CPUFlag rn bp)           -> (reg rn `shiftR` bp) .&. 1
         IIrqVector                          -> maybe 0 id (evIrqVec env)
@@ -147,8 +147,8 @@ renderInstrSim instrWord mIrqVec ir st0 =
     apply st _                  = st  -- reads already resolved
 
     regRefKey :: RegRef w -> String
-    regRefKey (RegScalar n)             = n
-    regRefKey (RegFile rf (FieldRef k)) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr 32))
+    regRefKey (RegScalar n)               = n
+    regRefKey (RegFile rf (FieldRef k) o) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr 32) + fromIntegral o)
 
     putReg n v st = st { ssCPU = (ssCPU st) { scRegs = Map.insert n v (scRegs (ssCPU st)) } }
     putFlag (CPUFlag rn bp) v st =

@@ -75,7 +75,7 @@ import Isacle.Periph.GPIO  (gpioDef, GPIO)
 import Isacle.Periph.UART  (uartDefWithFSM, UART)
 import Isacle.Periph.Timer (timerDefWithFSM, Timer)
 import Isacle.ISA.CPUDef (CPUDef)
-import Isacle.ISA.Def    (ISADef)
+import Isacle.ISA.Def    (ISADef, isaInterruptBody)
 import Isacle.ISA.Build (ISABuild)
 import Isacle.ISA.Backend.SynthCPU (synthHarvardCPU', CpuMemIface(..))
 import Isacle.ISA.Backend.SynthVnCPU (synthVonNeumannCPU', VnMemIface(..))
@@ -454,10 +454,17 @@ createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
     cmemRdDataParW <- lift freshWire
     stallParW      <- lift freshWire
 
+    -- The CPU exposes irq_pending/irq_vector input ports iff the ISA declares an
+    -- interrupt body.  With no interrupt controller wired up, tie them off (0).
+    let hasIrq = maybe False (const True) (isaInterruptBody isaDef)
+    irqPendParW <- lift freshWire
+    irqVecParW  <- lift freshWire
+    let irqParWs = if hasIrq then [irqPendParW, irqVecParW] else []
+
     -- Synthesise the CPU inside a named sub-entity so it appears as a
     -- distinct entity in the VHDL hierarchy and is independently testable.
     ((), cpuPorts) <- lift $ inBlock instName instName
-        [instrWordParW, dmemRdDataParW, cmemRdDataParW, stallParW] $ do
+        ([instrWordParW, dmemRdDataParW, cmemRdDataParW, stallParW] ++ irqParWs) $ do
             -- Input ports (order must match the parent wire list above).
             instrWordW  <- freshWire
             dmemRdDataW <- freshWire
@@ -520,6 +527,14 @@ createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
         alias dmemRdDataParW (bhRdData dataBus)
         -- Bus stall → CPU stall input (held while a data txn is outstanding)
         alias stallParW (bhStall dataBus)
+        -- Tie off the interrupt inputs (no interrupt controller in this SoC).
+        if hasIrq
+            then do
+                z1 <- do { w <- freshWire; emit $ NComb w (PLit 0 1) []; pure w }
+                zv <- do { w <- freshWire; emit $ NComb w (PLit 0 codeAddrBits) []; pure w }
+                alias irqPendParW z1
+                alias irqVecParW  zv
+            else pure ()
 
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
 

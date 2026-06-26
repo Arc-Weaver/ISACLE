@@ -22,6 +22,7 @@ module Isacle.ISA.Build
     ) where
 
 import Prelude hiding (Word)
+import Data.Char (isDigit)
 import GHC.TypeLits (KnownNat)
 import Control.Monad.Reader
 import Control.Monad.State.Strict
@@ -75,13 +76,24 @@ freshRead = ISABuild $ do
     modify $ \st -> st { bsReadCtr = n + 1 }
     pure (ReadTok n)
 
--- | Parse a 'CPURegister' name into a 'RegRef': @"rf:field"@ is a register-file
--- slot, anything else a scalar register.
+-- | Parse a 'CPURegister' name into a 'RegRef'.
+--
+--   * @"rf:field"@        — register-file slot indexed by an instruction field.
+--   * @"rf:field@off"@    — same, plus a constant @off@ added to the index
+--                           (sub-range encodings, e.g. AVR R16–R31 → @+16@).
+--   * @"rf:N"@ (N digits) — a /constant/ register-file index (e.g. @"GPR:0"@ for
+--                           R0).  Represented as an empty field key with the
+--                           index carried in the offset slot, so no field is
+--                           extracted and the index lowers to a literal.
+--   * anything else       — a scalar register.
 toRegRef :: String -> RegRef w
-toRegRef key
-    | (':' `elem` key) =
-        let (rf, rest) = break (== ':') key in RegFile rf (FieldRef (drop 1 rest))
-    | otherwise = RegScalar key
+toRegRef key = case break (== ':') key of
+    (rf, ':':rest) -> case break (== '@') rest of
+        (fk, '@':offStr)                    -> RegFile rf (FieldRef fk) (read offStr)
+        (fk, _) | not (null fk), all isDigit fk
+                                            -> RegFile rf (FieldRef "") (read fk)
+                | otherwise                 -> RegFile rf (FieldRef fk) 0
+    _ -> RegScalar key
 
 -- ---------------------------------------------------------------------------
 -- The one MonadALU instance
@@ -100,6 +112,11 @@ instance (KnownNat wordW, KnownNat addrW)
         alu <- ask
         let CPURegFile rfname = sel alu
         pure (CPURegister (rfname ++ ":" ++ fieldKey field))
+
+    registerWithOffset sel field offset = ISABuild $ do
+        alu <- ask
+        let CPURegFile rfname = sel alu
+        pure (CPURegister (rfname ++ ":" ++ fieldKey field ++ "@" ++ show offset))
 
     immediate field = pure (IField (FieldRef (fieldKey field)))
 
