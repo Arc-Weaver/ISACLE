@@ -115,11 +115,20 @@ data MemWriteReq = MemWriteReq
     , mwDataWire  :: WireId
     } deriving (Show)
 
--- | Data-memory read request.  'mrAddrWire' lets the CPU pass build an
--- address mux; 'scReadMem' already returned the shared data-in wire.
+-- | Data-memory read request.  'mrAddrWire' lets the CPU pass build the
+-- per-cycle read-address mux.
+--
+-- Each 'readMem' call now yields a /distinct/ result wire ('mrResultWire')
+-- rather than reusing the shared data-in bus, so an instruction that reads the
+-- bus more than once (e.g. @retFromStack@: lo then hi) can distinguish the two
+-- values.  The CPU sequencer drives 'mrResultWire' from 'mrBusWire' — directly
+-- for a single read, or through a per-cycle select plus a holding latch when a
+-- read's value is consumed in a later cycle than the one it completes in.
 data MemReadReq = MemReadReq
-    { mrMatchWire :: WireId
-    , mrAddrWire  :: WireId
+    { mrMatchWire  :: WireId
+    , mrAddrWire   :: WireId
+    , mrBusWire    :: WireId   -- ^ alias-resolved read value for this address
+    , mrResultWire :: WireId   -- ^ fresh wire the body consumed; CPU drives it
     } deriving (Show)
 
 -- | Flag write request: set one bit of a status register when the instruction fires.
@@ -144,10 +153,11 @@ data SynthSt = SynthSt
     , ssMemWrites    :: [MemWriteReq]
     , ssMemReads     :: [MemReadReq]
     , ssFlagWrites   :: [FlagWriteReq]
+    , ssMnemonic     :: Maybe String        -- instruction mnemonic for signal naming
     }
 
 initSynthSt :: SynthSt
-initSynthSt = SynthSt Nothing Nothing Map.empty [] [] [] [] [] []
+initSynthSt = SynthSt Nothing Nothing Map.empty [] [] [] [] [] [] Nothing
 
 -- ---------------------------------------------------------------------------
 -- Result
@@ -188,11 +198,17 @@ getFieldWire k = do
     case Map.lookup k (ssFieldWires st) of
         Just w  -> return w
         Nothing -> do
-            w <- lift $ lift $ case ssEncoding st of
-                Nothing  -> freshWire
-                Just enc -> case Map.lookup k (encFields enc) of
+            let prefix = case ssMnemonic st of
+                    Just nm -> nm ++ "_" ++ k
+                    Nothing -> k
+            w <- lift $ lift $ do
+                wire <- case ssEncoding st of
                     Nothing  -> freshWire
-                    Just bps -> extractFieldNetM bps (scInstrWire ctx)
+                    Just enc -> case Map.lookup k (encFields enc) of
+                        Nothing  -> freshWire
+                        Just bps -> extractFieldNetM bps (scInstrWire ctx)
+                N.hintWire wire prefix
+                return wire
             modify $ \s -> s { ssFieldWires = Map.insert k w (ssFieldWires s) }
             return w
 
@@ -267,14 +283,20 @@ instance KnownNat wordW => MonadALU (SynthM alu wordW addrW codeWordW codeAddrW)
     cpu sel     = SynthM (asks (sel . scAlu))
     cpuFlag sel = SynthM (asks (sel . scAlu))
 
-    mnemonic _ = return ()
-    doc      _ = return ()
+    mnemonic nm = SynthM $ modify $ \st -> st { ssMnemonic = Just nm }
+    doc      _  = return ()
 
     encoding s = SynthM $ do
-        ctx <- ask
+        ctx  <- ask
+        mnem <- gets ssMnemonic
         let enc = parseEncoding s
         modify $ \st -> st { ssEncoding = Just enc }
-        matchW <- lift $ lift $ buildMatchWire enc (scInstrWire ctx)
+        matchW <- lift $ lift $ do
+            w <- buildMatchWire enc (scInstrWire ctx)
+            case mnem of
+                Just nm -> N.hintWire w ("match_" ++ nm)
+                Nothing -> return ()
+            return w
         modify $ \st -> st { ssMatchWire = Just matchW }
 
     register sel field = SynthM $ do
@@ -345,15 +367,20 @@ instance KnownNat wordW => MonadALU (SynthM alu wordW addrW codeWordW codeAddrW)
                         : ssScalarWrites s }
 
     readMem (Unsigned addrWire) = SynthM $ do
-        ctx <- ask
-        st  <- get
+        ctx  <- ask
+        busW <- lift $ lift $ scReadMem ctx (fromIntegral addrWire)
+        st   <- get
         case ssMatchWire st of
-            Just matchW ->
+            Just matchW -> do
+                -- Fresh result wire per read, so multiple reads in one body are
+                -- distinguishable; the CPU sequencer drives it from busW.
+                resW <- lift $ lift freshWire
                 modify $ \s -> s { ssMemReads =
-                    MemReadReq matchW (fromIntegral addrWire) : ssMemReads s }
-            Nothing -> return ()
-        dataWire <- lift $ lift $ scReadMem ctx (fromIntegral addrWire)
-        return (Unsigned (fromIntegral dataWire))
+                    MemReadReq matchW (fromIntegral addrWire) busW resW
+                    : ssMemReads s }
+                return (Unsigned (fromIntegral resW))
+            -- No active match wire (dummy/eval context): just hand back the bus.
+            Nothing -> return (Unsigned (fromIntegral busW))
 
     writeMem (Unsigned addrWire) (Unsigned datWire) = SynthM $ do
         st <- get

@@ -16,6 +16,8 @@ module Hdl.Net
     , SomeBits(..)
       -- * Wire name hints
     , hintWire
+      -- * Section comments
+    , comment
       -- * Memoised primitive emission
     , lookupOrEmit
       -- * SExpr identity memoization
@@ -177,6 +179,20 @@ data NetNode
         { nHintWire :: WireId
         , nHintName :: String
         }
+    -- | A free-standing source comment emitted verbatim into the architecture
+    -- body, used to delineate generated sections (per-instruction decode, the
+    -- execution sequencer, write arbiters …) so the VHDL reads as structured
+    -- blocks rather than an undifferentiated wall of assignments.
+    | NComment
+        { nCommentText :: String }
+    -- | Group a set of register-output wires into a named VHDL record.
+    -- The emitter declares @<nGroupName>_t@ as a record type and
+    -- @<nGroupName>@ as the corresponding signal, mapping each field wire
+    -- to @<nGroupName>.<fieldName>@ in all generated expressions.
+    | NGroup
+        { nGroupName   :: String
+        , nGroupFields :: [(String, WireId)]  -- (fieldName, wireId) ordered
+        }
     deriving (Show, Eq)
 
 -- ---------------------------------------------------------------------------
@@ -262,6 +278,12 @@ execDesign name = snd . runDesign name
 -- The emitter uses hints to prefer human-readable signal names over wN.
 hintWire :: WireId -> String -> NetM ()
 hintWire wid n = emit (NHint wid n)
+
+-- | Emit a free-standing source comment into the architecture body at the
+-- current point in emission order.  Purely cosmetic — it carries no wires and
+-- is ignored by every analysis pass.
+comment :: String -> NetM ()
+comment = emit . NComment
 
 freshWire :: NetM WireId
 freshWire = NetM $ do

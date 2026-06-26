@@ -12,6 +12,7 @@ build-type:          Simple
 common common-options
   default-extensions:
     BangPatterns
+    BinaryLiterals
     ConstraintKinds
     DataKinds
     DefaultSignatures
@@ -39,10 +40,13 @@ common common-options
     StandaloneDeriving
     TupleSections
     AllowAmbiguousTypes
+    ExistentialQuantification
     TypeApplications
     TypeFamilies
     TypeOperators
     ViewPatterns
+    TemplateHaskell
+    QuasiQuotes
     NoImplicitPrelude
   ghc-options:
     -Wall -Wcompat
@@ -51,107 +55,165 @@ common common-options
     containers >= 0.6,
     transformers >= 0.5
 
+-- ---------------------------------------------------------------------------
+-- isacle-hdl: Clash-free NetNode IR and bit-vector types
+-- ---------------------------------------------------------------------------
+
+library isacle-hdl
+  import: common-options
+  visibility: public
+  hs-source-dirs: src-hdl
+  exposed-modules:
+    Hdl.Bits
+    Hdl.Class
+    Hdl.Emit.Vhdl
+    Hdl.Entity
+    Hdl.Net
+    Hdl.Prim
+    Hdl.Types
+  build-depends:
+    base >= 4.12 && < 4.22,
+    containers >= 0.6,
+    filepath >= 1.4,
+    mtl >= 2.2
+  default-language: Haskell2010
+
+-- ---------------------------------------------------------------------------
+-- isacle: ISA framework, peripheral DSL, system builder
+-- ---------------------------------------------------------------------------
+
 library
   import: common-options
   hs-source-dirs: src
-  build-depends:
-    isacle-hdl,
-    mtl >= 2.2,
-    filepath >= 1.4,
-    template-haskell >= 2.16,
-    bytestring >= 0.10
   exposed-modules:
     Isacle
     Isacle.ALU
     Isacle.Bus
+    Isacle.CPU.Dummy
     Isacle.Decode
     Isacle.Harvard
-    Isacle.Harvard.ISA
     Isacle.Harvard.CPU
+    Isacle.Harvard.ISA
     Isacle.Harvard.Pipeline
+    Isacle.ISA
+    Isacle.ISA.ALU
+    Isacle.ISA.Backend.Doc
+    Isacle.ISA.Backend.Lower
+    Isacle.ISA.Backend.Sim
+    Isacle.ISA.Backend.Synth
+    Isacle.ISA.Backend.SynthCPU
+    Isacle.ISA.Backend.SynthVnCPU
+    Isacle.ISA.CPUDef
+    Isacle.ISA.Def
+    Isacle.ISA.Encoding
+    Isacle.ISA.IR
+    Isacle.ISA.Build
+    Isacle.ISA.Example.AVR
+    Isacle.ISA.Example.Tiny
+    Isacle.ISA.Example.TinyVN
+    Isacle.ISA.Types
+    Isacle.ISA.VonNeumann
+    Isacle.Cache.Config
+    Isacle.Cache.L1
     Isacle.Memory
-    Isacle.TH
-    Isacle.CPU.Dummy
     Isacle.Periph.DMA
     Isacle.Periph.GPIO
     Isacle.Periph.Interrupt
     Isacle.Periph.Timer
     Isacle.Periph.UART
     Isacle.System
-    Isacle.System.Spec
-    Isacle.System.Periph
-    Isacle.System.BusDef
     Isacle.System.BusArch
-    Isacle.System.HdlCircuit
-    Isacle.System.SystemDSL
+    Isacle.System.BusDef
+    Isacle.System.BusHandle
     Isacle.System.Generate
-    Isacle.ISA
-    Isacle.ISA.Types
-    Isacle.ISA.CPUDef
-    Isacle.ISA.ALU
-    Isacle.ISA.Def
-    Isacle.ISA.Example.AVR
-    Isacle.ISA.Example.Tiny
-    Isacle.ISA.Encoding
-    Isacle.ISA.VonNeumann
-    Isacle.ISA.Backend.Doc
-    Isacle.ISA.Backend.Sim
-    Isacle.ISA.Backend.Synth
-    Isacle.ISA.Backend.SynthCPU
-  default-language: Haskell2010
-
-library isacle-hdl
-  visibility: public
-  default-language: Haskell2010
-  hs-source-dirs: src-hdl
-  default-extensions:
-    AllowAmbiguousTypes
-    DataKinds
-    DefaultSignatures
-    DeriveAnyClass
-    DeriveGeneric
-    FlexibleContexts
-    FlexibleInstances
-    FunctionalDependencies
-    GADTs
-    GeneralizedNewtypeDeriving
-    KindSignatures
-    LambdaCase
-    MultiParamTypeClasses
-    PolyKinds
-    RankNTypes
-    RecordWildCards
-    RecursiveDo
-    ScopedTypeVariables
-    StandaloneDeriving
-    TupleSections
-    TypeApplications
-    TypeFamilies
-    TypeOperators
-    UndecidableInstances
-    TemplateHaskell
-  ghc-options: -Wall -Wcompat
-  exposed-modules:
-    Hdl.Net
-    Hdl.Types
-    Hdl.Prim
-    Hdl.Bits
-    Hdl.Class
-    Hdl.Entity
-    Hdl.Emit.Vhdl
+    Isacle.System.HdlCircuit
+    Isacle.System.Periph
+    Isacle.System.Spec
+    Isacle.System.SystemDSL
+    Isacle.TH
   build-depends:
+    isacle:isacle-hdl,
     base >= 4.12 && < 4.22,
     containers >= 0.6,
-    filepath >= 1.4,
-    text >= 1.2,
     mtl >= 2.2,
-    transformers >= 0.5,
-    template-haskell >= 2.16
+    filepath >= 1.4,
+    template-haskell >= 2.16,
+    bytestring,
+    transformers >= 0.5
+  default-language: Haskell2010
 
-executable unittests
+-- ---------------------------------------------------------------------------
+-- Test executables
+-- ---------------------------------------------------------------------------
+
+executable test-tiny-vn
   import: common-options
   default-language: Haskell2010
   hs-source-dirs: tests
+  main-is: TestTinyVN.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle:isacle-hdl
+
+executable test-tiny-cpu
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestTinyCPU.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    directory,
+    isacle,
+    isacle:isacle-hdl
+
+executable test-tiny-run
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestTinyRun.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle:isacle-hdl
+
+executable test-ir-lower
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestIRLower.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle:isacle-hdl
+
+executable test-tiny-sys
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestTinySys.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    directory,
+    isacle,
+    isacle:isacle-hdl
+
+executable test-hdl-system
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  main-is: TestHdlSystem.hs
+  build-depends:
+    base >= 4.12 && < 4.22,
+    isacle,
+    isacle:isacle-hdl
+
+test-suite test-library
+  import: common-options
+  default-language: Haskell2010
+  hs-source-dirs: tests
+  type: exitcode-stdio-1.0
+  ghc-options: -threaded
   main-is: unittests.hs
   other-modules:
     Tests.Isacle.Harvard.ISA
@@ -163,121 +225,10 @@ executable unittests
     Tests.Isacle.System.Bus
   build-depends:
     base >= 4.12 && < 4.22,
-    isacle,
-    isacle-hdl
-
-executable test-dsl
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestDSL.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    isacle,
-    isacle-hdl
-
-executable test-hdl-system
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestHdlSystem.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    isacle,
-    isacle-hdl
-
-executable test-tiny-cpu
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestTinyCPU.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    directory >= 1.3,
-    isacle,
-    isacle-hdl
-
-executable test-tiny-run
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestTinyRun.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    containers,
-    isacle,
-    isacle-hdl
-
-executable test-tiny-sys
-  import: common-options
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestTinySys.hs
-  build-depends:
-    base >= 4.12 && < 4.22,
-    containers,
-    directory >= 1.3,
-    isacle,
-    isacle-hdl
-
-executable test-hdl
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestHdl.hs
-  default-extensions:
-    DataKinds
-    FlexibleContexts
-    FlexibleInstances
-    KindSignatures
-    RecursiveDo
-    ScopedTypeVariables
-    TypeApplications
-    TypeFamilies
-  ghc-options: -Wall -Wcompat
-  build-depends:
-    base >= 4.12 && < 4.22,
     containers >= 0.6,
-    isacle-hdl
-
-executable test-hdl-extended
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: TestHdlExtended.hs
-  default-extensions:
-    DataKinds
-    FlexibleContexts
-    FlexibleInstances
-    KindSignatures
-    NumericUnderscores
-    RecursiveDo
-    ScopedTypeVariables
-    TypeApplications
-    TypeFamilies
-  ghc-options: -Wall -Wcompat
-  build-depends:
-    base >= 4.12 && < 4.22,
-    containers >= 0.6,
-    isacle-hdl
-
-executable hdl-examples
-  default-language: Haskell2010
-  hs-source-dirs: tests
-  main-is: HdlExamples.hs
-  default-extensions:
-    DataKinds
-    DeriveAnyClass
-    DeriveGeneric
-    FlexibleContexts
-    FlexibleInstances
-    KindSignatures
-    NumericUnderscores
-    RecordWildCards
-    RecursiveDo
-    ScopedTypeVariables
-    TypeApplications
-    TypeFamilies
-  ghc-options: -Wall -Wcompat
-  build-depends:
-    base >= 4.12 && < 4.22,
-    containers >= 0.6,
-    isacle-hdl
+    isacle,
+    isacle:isacle-hdl,
+    hedgehog,
+    tasty >= 1.2 && < 1.6,
+    tasty-hedgehog,
+    tasty-th

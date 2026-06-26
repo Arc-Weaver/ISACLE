@@ -6,6 +6,7 @@
 module Isacle.System.HdlCircuit
     ( hdlOps
     , hdlBusIface
+    , busPortIface
       -- * Named physical-output bundles
     , GpioPhys(..)
     , UartPhys(..)
@@ -158,6 +159,34 @@ hdlBusIface wrAddr wrData wrEn rdAddr base = BusIface
     , biWrEn      = wrEn
     , biRelWrAddr = wrAddr - fromIntegral base
     , biRelRdAddr = rdAddr - fromIntegral base
+    }
+
+-- | Build a 'BusIface' from a protocol-agnostic single-channel slave port
+-- (@req@, @we@, @addr@, @wdata@) — the peripheral-facing side of a
+-- 'Isacle.System.BusArch.BusPort'.
+--
+-- Unlike 'hdlBusIface' (which hardcodes SimpleBus's separate read/write
+-- address+enable wires into the peripheral entity), this presents the unified
+-- master/slave transaction shape, so the peripheral entity carries no bus
+-- protocol — the protocol lives only in the bus's 'synthBus'.  A write targets
+-- offset @off@ when @req && we && addr == base+off@; reads are decoded
+-- combinationally by address (the interconnect gates the response by chip
+-- select).
+busPortIface :: forall dom dat.
+                (KnownDom dom, HdlType dat, Num dat)
+             => Sig dom Bool            -- ^ req   (transaction valid)
+             -> Sig dom Bool            -- ^ we    (1 = write)
+             -> Sig dom (Unsigned 32)   -- ^ addr  (bus-absolute)
+             -> Sig dom dat             -- ^ wdata (write data)
+             -> Word32                  -- ^ peripheral base address
+             -> BusIface (Sig dom) dat
+busPortIface req we addr wdata base = BusIface
+    { biWrData    = wdata
+    , biWrEqAddr  = \off -> req .&&. we .&&. (addr .==. fromInteger (fromIntegral base + fromIntegral off))
+    , biRdEqAddr  = \off -> addr .==. fromInteger (fromIntegral base + fromIntegral off)
+    , biWrEn      = req .&&. we
+    , biRelWrAddr = addr - fromIntegral base
+    , biRelRdAddr = addr - fromIntegral base
     }
 
 -- ---------------------------------------------------------------------------

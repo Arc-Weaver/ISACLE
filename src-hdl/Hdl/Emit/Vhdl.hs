@@ -7,6 +7,7 @@ module Hdl.Emit.Vhdl
     ) where
 
 import Prelude
+import Data.Char (toLower)
 import Data.List (intercalate, nub, partition, sort)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
@@ -40,13 +41,17 @@ vhdlReserved = Set.fromList
 
 data VType
     = VStdLogic
-    | VUnsigned  Int        -- unsigned(n-1 downto 0)
-    | VArrayOf   Int VType  -- array(0 to n-1) of elem
+    | VUnsigned  Int               -- unsigned(n-1 downto 0)
+    | VArrayOf   Int VType         -- array(0 to n-1) of elem
+    | VRecord    [(String, VType)] -- record ... end record
 
 ppType :: VType -> String
-ppType VStdLogic       = "std_logic"
-ppType (VUnsigned n)   = "unsigned(" ++ show (n-1) ++ " downto 0)"
-ppType (VArrayOf n t)  = "array(0 to " ++ show (n-1) ++ ") of " ++ ppType t
+ppType VStdLogic         = "std_logic"
+ppType (VUnsigned n)     = "unsigned(" ++ show (n-1) ++ " downto 0)"
+ppType (VArrayOf n t)    = "array(0 to " ++ show (n-1) ++ ") of " ++ ppType t
+ppType (VRecord fields)  = "record\n"
+    ++ concatMap (\(n, t) -> "    " ++ n ++ " : " ++ ppType t ++ ";\n") fields
+    ++ "  end record"
 
 -- | Convert a wire bit-width to the appropriate scalar VHDL type.
 wireVType :: Int -> VType
@@ -75,12 +80,20 @@ ppDecl (VDSig   n t (Just v))= "  signal " ++ n ++ " : " ++ t ++ " := " ++ v ++ 
 -- Memory naming — type alias and signal/constant names per NMem/NRom node
 -- ---------------------------------------------------------------------------
 
--- NMem: signal ram_<wid> : ram_<wid>_t := (...);
-ramTypeName :: WireId -> String
-ramTypeName wid = "ram_" ++ show wid ++ "_t"
+-- | Derive a human-readable base name for an NMem array from the hint on its
+-- output wire (e.g. hint "GPR_rd0" → base "gpr"), falling back to "ram_<wid>".
+-- The hint convention set by SynthCPU is "<RfName>_rd<slot>"; strip the suffix.
+memBaseName :: WireId -> NameMap -> String
+memBaseName wid nm =
+    case Map.lookup wid nm of
+        Just h  -> map toLower (takeWhile (/= '_') h)
+        Nothing -> "ram_" ++ show wid
 
-ramSigName :: WireId -> String
-ramSigName wid = "ram_" ++ show wid
+memTypeName :: WireId -> NameMap -> String
+memTypeName wid nm = memBaseName wid nm ++ "_t"
+
+memSigName :: WireId -> NameMap -> String
+memSigName wid nm = memBaseName wid nm
 
 -- NRom: constant rom_<wid> : rom_<wid>_t := (...);
 romTypeName :: WireId -> String
@@ -237,6 +250,8 @@ cse nodes = map (rewrite finalSubst) kept
                      (sub subst wrD) (sub subst wrEn) sz dw ini dom
         NRom out rdA sz dw ini ->
             NRom out (sub subst rdA) sz dw ini
+        NGroup name fields ->
+            NGroup name [(fn, sub subst w) | (fn, w) <- fields]
         _ -> n
 
 -- ---------------------------------------------------------------------------
@@ -246,17 +261,25 @@ cse nodes = map (rewrite finalSubst) kept
 type NameMap = Map.Map WireId String
 
 buildNameMap :: [NetNode] -> NameMap
-buildNameMap nodes = Map.unions [inputMap, hintMap, litMap, regMap, internalMap]
+buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, internalMap]
   where
     inputMap = Map.fromList [(nOut n, nPortName n) | n@NInput{} <- nodes]
+
+    -- Group fields take precedence: wire → "groupName.fieldName"
+    groupMap = Map.fromList
+        [ (wid, grpName ++ "." ++ fldName)
+        | NGroup grpName fields <- nodes
+        , (fldName, wid) <- fields ]
 
     portNames = Set.fromList $
         [ nPortName n | n@NInput{}  <- nodes ] ++
         [ nPortName n | n@NOutput{} <- nodes ]
+    groupedWires = Map.keysSet groupMap
     hintMap = Map.fromList
         [ (nHintWire n, safeHint (nHintWire n) (nHintName n))
         | n@NHint{} <- nodes
-        , not (isLitWire (nHintWire n) nodes) ]
+        , not (isLitWire (nHintWire n) nodes)
+        , not (Set.member (nHintWire n) groupedWires) ]
     safeHint wid h
         | Set.member h portNames    = h ++ if isReg wid then "_r" else "_s"
         | Set.member h vhdlReserved = h ++ "_s"
@@ -274,7 +297,7 @@ buildNameMap nodes = Map.unions [inputMap, hintMap, litMap, regMap, internalMap]
         , Just pname <- [Map.lookup (nOut n) outputDrivers]
         ]
 
-    namedWids = Map.keysSet (Map.unions [inputMap, hintMap, litMap, regMap])
+    namedWids = Map.keysSet (Map.unions [inputMap, groupMap, hintMap, litMap, regMap])
     internalMap = Map.fromList
         [ (wid, "w" ++ show wid)
         | wid <- nub $ concatMap drivenWires nodes
@@ -347,12 +370,19 @@ architectureDecl design name nm nodes = unlines $
 -- | All architecture-region declarations: types, constants, signals.
 archDecls :: NameMap -> [NetNode] -> [VDecl]
 archDecls nm nodes =
-    -- Named array types for inline RAM and ROM.
-    [ VDType (ramTypeName (nOut n)) (VArrayOf (nMemSize n) (wireVType (nMemDatW n)))
-    | n@NMem{} <- nodes ]
+    -- NGroup: record type then record signal (one per group).
+    concatMap groupDecls groups
     ++
-    [ VDType (romTypeName (nOut n)) (VArrayOf (nRomSize n) (wireVType (nRomDatW n)))
-    | n@NRom{} <- nodes ]
+    -- Named array types for inline RAM and ROM (deduplicated by base name).
+    Map.elems (Map.fromList
+        [ (memTypeName (nOut n) nm,
+           VDType (memTypeName (nOut n) nm) (VArrayOf (nMemSize n) (wireVType (nMemDatW n))))
+        | n@NMem{} <- nodes ])
+    ++
+    Map.elems (Map.fromList
+        [ (romTypeName (nOut n),
+           VDType (romTypeName (nOut n)) (VArrayOf (nRomSize n) (wireVType (nRomDatW n))))
+        | n@NRom{} <- nodes ])
     ++
     -- PLit constants (deduplicated by value×width).
     [ VDConst (litConstName v bw) (ppType (wireVType bw)) (ppLit (SomeBits v bw))
@@ -363,22 +393,46 @@ archDecls nm nodes =
               (initAggregate (nRomSize n) (nRomDatW n) (nRomInit n))
     | n@NRom{} <- nodes ]
     ++
-    -- RAM state as signals (initialised).
-    [ VDSig (ramSigName (nOut n)) (ramTypeName (nOut n))
-            (Just (initAggregate (nMemSize n) (nMemDatW n) (nMemInit n)))
-    | n@NMem{} <- nodes ]
+    -- RAM state as signals (deduplicated by base name so multi-port RFs share one array).
+    Map.elems (Map.fromList
+        [ (memSigName (nOut n) nm,
+           VDSig (memSigName (nOut n) nm) (memTypeName (nOut n) nm)
+                 (Just (initAggregate (nMemSize n) (nMemDatW n) (nMemInit n))))
+        | n@NMem{} <- nodes ])
     ++
     -- All other driven wires (registers, combinational outputs).
+    -- Skip wires that are declared as part of an NGroup record.
     [ VDSig (lookupWire nm wid) (ppType (wireVType (inferWidth wid nodes)))
             (fmap ppLit (regInit wid nodes))
     | wid <- sort (Map.keys nm)
     , not (isInputWire wid nodes)
     , not (isLitWire wid nodes)
+    , not (Set.member wid groupedWires)
     , hasDriver wid nodes
     ]
   where
     litMap :: Map.Map (Integer, Int) ()
     litMap = Map.fromList [ ((v, bw), ()) | NComb _ (PLit v bw) [] <- nodes ]
+
+    groups = [ n | n@NGroup{} <- nodes ]
+
+    groupedWires :: Set.Set WireId
+    groupedWires = Set.fromList
+        [ w | NGroup _ fields <- nodes, (_, w) <- fields ]
+
+    groupDecls (NGroup grpName fields) =
+        let recType = VRecord
+                [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ]
+            initStr = "("
+                ++ intercalate ", "
+                    [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
+                                                   (regInit w nodes))
+                    | (fn, w) <- fields ]
+                ++ ")"
+        in [ VDType (grpName ++ "_t") recType
+           , VDSig  grpName (grpName ++ "_t") (Just initStr)
+           ]
+    groupDecls _ = []
 
     isInputWire wid ns = wid `elem` [ nOut n | n@NInput{} <- ns ]
     hasDriver w        = any (drivesWire w)
@@ -401,6 +455,8 @@ regInit wid nodes = case [ nInit n | n@NReg{} <- nodes, nOut n == wid ] of
 toStmt :: Design -> NameMap -> [NetNode] -> NetNode -> [String]
 toStmt _      _  _  NInput{}                = []
 toStmt _      _  _  NHint{}                 = []
+toStmt _      _  _  NGroup{}               = []
+toStmt _      _  _  (NComment txt)          = ["", "  -- " ++ txt]
 toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses
 toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
     -- Truncate addr to the minimum bits that can index sz entries before to_integer
@@ -409,7 +465,7 @@ toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
         nbits = ceiling (logBase 2 (fromIntegral (max sz 2) :: Double)) :: Int
         raddr = "resize(" ++ addr ++ ", " ++ show nbits ++ ")"
     in [ "  " ++ lookupWire nm out ++ " <= "
-             ++ ramSigName out ++ "(to_integer(" ++ raddr ++ "))"
+             ++ memSigName out nm ++ "(to_integer(" ++ raddr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
 toStmt _      nm _  (NRom out rdA _ _ _) =
     let addr = lookupWire nm rdA
@@ -496,7 +552,7 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
         ]
     clockedBody (NMem out _ wrA wrD wrEn _ _ _ _) =
         [ "      if " ++ lookupWire nm wrEn ++ " = '1' then"
-        , "        " ++ ramSigName out ++ "(to_integer("
+        , "        " ++ memSigName out nm ++ "(to_integer("
                      ++ lookupWire nm wrA ++ ")) <= " ++ lookupWire nm wrD ++ ";"
         , "      end if;"
         ]
