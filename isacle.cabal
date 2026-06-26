@@ -64,6 +64,7 @@ library isacle-hdl
   visibility: public
   hs-source-dirs: src-hdl
   exposed-modules:
+    Hdl.Arith
     Hdl.Bits
     Hdl.Class
     Hdl.Emit.Vhdl

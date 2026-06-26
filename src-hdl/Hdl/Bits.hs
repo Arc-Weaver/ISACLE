@@ -50,6 +50,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 
 import Hdl.Prim (Unsigned(..), Bit(..))
+import Hdl.Types (HdlType(..))
 
 -- ---------------------------------------------------------------------------
 -- BitVector
@@ -96,6 +97,13 @@ instance KnownNat n => Num (Signed n) where
     abs (Signed a)      = wrapS @n (abs a)
     signum (Signed a)   = Signed (signum a)
     fromInteger         = wrapS @n
+
+-- | 'Signed n' as an HDL signal type: its width is @n@ and it erases to its
+-- @n@-bit two's-complement bit pattern (mirrors the 'Unsigned' instance).
+instance KnownNat n => HdlType (Signed n) where
+    type Width (Signed n) = n
+    toBits (Signed v) = v `mod` (2 ^ natVal (Proxy @n))
+    fromBits          = wrapS @n
 
 -- ---------------------------------------------------------------------------
 -- Vec n a

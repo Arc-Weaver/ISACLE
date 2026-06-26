@@ -5,6 +5,8 @@ module Hdl.Types
     ( -- * Per-signal domain tags
       Sig(..)
     , materialize
+      -- * Low-level builder (internal: typed ops are built on this)
+    , primSig2
       -- * Combinational operations
     , (.==.)
     , (.<.)
