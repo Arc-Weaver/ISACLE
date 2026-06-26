@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds             #-}
-{-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
@@ -16,6 +15,11 @@
 -- to @MaxN wa wb + 1@ (the carry) and @mul@ to @wa + wb@.  The operand types also
 -- fix the signedness, so each instance lowers to the right primitive.
 --
+-- Implementation note: each op resizes both operands /up/ to the result width
+-- and then uses the modular 'Num' op — which can't overflow there, because the
+-- result width is large enough by construction.  So the exact ops are built from
+-- the safe public surface ('sigResize' + 'Num'); no loose @primSig2@ needed.
+--
 -- There is deliberately no mixed-signedness instance, so adding an unsigned to a
 -- signed signal is a type error — and because the primitives only ever grow,
 -- there is no hidden downsize.  To land a growing chain at a target width,
@@ -23,16 +27,17 @@
 module Hdl.Arith
     ( HdlArith(..)
     , MaxN
+    , sConcat
     ) where
 
+import Prelude
 import Data.Kind (Type)
 import Data.Type.Bool (If)
 import GHC.TypeLits (Nat, KnownNat, type (+), type (<=?))
 
-import Hdl.Net   (PrimOp(..))
-import Hdl.Types (Sig, primSig2, sigResize, HdlType)
+import Hdl.Types (Sig, sigResize, sigConcat, HdlType(..))
 import Hdl.Prim  (Unsigned)
-import Hdl.Bits  (Signed)
+import Hdl.Bits  (Signed, BitVector)
 
 -- | Type-level maximum of two naturals.
 type family MaxN (m :: Nat) (n :: Nat) :: Nat where
@@ -51,16 +56,13 @@ class (HdlType a, HdlType b) => HdlArith a b where
     -- | Exact multiplication: @wa + wb@ bits.
     mul :: Sig dom a -> Sig dom b -> Sig dom (MulR a b)
 
--- Unsigned: grow by resizing (zero-extend) both operands to the result width,
--- then emit the unsigned primitive.  (Signed awaits the emitter's per-wire
--- signed/unsigned tag, after which its instance slots in here unchanged in shape.)
 instance (KnownNat m, KnownNat n, KnownNat (MaxN m n + 1), KnownNat (m + n))
       => HdlArith (Unsigned m) (Unsigned n) where
     type AddR (Unsigned m) (Unsigned n) = Unsigned (MaxN m n + 1)
     type MulR (Unsigned m) (Unsigned n) = Unsigned (m + n)
-    add a b = primSig2 PAdd (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
-    sub a b = primSig2 PSub (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
-    mul a b = primSig2 PMul (sigResize @(m + n)         a) (sigResize @(m + n)         b)
+    add a b = sigResize @(MaxN m n + 1) a + sigResize @(MaxN m n + 1) b
+    sub a b = sigResize @(MaxN m n + 1) a - sigResize @(MaxN m n + 1) b
+    mul a b = sigResize @(m + n)         a * sigResize @(m + n)         b
 
 -- Signed: structurally identical to the unsigned instance — the signed
 -- behaviour (sign-extending resize, signed +/*/comparison) comes entirely from
@@ -70,6 +72,13 @@ instance (KnownNat m, KnownNat n, KnownNat (MaxN m n + 1), KnownNat (m + n))
       => HdlArith (Signed m) (Signed n) where
     type AddR (Signed m) (Signed n) = Signed (MaxN m n + 1)
     type MulR (Signed m) (Signed n) = Signed (m + n)
-    add a b = primSig2 PAdd (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
-    sub a b = primSig2 PSub (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
-    mul a b = primSig2 PMul (sigResize @(m + n)         a) (sigResize @(m + n)         b)
+    add a b = sigResize @(MaxN m n + 1) a + sigResize @(MaxN m n + 1) b
+    sub a b = sigResize @(MaxN m n + 1) a - sigResize @(MaxN m n + 1) b
+    mul a b = sigResize @(m + n)         a * sigResize @(m + n)         b
+
+-- | Width-typed concatenation: @a@ in the high bits, @b@ in the low bits; the
+-- result is an unsigned bit vector of the summed width (concatenation is bit
+-- juxtaposition, so it carries no signedness).
+sConcat :: forall dom a b. (HdlType a, HdlType b, KnownNat (Width a + Width b))
+        => Sig dom a -> Sig dom b -> Sig dom (BitVector (Width a + Width b))
+sConcat = sigConcat
