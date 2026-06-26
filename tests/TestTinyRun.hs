@@ -16,6 +16,7 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict    as Map
 
 import Isacle.ISA.Backend.Sim
+import Isacle.ISA.Build     (ISABuild)
 import Isacle.ISA.CPUDef    (runCPUDef)
 import Isacle.ISA.Def       (ISADef(isaInstrs))
 import Isacle.ISA.Example.Tiny
@@ -65,7 +66,8 @@ run initSt prog steps = runN steps initSt'
   where
     initSt' = initSt { ssCodeMem = IntMap.fromList (zip [0..] prog) }
     (aluRec, _) = runCPUDef tinyCPUDef
-    [nopBody, addBody, movBody, jmpBody] = isaInstrs tinyISA
+    [nopBody, addBody, movBody, jmpBody] =
+        isaInstrs (tinyISA :: ISADef (ISABuild TinyAlu 8 8 8 8))
 
     decode w
         | w == 0x00           = nopBody
