@@ -54,21 +54,29 @@ pushBody = do
     one <- litB 1
     writeRegB (RegScalar "SP") (spV - one)   -- <-- the previously-broken decrement
 
+regWriteName :: RegWrite -> String
+regWriteName (RegWrite (RegScalar n) w)            = n ++ " <= w" ++ show w
+regWriteName (RegWrite (RegFile f (FieldRef k)) w) = f ++ "_" ++ k ++ " <= w" ++ show w
+
 demoBuild :: IO ()
 demoBuild = do
     let ir = runISABuild pushBody
-    putStrLn "== InstrIR for PUSH =="
+    putStrLn "== InstrIR for PUSH (built through ISABuild) =="
     putStrLn ("  mnemonic = " ++ show (iirMnemonic ir))
     putStrLn ("  encoding = " ++ show (iirEncoding ir))
     putStrLn ("  #stmts   = " ++ show (length (iirStmts ir)))
-    -- Lower the SP write-back expression (SP - 1) and show it is a subtractor.
-    -- Built via the IExpr Num instance — exactly what `sp - 1` does in a body.
-    let spMinus1 = (IReadReg (RegScalar "SP") :: IExpr 16) - 1
-        (_, nodes, _) = runNetM (lowerExpr_ ctx spMinus1)
-    putStrLn "  SP-1 lowers to:"
-    mapM_ putStrLn [ "    w" ++ show o ++ " = " ++ show op ++ " " ++ show ins
+    -- Render the whole instruction's IR to lowered write/read requests, and
+    -- show the emitted ops + names (the body's `sp - 1` becomes a PSub).
+    let (r, nodes, _) = runNetM (renderInstr ctx ir)
+    putStrLn "  rendered:"
+    putStrLn ("    mem writes (addr,data) = "
+              ++ show [ (a, d) | (a, d) <- rMemWrites r ])
+    putStrLn ("    reg writes             = " ++ show (map regWriteName (rRegWrites r)))
+    putStrLn "    emitted ops:"
+    mapM_ putStrLn [ "      w" ++ show o ++ " = " ++ show op ++ " " ++ show ins
                    | NComb o op ins <- nodes ]
-    mapM_ putStrLn [ "    name w" ++ show w ++ " => " ++ n | NHint w n <- nodes ]
+    putStrLn "    names:"
+    mapM_ putStrLn [ "      w" ++ show w ++ " => " ++ n | NHint w n <- nodes ]
 
 main :: IO ()
 main = do

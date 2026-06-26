@@ -12,20 +12,28 @@
 -- Register reads, field extractions and read results are resolved through a
 -- 'LowerCtx' supplied by the CPU synthesis pass; this module owns only the
 -- expression-tree lowering and the naming strategy.
+{-# LANGUAGE ExistentialQuantification #-}
 module Isacle.ISA.Backend.Lower
     ( LowerCtx(..)
     , Named(..)
     , lowerExpr
     , lowerExpr_
+      -- * Statement-level rendering
+    , Rendered(..)
+    , RegWrite(..)
+    , Jump(..)
+    , emptyRendered
+    , renderInstr
     ) where
 
 import Prelude
+import Control.Monad (foldM)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net (WireId, NetM, NetNode(..), PrimOp, freshWire, emit, hintWire)
 import qualified Hdl.Net as N
-import Isacle.ISA.Types (ALUPrim(..))
+import Isacle.ISA.Types (ALUPrim(..), CPUFlag)
 import Isacle.ISA.IR
 
 -- | Resolution callbacks for the leaves an 'IExpr' can reference.  Supplied by
@@ -182,3 +190,68 @@ toPrim PMulSigned   = N.PMul
 -- each constructor carries.
 widthOf :: forall w. KnownNat w => IExpr w -> Int
 widthOf _ = fromIntegral (natVal (Proxy @w))
+
+-- ---------------------------------------------------------------------------
+-- Statement-level rendering: InstrIR -> lowered write/read requests
+-- ---------------------------------------------------------------------------
+
+-- | A register write, lowered: the (annotated) destination plus the data wire.
+data RegWrite = forall w. RegWrite (RegRef w) WireId
+
+-- | A conditional jump, lowered: the PC register, the condition wire, the
+-- target wire.
+data Jump = forall w. Jump (RegRef w) WireId WireId
+
+-- | One instruction's effects, lowered to wires.  This is the synth-side
+-- analogue of the old @SynthResult@, but produced from the 'InstrIR' source of
+-- truth instead of a leaky interpreter — the CPU pass assembles these into the
+-- register file, memory ports and the execution sequencer.
+data Rendered = Rendered
+    { rRegWrites  :: [RegWrite]
+    , rMemWrites  :: [(WireId, WireId)]    -- ^ (address, data) in program order
+    , rMemReads   :: [(ReadTok, WireId)]   -- ^ (token, address) in program order
+    , rCodeReads  :: [(ReadTok, WireId)]
+    , rFlagWrites :: [(CPUFlag, WireId)]
+    , rJumps      :: [Jump]
+    }
+
+emptyRendered :: Rendered
+emptyRendered = Rendered [] [] [] [] [] []
+
+-- | Lower every statement of an instruction's IR to wires, preserving program
+-- order (which the sequencer relies on for memory transactions).  Each
+-- expression is lowered through 'lowerExpr', so annotation-driven naming
+-- applies throughout.
+renderInstr :: LowerCtx -> InstrIR -> NetM Rendered
+renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
+  where
+    -- accumulate in reverse, restore order at the end
+    finish r = r
+        { rRegWrites  = reverse (rRegWrites r)
+        , rMemWrites  = reverse (rMemWrites r)
+        , rMemReads   = reverse (rMemReads r)
+        , rCodeReads  = reverse (rCodeReads r)
+        , rFlagWrites = reverse (rFlagWrites r)
+        , rJumps      = reverse (rJumps r)
+        }
+
+    step r (SWriteReg ref e) = do
+        w <- lowerExpr_ ctx e
+        pure r { rRegWrites = RegWrite ref w : rRegWrites r }
+    step r (SWriteMem a d) = do
+        wa <- lowerExpr_ ctx a
+        wd <- lowerExpr_ ctx d
+        pure r { rMemWrites = (wa, wd) : rMemWrites r }
+    step r (SReadMem tok a) = do
+        wa <- lowerExpr_ ctx a
+        pure r { rMemReads = (tok, wa) : rMemReads r }
+    step r (SReadCode tok a) = do
+        wa <- lowerExpr_ ctx a
+        pure r { rCodeReads = (tok, wa) : rCodeReads r }
+    step r (SWriteFlag f e) = do
+        w <- lowerExpr_ ctx e
+        pure r { rFlagWrites = (f, w) : rFlagWrites r }
+    step r (SJumpIf pc cond tgt) = do
+        wc <- lowerExpr_ ctx cond
+        wt <- lowerExpr_ ctx tgt
+        pure r { rJumps = Jump pc wc wt : rJumps r }
