@@ -14,8 +14,11 @@ module Hdl.Net
     , NetNode(..)
     , PrimOp(..)
     , SomeBits(..)
+    , Repr(..)
       -- * Wire name hints
     , hintWire
+      -- * Wire representation tags (signed/unsigned/…; drives emitter signal type)
+    , reprWire
       -- * Section comments
     , comment
       -- * Memoised primitive emission
@@ -118,6 +121,14 @@ data SomeBits = SomeBits
 -- Netlist IR nodes
 -- ---------------------------------------------------------------------------
 
+-- | How a wire's bits are interpreted, for VHDL signal typing.  Any untagged
+-- wire defaults to 'RUnsigned'; the typed 'Sig' surface tags wires via
+-- 'reprWire' so the emitter can declare @signed(…)@ vs @unsigned(…)@ and let
+-- numeric_std overloading pick the right arithmetic.  Deliberately extensible
+-- (fixed-point, enums, … add a constructor here + an emitter case).
+data Repr = RUnsigned | RSigned
+    deriving (Eq, Show)
+
 data NetNode
     = NReg
         { nOut  :: WireId
@@ -178,6 +189,12 @@ data NetNode
     | NHint
         { nHintWire :: WireId
         , nHintName :: String
+        }
+    -- | Representation tag for a wire (signed/unsigned/…).  A pure annotation,
+    -- like 'NHint': drives nothing, emits no statement.
+    | NRepr
+        { nReprWire :: WireId
+        , nReprKind :: Repr
         }
     -- | A free-standing source comment emitted verbatim into the architecture
     -- body, used to delineate generated sections (per-instruction decode, the
@@ -278,6 +295,12 @@ execDesign name = snd . runDesign name
 -- The emitter uses hints to prefer human-readable signal names over wN.
 hintWire :: WireId -> String -> NetM ()
 hintWire wid n = emit (NHint wid n)
+
+-- | Attach a representation tag to a wire (signed/unsigned/…).  The emitter
+-- declares the wire's VHDL signal type from this; untagged wires default to
+-- unsigned.
+reprWire :: WireId -> Repr -> NetM ()
+reprWire wid r = emit (NRepr wid r)
 
 -- | Emit a free-standing source comment into the architecture body at the
 -- current point in emission order.  Purely cosmetic — it carries no wires and

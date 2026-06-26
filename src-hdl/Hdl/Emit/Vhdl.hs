@@ -42,12 +42,14 @@ vhdlReserved = Set.fromList
 data VType
     = VStdLogic
     | VUnsigned  Int               -- unsigned(n-1 downto 0)
+    | VSigned    Int               -- signed(n-1 downto 0)
     | VArrayOf   Int VType         -- array(0 to n-1) of elem
     | VRecord    [(String, VType)] -- record ... end record
 
 ppType :: VType -> String
 ppType VStdLogic         = "std_logic"
 ppType (VUnsigned n)     = "unsigned(" ++ show (n-1) ++ " downto 0)"
+ppType (VSigned n)       = "signed(" ++ show (n-1) ++ " downto 0)"
 ppType (VArrayOf n t)    = "array(0 to " ++ show (n-1) ++ ") of " ++ ppType t
 ppType (VRecord fields)  = "record\n"
     ++ concatMap (\(n, t) -> "    " ++ n ++ " : " ++ ppType t ++ ";\n") fields
@@ -57,6 +59,37 @@ ppType (VRecord fields)  = "record\n"
 wireVType :: Int -> VType
 wireVType 1 = VStdLogic
 wireVType n = VUnsigned n
+
+-- | Like 'wireVType' but honours a wire's representation tag: a signed wire of
+-- width > 1 becomes @signed(..)@, so numeric_std overloading gives signed
+-- arithmetic\/comparison\/resize for free.  Untagged (the default) and 1-bit
+-- wires keep the plain 'wireVType' behaviour.
+wireVTypeR :: Repr -> Int -> VType
+wireVTypeR RSigned n | n > 1 = VSigned n
+wireVTypeR _       n         = wireVType n
+
+-- | A wire's representation tag.  An explicit 'NRepr' tag wins; otherwise the
+-- tag propagates from the operand a combinational op preserves the numeric
+-- interpretation of (like 'inferWidth' for widths), bottoming out at untagged
+-- leaves as 'RUnsigned'.  Only leaves (ports, registers) need explicit tags.
+reprOf :: WireId -> [NetNode] -> Repr
+reprOf wid nodes =
+    case [ r | NRepr w r <- nodes, w == wid ] of
+      (r:_) -> r
+      []    -> case [ (op, ins) | NComb o op ins <- nodes, o == wid ] of
+                 ((op, ins):_) -> maybe RUnsigned (`reprOf` nodes) (reprSource op ins)
+                 []            -> RUnsigned
+  where
+    -- the operand a combinational op inherits its representation from
+    reprSource :: PrimOp -> [WireId] -> Maybe WireId
+    reprSource PAdd        (a:_)   = Just a
+    reprSource PSub        (a:_)   = Just a
+    reprSource PMul        (a:_)   = Just a
+    reprSource (PResize _) (a:_)   = Just a
+    reprSource PMux        (_:t:_) = Just t   -- skip the 1-bit selector
+    reprSource PShiftL     (a:_)   = Just a
+    reprSource PShiftR     (a:_)   = Just a
+    reprSource _           _       = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Architecture declarations
@@ -251,6 +284,8 @@ cse nodes = map (rewrite finalSubst) kept
             NSubInst inst entRef [(p, sub subst w) | (p, w) <- ins] outs
         NHint w name ->
             NHint (sub subst w) name
+        NRepr w r ->
+            NRepr (sub subst w) r
         NMem out rdA wrA wrD wrEn sz dw ini dom ->
             NMem out (sub subst rdA) (sub subst wrA)
                      (sub subst wrD) (sub subst wrEn) sz dw ini dom
@@ -378,8 +413,8 @@ entityDecl design name nodes
     allPorts =
         [ ppPortLine VIn  (domName d)      VStdLogic            | d <- doms ]
      ++ [ ppPortLine VIn  (domResetName d) VStdLogic            | d <- doms ]
-     ++ [ ppPortLine VIn  (nPortName n) (wireVType (nWidth n))  | n@NInput{}  <- nodes ]
-     ++ [ ppPortLine VOut (nPortName n) (wireVType (nWidth n))  | n@NOutput{} <- nodes ]
+     ++ [ ppPortLine VIn  (nPortName n) (wireVTypeR (reprOf (nOut n) nodes) (nWidth n)) | n@NInput{}  <- nodes ]
+     ++ [ ppPortLine VOut (nPortName n) (wireVTypeR (reprOf (nIn n) nodes) (nWidth n))  | n@NOutput{} <- nodes ]
     doms = allClockDomains design nodes
 
 -- | Render a port list with semicolons on all but the final entry.
@@ -436,7 +471,7 @@ archDecls nm nodes =
     ++
     -- All other driven wires (registers, combinational outputs).
     -- Skip wires that are declared as part of an NGroup record.
-    [ VDSig (lookupWire nm wid) (ppType (wireVType (inferWidth wid nodes)))
+    [ VDSig (lookupWire nm wid) (ppType (wireVTypeR (reprOf wid nodes) (inferWidth wid nodes)))
             (fmap ppLit (regInit wid nodes))
     | wid <- sort (Map.keys nm)
     , not (isInputWire wid nodes)
@@ -489,6 +524,7 @@ regInit wid nodes = case [ nInit n | n@NReg{} <- nodes, nOut n == wid ] of
 toStmt :: Design -> NameMap -> [NetNode] -> NetNode -> [String]
 toStmt _      _  _  NInput{}                = []
 toStmt _      _  _  NHint{}                 = []
+toStmt _      _  _  NRepr{}                 = []
 toStmt _      _  _  NGroup{}               = []
 toStmt _      _  _  (NComment txt)          = ["", "  -- " ++ txt]
 toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses

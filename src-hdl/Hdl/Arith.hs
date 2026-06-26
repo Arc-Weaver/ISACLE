@@ -32,6 +32,7 @@ import GHC.TypeLits (Nat, KnownNat, type (+), type (<=?))
 import Hdl.Net   (PrimOp(..))
 import Hdl.Types (Sig, primSig2, sigResize, HdlType)
 import Hdl.Prim  (Unsigned)
+import Hdl.Bits  (Signed)
 
 -- | Type-level maximum of two naturals.
 type family MaxN (m :: Nat) (n :: Nat) :: Nat where
@@ -57,6 +58,18 @@ instance (KnownNat m, KnownNat n, KnownNat (MaxN m n + 1), KnownNat (m + n))
       => HdlArith (Unsigned m) (Unsigned n) where
     type AddR (Unsigned m) (Unsigned n) = Unsigned (MaxN m n + 1)
     type MulR (Unsigned m) (Unsigned n) = Unsigned (m + n)
+    add a b = primSig2 PAdd (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
+    sub a b = primSig2 PSub (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
+    mul a b = primSig2 PMul (sigResize @(m + n)         a) (sigResize @(m + n)         b)
+
+-- Signed: structurally identical to the unsigned instance — the signed
+-- behaviour (sign-extending resize, signed +/*/comparison) comes entirely from
+-- the emitter declaring the wires @signed(..)@ via their representation tag, so
+-- numeric_std overloading does the rest.
+instance (KnownNat m, KnownNat n, KnownNat (MaxN m n + 1), KnownNat (m + n))
+      => HdlArith (Signed m) (Signed n) where
+    type AddR (Signed m) (Signed n) = Signed (MaxN m n + 1)
+    type MulR (Signed m) (Signed n) = Signed (m + n)
     add a b = primSig2 PAdd (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
     sub a b = primSig2 PSub (sigResize @(MaxN m n + 1) a) (sigResize @(MaxN m n + 1) b)
     mul a b = primSig2 PMul (sigResize @(m + n)         a) (sigResize @(m + n)         b)

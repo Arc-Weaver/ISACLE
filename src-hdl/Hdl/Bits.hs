@@ -51,6 +51,7 @@ import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 
 import Hdl.Prim (Unsigned(..), Bit(..))
 import Hdl.Types (HdlType(..))
+import Hdl.Net (Repr(..))
 
 -- ---------------------------------------------------------------------------
 -- BitVector
@@ -104,6 +105,7 @@ instance KnownNat n => HdlType (Signed n) where
     type Width (Signed n) = n
     toBits (Signed v) = v `mod` (2 ^ natVal (Proxy @n))
     fromBits          = wrapS @n
+    hdlRepr _         = RSigned
 
 -- ---------------------------------------------------------------------------
 -- Vec n a
