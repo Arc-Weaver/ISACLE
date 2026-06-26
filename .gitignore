@@ -23,9 +23,12 @@ cabal.project.local~
 .ghc.environment.*
 dist-newstyle/
 
-# isacle-hdl synthesis outputs
+# isacle-hdl synthesis outputs (generated VHDL, GHDL work libs, waveforms).
+# Hand-written testbenches under tests/ghdl/ are tracked.
 build/
 vhdl/
 work-obj08.cf
+*.cf
+*.vcd
 ARCHITECTURE.html
 memory/
