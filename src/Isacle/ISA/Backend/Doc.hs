@@ -1,33 +1,28 @@
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE GADTs #-}
+-- | Documentation renderer over the ISA IR.
+--
+-- An instruction body is built into an 'InstrIR' and its metadata (mnemonic,
+-- doc string, encoding, operands) is read back out.  Operands are recovered
+-- from the IR: register-file reads become 'OpRegister', decoded immediates
+-- 'OpImmediate'.
 module Isacle.ISA.Backend.Doc
-    ( -- * Collected instruction metadata
-      InstrSpec(..)
+    ( InstrSpec(..)
     , OperandSpec(..)
-      -- * Doc monad
-    , DocM
-      -- * Runners
     , docInstr
     , docISA
     ) where
 
 import Prelude hiding (Word)
-import Control.Monad.Reader
-import Control.Monad.State.Strict
-import Hdl.Bits
-import Isacle.ISA.Types
-import Isacle.ISA.ALU
-import Isacle.ISA.Def
+import Data.List (nub)
 
--- ---------------------------------------------------------------------------
--- Output types
--- ---------------------------------------------------------------------------
+import Isacle.ISA.Def
+import Isacle.ISA.IR
+import Isacle.ISA.Build (ISABuild, runISABuild)
 
 -- | One operand referenced by an instruction body.
 data OperandSpec
-    = OpRegister String String   -- ^ (encoding field name, register file name)
-    | OpImmediate String         -- ^ encoding field name
+    = OpRegister String String   -- ^ (field key, register file name)
+    | OpImmediate String         -- ^ field key
     deriving (Show, Eq)
 
 -- | Collected documentation metadata for one instruction.
@@ -38,87 +33,52 @@ data InstrSpec = InstrSpec
     , specOperands :: [OperandSpec]
     } deriving (Show, Eq)
 
--- ---------------------------------------------------------------------------
--- Build accumulator (private)
--- ---------------------------------------------------------------------------
-
-data InstrBuild = InstrBuild
-    { ibMnemonic  :: String
-    , ibDoc       :: String
-    , ibEncoding  :: String
-    , ibOperands  :: [OperandSpec]
-    }
-
-emptyBuild :: InstrBuild
-emptyBuild = InstrBuild "" "" "" []
-
--- ---------------------------------------------------------------------------
--- DocM monad
--- Reader (alu) + State InstrBuild; no signals touched.
--- ---------------------------------------------------------------------------
-
-newtype DocM alu a = DocM (ReaderT alu (State InstrBuild) a)
-    deriving newtype (Functor, Applicative, Monad)
-
-instance MonadALU (DocM alu) where
-    type AluDef   (DocM alu) = alu
-    type Word     (DocM alu) = Unsigned 8
-    type DataAddr (DocM alu) = Unsigned 16
-
-    cpu sel      = DocM (asks sel)
-    cpuFlag sel  = DocM (asks sel)
-
-    register sel field = DocM $ do
-        alu <- ask
-        let CPURegFile rfname = sel alu
-        lift $ modify (\b -> b { ibOperands = ibOperands b ++ [OpRegister field rfname] })
-        return (CPURegister field)
-
-    immediate field = DocM $ do
-        lift $ modify (\b -> b { ibOperands = ibOperands b ++ [OpImmediate field] })
-        return (Unsigned 0)
-
-    mnemonic s   = DocM . lift $ modify (\b -> b { ibMnemonic = s })
-    doc s        = DocM . lift $ modify (\b -> b { ibDoc = s })
-    encoding s   = DocM . lift $ modify (\b -> b { ibEncoding = s })
-
-    readReg _    = return (Unsigned 0)
-    writeReg _ _ = return ()
-    readMem _    = return (Unsigned 0)
-    writeMem _ _ = return ()
-    getFlag _    = return 0
-    setFlag _ _  = return ()
-    isZero _        = return 0
-    absJumpIf _ _ _ = return ()
-    aluOp _ x _  = return x
-    resizeBits _  = return 0
-
-instance MonadHarvardALU (DocM alu) where
-    type CodeAddr (DocM alu) = Unsigned 16
-    type CodeWord (DocM alu) = Unsigned 16
-    readCode _ = return (Unsigned 0)
-
-instance MonadIRQ (DocM alu) where
-    type IrqAddrW (DocM alu) = 16
-    irqVector = return 0
-    irqGate _ = return ()
-
--- ---------------------------------------------------------------------------
--- Runners
--- ---------------------------------------------------------------------------
-
--- | Run one instruction body against an ALU definition record; collect its spec.
-docInstr :: alu -> DocM alu () -> InstrSpec
-docInstr alu m =
-    let DocM inner = m
-        build = execState (runReaderT inner alu) emptyBuild
+-- | Build one instruction body and read off its documentation spec.
+docInstr :: alu -> ISABuild alu wordW addrW codeWordW codeAddrW () -> InstrSpec
+docInstr alu body =
+    let ir = runISABuild alu body
     in InstrSpec
-        { specMnemonic = ibMnemonic build
-        , specDoc      = ibDoc      build
-        , specEncoding = ibEncoding build
-        , specOperands = ibOperands build
+        { specMnemonic = maybe "" id (iirMnemonic ir)
+        , specDoc      = maybe "" id (iirDoc ir)
+        , specEncoding = maybe "" id (iirEncoding ir)
+        , specOperands = nub (concatMap operandsS (iirStmts ir))
         }
 
--- | Run every instruction in an ISADef and return their specs in order.
-docISA :: alu -> ISADef (DocM alu) -> [InstrSpec]
+docISA :: alu -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW) -> [InstrSpec]
 docISA alu idef = map (docInstr alu) (isaInstrs idef)
+
+-- ---------------------------------------------------------------------------
+-- Operand recovery
+-- ---------------------------------------------------------------------------
+
+operandsS :: IStmt -> [OperandSpec]
+operandsS s = case s of
+    SReadMem  _ a  -> operandsE a
+    SReadCode _ a  -> operandsE a
+    SWriteReg r e  -> regOperand r ++ operandsE e
+    SWriteMem a d  -> operandsE a ++ operandsE d
+    SWriteFlag _ e -> operandsE e
+    SJumpIf r c t  -> regOperand r ++ operandsE c ++ operandsE t
+
+regOperand :: RegRef w -> [OperandSpec]
+regOperand (RegFile rf (FieldRef k)) = [OpRegister k rf]
+regOperand (RegScalar _)             = []
+
+operandsE :: IExpr w -> [OperandSpec]
+operandsE e = case e of
+    IField (FieldRef k)                -> [OpImmediate k]
+    IReadReg (RegFile rf (FieldRef k)) -> [OpRegister k rf]
+    IReadReg (RegScalar _)             -> []
+    IReadRes _                         -> []
+    IFlagRead _                        -> []
+    IIrqVector                         -> []
+    ILit _                             -> []
+    IBin _ a b                         -> operandsE a ++ operandsE b
+    IUn _ a                            -> operandsE a
+    IResize a                          -> operandsE a
+    ISignExt a                         -> operandsE a
+    IZeroExt a                         -> operandsE a
+    ITrunc a                           -> operandsE a
+    IIsZero a                          -> operandsE a
+    ISlice _ _ a                       -> operandsE a
+    INamed _ a                         -> operandsE a

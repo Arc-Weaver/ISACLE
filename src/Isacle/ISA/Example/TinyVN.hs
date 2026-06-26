@@ -29,7 +29,7 @@ module Isacle.ISA.Example.TinyVN
     ) where
 
 import Prelude hiding (Word)
-import Hdl.Bits
+import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ tvAdd = do
     setFlag zf z
 
 -- | LD rd, ra: load rd from mem[ra]
-tvLd :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ Unsigned 32, Word m ~ Unsigned 32) => m ()
+tvLd :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr 32, Word m ~ IExpr 32) => m ()
 tvLd = do
     mnemonic "LD"
     doc      "Load: rd = mem[ra]"
@@ -95,7 +95,7 @@ tvLd = do
     writeReg rd val
 
 -- | ST ra, rs: store rs to mem[ra]
-tvSt :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ Unsigned 32, Word m ~ Unsigned 32) => m ()
+tvSt :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr 32, Word m ~ IExpr 32) => m ()
 tvSt = do
     mnemonic "ST"
     doc      "Store: mem[ra] = rs"
@@ -107,7 +107,7 @@ tvSt = do
     writeMem addr val
 
 -- | ADDI rd, #imm8: rd = rd + zero-extended 8-bit immediate
-tvAddi :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ Unsigned 32) => m ()
+tvAddi :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
 tvAddi = do
     mnemonic "ADDI"
     doc      "Add immediate: rd = rd + imm8"
@@ -119,7 +119,7 @@ tvAddi = do
     writeReg rd r
 
 -- | BEQ k: if Z then PC = k (24-bit absolute target)
-tvBeq :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ Unsigned 32) => m ()
+tvBeq :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
 tvBeq = do
     mnemonic "BEQ"
     doc      "Branch if zero: if Z then PC = k"
@@ -131,7 +131,7 @@ tvBeq = do
     absJumpIf p z k
 
 -- | JMP k: PC = k (24-bit absolute target)
-tvJmp :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ Unsigned 32) => m ()
+tvJmp :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
 tvJmp = do
     mnemonic "JMP"
     doc      "Absolute jump: PC = k"
@@ -146,8 +146,8 @@ tvJmp = do
 
 tinyVnISA :: ( MonadALU m
              , AluDef m ~ TinyVnAlu
-             , Word m ~ Unsigned 32
-             , DataAddr m ~ Unsigned 32
+             , Word m ~ IExpr 32
+             , DataAddr m ~ IExpr 32
              ) => ISADef m
 tinyVnISA = defineISA ISADef
     { isaPc            = SomeCPURegister <$> cpu tvPc
