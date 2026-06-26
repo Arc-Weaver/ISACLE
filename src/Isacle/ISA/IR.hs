@@ -5,6 +5,8 @@
 {-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE FlexibleContexts     #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE TypeOperators        #-}
+{-# LANGUAGE TypeApplications     #-}
 -- | The ISA instruction IR — the well-typed /source of truth/ an instruction
 -- body constructs, mirroring how 'Isacle.System.BusDef' is the source of truth
 -- for a bus.  Backends are /renderers/ over this IR (synthesis → netlist,
@@ -47,6 +49,11 @@ module Isacle.ISA.IR
     , truncateB
     , bitCoerce
     , slice
+      -- * Width-checked variants (type-level width laws; opt-in)
+    , zeroExtendC
+    , signExtendC
+    , truncateC
+    , sliceC
       -- * Ordered effects and the per-instruction IR
     , IStmt(..)
     , InstrIR(..)
@@ -55,7 +62,8 @@ module Isacle.ISA.IR
 
 import Prelude
 import Data.Kind (Type)
-import GHC.TypeLits (Nat, KnownNat)
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (Nat, KnownNat, natVal, type (<=), type (+), type (-))
 
 import Isacle.ISA.Types (ALUPrim(..), CPUFlag(..))
 
@@ -168,6 +176,34 @@ bitCoerce = IResize
 
 slice :: (KnownNat k, KnownNat w) => Int -> Int -> IExpr k -> IExpr w
 slice = ISlice
+
+-- ---------------------------------------------------------------------------
+-- Width-checked variants — identical lowering to the adapters above, but the
+-- type-level width law is enforced in the signature.  Opt-in: a body that wants
+-- the static check calls these instead of the loose adapters, and an
+-- out-of-range slice or a wrong-direction resize becomes a compile error.
+-- ---------------------------------------------------------------------------
+
+-- | Zero-extend, statically guaranteed to grow (or stay): @k <= w@.
+zeroExtendC :: (KnownNat k, KnownNat w, k <= w) => IExpr k -> IExpr w
+zeroExtendC = IZeroExt
+
+-- | Sign-extend, statically guaranteed to grow (or stay): @k <= w@.
+signExtendC :: (KnownNat k, KnownNat w, k <= w) => IExpr k -> IExpr w
+signExtendC = ISignExt
+
+-- | Truncate, statically guaranteed to shrink (or stay): @w <= k@.
+truncateC :: (KnownNat k, KnownNat w, w <= k) => IExpr k -> IExpr w
+truncateC = ITrunc
+
+-- | Slice bits @[hi..lo]@ inclusive with the bounds at the /type/ level: the
+-- result is exactly @hi - lo + 1@ bits and the slice must fit the source
+-- (@lo <= hi@, @hi + 1 <= k@).  Use via type application: @sliceC \@hi \@lo e@.
+sliceC :: forall hi lo k w.
+          ( KnownNat hi, KnownNat lo, KnownNat k, KnownNat w
+          , lo <= hi, (hi + 1) <= k, w ~ (hi - lo + 1) )
+       => IExpr k -> IExpr w
+sliceC = ISlice (fromIntegral (natVal (Proxy @hi))) (fromIntegral (natVal (Proxy @lo)))
 
 -- ---------------------------------------------------------------------------
 -- Ordered effects and the per-instruction IR
