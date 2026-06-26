@@ -7,10 +7,10 @@ module Isacle.ISA.ALU where
 
 import Prelude hiding (Word)
 import Data.Kind (Type)
-import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal)
-import Hdl.Bits
+import GHC.TypeLits (KnownNat, Nat)
+import Hdl.Bits (Bit(..))
 import Isacle.ISA.Types
+import Isacle.ISA.IR
 
 -- ---------------------------------------------------------------------------
 -- MonadALU
@@ -51,7 +51,7 @@ class Monad m => MonadALU m where
     cpuFlag  :: (AluDef m -> CPUFlag) -> m CPUFlag
 
     -- | Get a constant/immediate value from the instruction encoding
-    immediate :: String -> m (Unsigned n)
+    immediate :: KnownNat n => String -> m (IExpr n)
 
     -- ------------------------------------------------------------------
     -- Instruction metadata
@@ -66,8 +66,8 @@ class Monad m => MonadALU m where
     -- Register operations
     -- ------------------------------------------------------------------
 
-    readReg  :: KnownNat w => CPURegister w -> m (Unsigned w)
-    writeReg :: KnownNat w => CPURegister w -> Unsigned w -> m ()
+    readReg  :: KnownNat w => CPURegister w -> m (IExpr w)
+    writeReg :: KnownNat w => CPURegister w -> IExpr w -> m ()
 
     -- ------------------------------------------------------------------
     -- Data memory operations
@@ -89,52 +89,41 @@ class Monad m => MonadALU m where
     -- writeFlag mcsCY v ≡  cpuFlag mcsCY >>= \f -> setFlag f v
     -- ------------------------------------------------------------------
 
-    getFlag :: CPUFlag -> m (Unsigned 1)
-    setFlag :: CPUFlag -> Unsigned 1 -> m ()
+    getFlag :: CPUFlag -> m (IExpr 1)
+    setFlag :: CPUFlag -> IExpr 1 -> m ()
 
-    readFlag :: (AluDef m -> CPUFlag) -> m (Unsigned 1)
+    readFlag :: (AluDef m -> CPUFlag) -> m (IExpr 1)
     readFlag sel = getFlag =<< cpuFlag sel
 
-    writeFlag :: (AluDef m -> CPUFlag) -> Unsigned 1 -> m ()
+    writeFlag :: (AluDef m -> CPUFlag) -> IExpr 1 -> m ()
     writeFlag sel v = cpuFlag sel >>= \f -> setFlag f v
 
-    -- | Resize a k-bit value to n bits: zero-extends when n > k, truncates
-    -- (takes lower n bits) when n < k.
-    -- Default: masks to the lower n bits (correct for simulation).
-    resizeBits :: forall k n. (KnownNat k, KnownNat n) => Unsigned k -> m (Unsigned n)
-    resizeBits v =
-        let n    = fromIntegral (natVal (Proxy @n)) :: Int
-            mask = (1 `shiftL` n) - 1
-        in pure (fromInteger (toInteger v .&. mask))
+    -- | Resize a k-bit value to n bits (zero-extend up, truncate down).
+    resizeBits :: (KnownNat k, KnownNat n) => IExpr k -> m (IExpr n)
+    resizeBits = pure . tResize
 
-    -- | Sign-extend a k-bit value to n bits, interpreting the source as 2's
-    -- complement signed.  Default uses Haskell signed wrapping (correct for
-    -- simulation); the synthesis backend overrides this to emit PSignedResize.
-    signExtendBits :: forall k n. (KnownNat k, KnownNat n) => Unsigned k -> m (Unsigned n)
-    signExtendBits v =
-        let w   = fromIntegral (natVal (Proxy @k)) :: Int
-            raw = toInteger v
-            sgn = raw >= (1 `shiftL` (w - 1))
-            ext = if sgn then raw - (1 `shiftL` w) else raw
-        in pure (fromInteger ext)
+    -- | Sign-extend a k-bit value to n bits (2's complement).
+    signExtendBits :: (KnownNat k, KnownNat n) => IExpr k -> m (IExpr n)
+    signExtendBits = pure . tSignExt
 
     -- | Test whether an n-bit value is zero, returning a 1-bit result.
-    isZero :: KnownNat n => Unsigned n -> m (Unsigned 1)
+    isZero :: KnownNat n => IExpr n -> m (IExpr 1)
+    isZero = pure . tIsZero
 
     -- | Conditional absolute jump: write target to pcReg only when cond == 1.
-    absJumpIf :: KnownNat w => CPURegister w -> Unsigned 1 -> Unsigned w -> m ()
+    absJumpIf :: KnownNat w => CPURegister w -> IExpr 1 -> IExpr w -> m ()
 
     -- ------------------------------------------------------------------
     -- ALU operations
     -- ------------------------------------------------------------------
 
-    aluOp :: KnownNat w => ALUPrim -> Unsigned w -> Unsigned w -> m (Unsigned w)
+    aluOp :: KnownNat w => ALUPrim -> IExpr w -> IExpr w -> m (IExpr w)
+    aluOp PNot a _ = pure (tUn PNot a)
+    aluOp op   a b = pure (tBin op a b)
 
-    -- | Produce a hardware constant.  The default is a pure 'fromInteger'
-    -- (correct for simulation); the SynthM backend overrides this to emit a
-    -- 'PLit' NetNode so the constant does not alias a live signal wire.
-    litC :: KnownNat n => Integer -> m (Unsigned n)
-    litC v = pure (fromInteger v)
+    -- | Produce a hardware constant.
+    litC :: KnownNat n => Integer -> m (IExpr n)
+    litC = pure . tLit
 
     -- ------------------------------------------------------------------
     -- Bit-extraction primitives
@@ -142,25 +131,25 @@ class Monad m => MonadALU m where
     -- ------------------------------------------------------------------
 
     -- | Return the most-significant bit of a word.
-    wordMsb :: KnownNat w => Unsigned w -> m Bit
+    wordMsb :: KnownNat w => IExpr w -> m Bit
     wordMsb _ = return Lo
 
     -- | Return Hi when the word is zero, Lo otherwise.
-    wordIsZero :: KnownNat w => Unsigned w -> m Bit
+    wordIsZero :: KnownNat w => IExpr w -> m Bit
     wordIsZero _ = return Lo
 
     -- | Add two w-bit values with a carry-in; returns (result, carry-out,
     -- half-carry from bits 3→4). Default stubs the carry bits as Lo.
     addWithFlags :: KnownNat w
-                 => Unsigned w -> Unsigned w -> Bit
-                 -> m (Unsigned w, Bit, Bit)
+                 => IExpr w -> IExpr w -> Bit
+                 -> m (IExpr w, Bit, Bit)
     addWithFlags a b _ = do r <- aluOp PAdd a b; return (r, Lo, Lo)
 
     -- | Subtract @b@ and borrow-in from @a@; returns (result, borrow-out,
     -- half-borrow from bits 3→4). Default stubs the borrow bits as Lo.
     subWithFlags :: KnownNat w
-                 => Unsigned w -> Unsigned w -> Bit
-                 -> m (Unsigned w, Bit, Bit)
+                 => IExpr w -> IExpr w -> Bit
+                 -> m (IExpr w, Bit, Bit)
     subWithFlags a b _ = do r <- aluOp PSub a b; return (r, Lo, Lo)
 
 -- ---------------------------------------------------------------------------
@@ -192,13 +181,13 @@ class MonadALU m => MonadIRQ m where
     -- | Return the externally-supplied interrupt vector address.
     -- Wired to an @irq_vector@ input port in hardware so an interrupt
     -- controller outside the core can drive it.
-    irqVector :: m (Unsigned (IrqAddrW m))
+    irqVector :: m (IExpr (IrqAddrW m))
 
     -- | Condition all subsequent writes in the current do-block on the given
     -- 1-bit signal, similar to Haskell's @guard@ but for hardware writes.
     -- In synthesis the condition is ANDed with the current match wire; in
     -- simulation the body is skipped when the condition evaluates to 0.
-    irqGate :: m (Unsigned 1) -> m ()
+    irqGate :: m (IExpr 1) -> m ()
 
 -- ---------------------------------------------------------------------------
 -- Common helpers
@@ -207,20 +196,20 @@ class MonadALU m => MonadIRQ m where
 
 -- | Relative jump: add a signed offset to the current PC
 relJump :: (MonadALU m, KnownNat w)
-        => CPURegister w -> Signed w -> m ()
+        => CPURegister w -> IExpr w -> m ()
 relJump pcReg offset = do
     current <- readReg pcReg
-    writeReg pcReg (current + bitCoerce offset)
+    writeReg pcReg (current + offset)
 
 -- | Absolute jump: load a new value directly into the PC
 absJump :: (MonadALU m, KnownNat w)
-        => CPURegister w -> Unsigned w -> m ()
+        => CPURegister w -> IExpr w -> m ()
 absJump pcReg target = writeReg pcReg target
 
 -- | Push a word onto the stack.
 -- Reads the SP, writes to mem[SP], decrements SP.
 -- Byte order for multi-word values determined by CPUDef endianness.
-push :: (MonadALU m, DataAddr m ~ Unsigned spWidth, KnownNat spWidth)
+push :: (MonadALU m, DataAddr m ~ IExpr spWidth, KnownNat spWidth)
      => CPURegister spWidth -> Word m -> m ()
 push spReg val = do
     sp <- readReg spReg
@@ -229,7 +218,7 @@ push spReg val = do
 
 -- | Pop a word from the stack.
 -- Increments SP, reads from mem[SP].
-pop :: (MonadALU m, DataAddr m ~ Unsigned spWidth, KnownNat spWidth)
+pop :: (MonadALU m, DataAddr m ~ IExpr spWidth, KnownNat spWidth)
     => CPURegister spWidth -> m (Word m)
 pop spReg = do
     sp <- readReg spReg
@@ -242,19 +231,19 @@ pop spReg = do
 -- ---------------------------------------------------------------------------
 
 -- | Read via a register used as a data pointer
-indirectRead :: (MonadALU m, DataAddr m ~ Unsigned addrWidth, KnownNat addrWidth)
+indirectRead :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
              => CPURegister addrWidth -> m (Word m)
 indirectRead ptrReg = readReg ptrReg >>= readMem . bitCoerce
 
 -- | Write via a register used as a data pointer
-indirectWrite :: (MonadALU m, DataAddr m ~ Unsigned addrWidth, KnownNat addrWidth)
+indirectWrite :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
               => CPURegister addrWidth -> Word m -> m ()
 indirectWrite ptrReg val = do
     ptr <- readReg ptrReg
     writeMem (bitCoerce ptr) val
 
 -- | Read with post-increment
-indirectReadPostInc :: (MonadALU m, DataAddr m ~ Unsigned addrWidth, KnownNat addrWidth)
+indirectReadPostInc :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
                     => CPURegister addrWidth -> m (Word m)
 indirectReadPostInc ptrReg = do
     ptr <- readReg ptrReg
@@ -262,7 +251,7 @@ indirectReadPostInc ptrReg = do
     readMem (bitCoerce ptr)
 
 -- | Read with pre-decrement
-indirectReadPreDec :: (MonadALU m, DataAddr m ~ Unsigned addrWidth, KnownNat addrWidth)
+indirectReadPreDec :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
                    => CPURegister addrWidth -> m (Word m)
 indirectReadPreDec ptrReg = do
     ptr <- readReg ptrReg
@@ -271,8 +260,8 @@ indirectReadPreDec ptrReg = do
     readMem (bitCoerce ptr')
 
 -- | Read with constant offset
-indirectReadOffset :: (MonadALU m, DataAddr m ~ Unsigned addrWidth, KnownNat addrWidth)
-                   => CPURegister addrWidth -> Unsigned addrWidth -> m (Word m)
+indirectReadOffset :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
+                   => CPURegister addrWidth -> IExpr addrWidth -> m (Word m)
 indirectReadOffset ptrReg offset = do
     ptr <- readReg ptrReg
     readMem (bitCoerce (ptr + offset))

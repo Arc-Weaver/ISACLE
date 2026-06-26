@@ -65,29 +65,29 @@ module Isacle.ISA
     , fieldKey
     , extractField
     , matchesWord
-      -- * Documentation backend
-    , DocM
+      -- * IR (source of truth) + builder
+    , module Isacle.ISA.IR
+    , ISABuild
+    , runISABuild
+      -- * Documentation renderer
     , InstrSpec(..)
     , OperandSpec(..)
     , docInstr
     , docISA
-      -- * Simulation backend
-    , SimM
+      -- * Simulation renderer
     , SimState(..)
     , SimCPU(..)
     , emptySim
     , runInstr
     , execInstr
     , runIrq
-      -- * Synthesis backend
-    , SynthCtx(..)
+      -- * Synthesis renderer
     , SynthResult(..)
     , RegWriteReq(..)
     , MemWriteReq(..)
     , FlagWriteReq(..)
-    , SynthM
-    , runSynthM
-    , evalSynthM
+    , RenderCtx(..)
+    , renderSynth
       -- * CPU synthesis
     , synthHarvardCPU
     ) where
@@ -97,6 +97,8 @@ import Isacle.ISA.CPUDef
 import Isacle.ISA.ALU
 import Isacle.ISA.Def
 import Isacle.ISA.Encoding
+import Isacle.ISA.IR
+import Isacle.ISA.Build
 import Isacle.ISA.Backend.Doc
 import Isacle.ISA.Backend.Sim
 import Isacle.ISA.Backend.Synth

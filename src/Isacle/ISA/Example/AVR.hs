@@ -4,7 +4,7 @@
 module Isacle.ISA.Example.AVR where
 
 import Prelude hiding (Word)
-import Hdl.Bits hiding ((!!))
+import Hdl.Bits hiding ((!!), zeroExtend, signExtend, truncateB, bitCoerce, slice)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ addDef = do
     writeReg rd r
     zf <- isZero r
     setFlag z zf
-    setFlag n (bitToU1 (msb r))
+    setFlag n (slice 7 7 r)
 
 rjmpDef :: (MonadALU m, AluDef m ~ AVRAlu) => m ()
 rjmpDef = do
@@ -79,11 +79,11 @@ rjmpDef = do
     encoding "1100_kkkkkkkkkkkk_...."
     k   <- immediate "kkkkkkkkkkkk"
     pc' <- cpu pc
-    relJump pc' (signExtend (bitCoerce (k :: Unsigned 12) :: Signed 12) :: Signed 22)
+    relJump pc' (signExtend (k :: IExpr 12) :: IExpr 22)
 
--- | LDS requires Word m ~ Unsigned 8 and DataAddr m ~ Unsigned 16
+-- | LDS requires Word m ~ IExpr 8 and DataAddr m ~ IExpr 16
 ldsDef :: ( MonadHarvardALU m, AluDef m ~ AVRAlu
-          , Word m ~ Unsigned 8, DataAddr m ~ Unsigned 16
+          , Word m ~ IExpr 8, DataAddr m ~ IExpr 16
           ) => m ()
 ldsDef = do
     mnemonic "LDS"
@@ -91,7 +91,7 @@ ldsDef = do
     encoding "1001_000d_ddddd_0000_kkkkkkkkkkkkkkkk_...."
     rd <- register gpr "ddddd"
     k  <- immediate "kkkkkkkkkkkkkkkk"
-    v  <- readMem (k :: Unsigned 16)
+    v  <- readMem (k :: IExpr 16)
     writeReg rd v
 
 -- | LPM reads a byte from program memory via the implicit Z register (r30:r31).
@@ -99,8 +99,8 @@ ldsDef = do
 -- file entries by a fixed index (not an encoding field); that is left as a
 -- future DSL extension.
 lpmDef :: ( MonadHarvardALU m, AluDef m ~ AVRAlu
-          , Word m ~ Unsigned 8
-          , CodeAddr m ~ Unsigned 16, CodeWord m ~ Unsigned 16
+          , Word m ~ IExpr 8
+          , CodeAddr m ~ IExpr 16, CodeWord m ~ IExpr 16
           ) => m ()
 lpmDef = do
     mnemonic "LPM"
@@ -111,10 +111,10 @@ lpmDef = do
 -- ISA definition
 -- ---------------------------------------------------------------------------
 
--- | AVR ISA definition. The data word is 8-bit (Word m ~ Unsigned 8),
+-- | AVR ISA definition. The data word is 8-bit (Word m ~ IExpr 8),
 -- SP is 16-bit, and the PC is 22-bit.
 avrISA :: ( MonadHarvardALU m, AluDef m ~ AVRAlu
-          , Word m ~ Unsigned 8, DataAddr m ~ Unsigned 16
+          , Word m ~ IExpr 8, DataAddr m ~ IExpr 16
           ) => ISADef m
 avrISA = defineISA ISADef
     { isaPc            = SomeCPURegister <$> cpu pc

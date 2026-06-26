@@ -5,6 +5,8 @@ module Hdl.Types
     ( -- * Per-signal domain tags
       Sig(..)
     , materialize
+      -- * Representation tagging
+    , withRepr
       -- * Combinational operations
     , (.==.)
     , (.<.)
@@ -84,6 +86,16 @@ primSig1 :: PrimOp -> Sig dom a -> Sig dom b
 primSig1 op a = SExpr $ do
     wa <- materialize a
     lookupOrEmit op [wa]
+
+-- | Tag a typed signal's wire with its representation (from 'hdlRepr'), so the
+-- emitter declares it with the right VHDL signal type.  Apply where a typed
+-- value originates (ports, registers) — the emitter then propagates the tag
+-- through combinational ops, so intermediate results inherit it.
+withRepr :: forall dom a. HdlType a => Sig dom a -> Sig dom a
+withRepr s = SExpr $ do
+    w <- materialize s
+    reprWire w (hdlRepr (Proxy @a))
+    pure w
 
 -- ---------------------------------------------------------------------------
 -- Comparison and logical operations
@@ -218,6 +230,11 @@ class KnownNat (Width a) => HdlType (a :: Type) where
     type Width a :: Nat
     toBits   :: a -> Integer
     fromBits :: Integer -> a
+    -- | The wire representation this type erases to.  Drives the emitter's
+    -- VHDL signal type (and thus numeric_std overloading).  Defaults to
+    -- 'RUnsigned'; signed types override it.
+    hdlRepr  :: Proxy a -> Repr
+    hdlRepr _ = RUnsigned
 
 instance HdlType Bool where
     type Width Bool = 1

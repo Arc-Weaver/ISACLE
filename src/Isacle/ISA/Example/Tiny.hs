@@ -24,7 +24,7 @@ module Isacle.ISA.Example.Tiny
     ) where
 
 import Prelude hiding (Word)
-import Hdl.Bits
+import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ movDef = do
 
 -- | LDI rd, #n — load 4-bit immediate into register.
 -- Encoding: 01rrnnnn  (rr = dest register bits[5:4], nnnn = value bits[3:0])
-ldiDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+ldiDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ IExpr 8) => m ()
 ldiDef = do
     mnemonic "LDI"
     doc      "Load immediate: rd = #n (4-bit, 0–15)"
@@ -98,7 +98,7 @@ ldiDef = do
 
 -- | ST [rd], rs — store register rs to data memory at address in rd.
 -- Encoding: 0011ssdd  (ss = data register, dd = address register)
-stDef :: (MonadALU m, AluDef m ~ TinyAlu, DataAddr m ~ Unsigned 8, Word m ~ Unsigned 8) => m ()
+stDef :: (MonadALU m, AluDef m ~ TinyAlu, DataAddr m ~ IExpr 8, Word m ~ IExpr 8) => m ()
 stDef = do
     mnemonic "ST"
     doc      "Store to memory: mem[rd] = rs"
@@ -111,7 +111,7 @@ stDef = do
 
 -- | BRZ k — branch if Z=1 (last ADD result was zero).
 -- Encoding: 100kkkkk  (5-bit target, 0–31)
-brzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+brzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ IExpr 8) => m ()
 brzDef = do
     mnemonic "BRZ"
     doc      "Branch if zero flag set: if Z then PC = k"
@@ -124,7 +124,7 @@ brzDef = do
 
 -- | BRNZ k — branch if Z=0 (last ADD result was nonzero).
 -- Encoding: 101kkkkk  (5-bit target, 0–31)
-brnzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+brnzDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ IExpr 8) => m ()
 brnzDef = do
     mnemonic "BRNZ"
     doc      "Branch if zero flag clear: if not Z then PC = k"
@@ -138,8 +138,8 @@ brnzDef = do
     absJumpIf p nz k
 
 -- | JMP encodes the target as a 6-bit immediate in bits [5:0].
--- Requires Word m ~ Unsigned 8 so the immediate can be passed to absJump.
-jmpDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8) => m ()
+-- Requires Word m ~ IExpr 8 so the immediate can be passed to absJump.
+jmpDef :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ IExpr 8) => m ()
 jmpDef = do
     mnemonic "JMP"
     doc      "Absolute jump: PC = k"
@@ -152,7 +152,7 @@ jmpDef = do
 -- ISA definition
 -- ---------------------------------------------------------------------------
 
-tinyISA :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ Unsigned 8, DataAddr m ~ Unsigned 8) => ISADef m
+tinyISA :: (MonadALU m, AluDef m ~ TinyAlu, Word m ~ IExpr 8, DataAddr m ~ IExpr 8) => ISADef m
 tinyISA = defineISA ISADef
     { isaPc            = SomeCPURegister <$> cpu pc
     , isaInterruptBody = Nothing
