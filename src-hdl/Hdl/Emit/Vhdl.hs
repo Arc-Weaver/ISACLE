@@ -594,16 +594,20 @@ combExpr :: NameMap -> [NetNode] -> PrimOp -> [WireId] -> String
 combExpr nm ns op ins = case (op, ins) of
     (POr,   [a,b]) | a == b -> w a   -- identity: hinted a or a → a
     (PAnd,  [a,b]) | a == b -> w a   -- identity: hinted a and a → a
-    (PAdd,  [a,b]) -> binOp ns " + "   a b
-    (PSub,  [a,b]) -> binOp ns " - "   a b
-    (PMul,  [a,b]) ->
-        let aw = inferWidth a ns
-            bw = inferWidth b ns
-            ow = max aw bw
-            prod = widthPad ow aw a ++ " * " ++ widthPad ow bw b
-        in if ow < aw + bw
-           then "resize(" ++ prod ++ ", " ++ show ow ++ ")"
-           else prod
+    -- 1-bit unsigned arithmetic is mod-2: a+b = a-b = a xor b, a*b = a and b.
+    -- (A width-1 wire is std_logic, which has no numeric_std "+".)
+    (PAdd,  [a,b]) -> arithOp ns " + "   " xor " a b
+    (PSub,  [a,b]) -> arithOp ns " - "   " xor " a b
+    (PMul,  [a,b])
+        | max (inferWidth a ns) (inferWidth b ns) == 1 -> w a ++ " and " ++ w b
+        | otherwise ->
+            let aw = inferWidth a ns
+                bw = inferWidth b ns
+                ow = max aw bw
+                prod = widthPad ow aw a ++ " * " ++ widthPad ow bw b
+            in if ow < aw + bw
+               then "resize(" ++ prod ++ ", " ++ show ow ++ ")"
+               else prod
     (PAnd,  [a,b]) -> binOp ns " and " a b
     (POr,   [a,b]) -> binOp ns " or "  a b
     (PXor,  [a,b]) -> binOp ns " xor " a b
@@ -621,6 +625,7 @@ combExpr nm ns op ins = case (op, ins) of
     (PEq,   [a,b]) -> "'1' when " ++ w a ++ " = " ++ w b ++ " else '0'"
     (PLt,   [a,b]) -> "'1' when " ++ w a ++ " < " ++ w b ++ " else '0'"
     (PSlice hi lo, [a])
+        | inferWidth a ns == 1 -> w a   -- 1-bit source is std_logic; its only bit is itself
         | hi == lo  -> w a ++ "(" ++ show hi ++ ")"
         | otherwise -> w a ++ "(" ++ show hi ++ " downto " ++ show lo ++ ")"
     (PConcat, ws)   -> intercalate " & " (map w ws)
@@ -650,6 +655,10 @@ combExpr nm ns op ins = case (op, ins) of
             bw = inferWidth b nodes'
             ow = max aw bw
         in widthPad ow aw a ++ opr ++ widthPad ow bw b
+    -- Arithmetic that degrades to a boolean op at width 1 (std_logic has no "+").
+    arithOp nodes' arithOpr boolOpr a b
+        | max (inferWidth a nodes') (inferWidth b nodes') == 1 = w a ++ boolOpr ++ w b
+        | otherwise = binOp nodes' arithOpr a b
 
 -- ---------------------------------------------------------------------------
 -- Width inference
