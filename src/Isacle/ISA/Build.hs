@@ -18,6 +18,7 @@
 module Isacle.ISA.Build
     ( ISABuild
     , runISABuild
+    , evalISABuild
     ) where
 
 import Prelude hiding (Word)
@@ -59,6 +60,11 @@ runISABuild alu (ISABuild m) =
     let st = execState (runReaderT m alu) initBuildSt
     in InstrIR (bsMnemonic st) (bsDoc st) (bsEncoding st)
                (bsGate st) (reverse (bsStmts st))
+
+-- | Run a body for its /result/ only (ignoring the IR).  Used to read static
+-- facts out of a body — e.g. the PC register name from @isaPc@.
+evalISABuild :: alu -> ISABuild alu wordW addrW cwW caW a -> a
+evalISABuild alu (ISABuild m) = evalState (runReaderT m alu) initBuildSt
 
 emitStmt :: IStmt -> ISABuild alu wordW addrW cwW caW ()
 emitStmt s = ISABuild $ modify $ \st -> st { bsStmts = s : bsStmts st }

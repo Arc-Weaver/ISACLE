@@ -53,6 +53,7 @@ import Hdl.Types (KnownDom(..))
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.Def
+import Isacle.ISA.Build (ISABuild, runISABuild, evalISABuild)
 import Isacle.ISA.Backend.Synth
 
 -- ---------------------------------------------------------------------------
@@ -90,7 +91,7 @@ synthHarvardCPU' :: forall dom wordW addrW codeWordW codeAddrW alu.
                     , KnownNat wordW, KnownNat addrW
                     , KnownNat codeWordW, KnownNat codeAddrW )
                  => CPUDef alu
-                 -> ISADef (SynthM alu wordW addrW codeWordW codeAddrW)
+                 -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
                  -> WireId   -- ^ pre-allocated instr_word wire
                  -> WireId   -- ^ pre-allocated data_rd_data wire
                  -> WireId   -- ^ pre-allocated code_rd_data wire (LPM stub)
@@ -206,12 +207,19 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                 (return dmemRdDataW)
                 (schAliasRegs schema)
 
+    let renderCtx = RenderCtx
+            { rcInstrWire  = instrWireId
+            , rcReadScalar = \n -> scReadRegFn n 0
+            , rcDataBus    = dmemRdDataW
+            , rcCodeBus    = cmemRdDataW
+            , rcGetFlag    = getFlagFn
+            , rcIrqVector  = Nothing
+            , rcWordW      = wordBits
+            }
+
+    -- Each body is built into an InstrIR, then lowered to a SynthResult.
     results <- forM (isaInstrs isaDef) $ \instr ->
-        runSynthM aluRec instrWireId scReadRegFn
-                  scReadMemFnAlias
-                  (const (return cmemRdDataW))
-                  getFlagFn
-                  instr
+        renderSynth renderCtx Nothing (runISABuild aluRec instr)
 
     -- Interrupt body synthesis (if ISA declares one)
     irqData <- case isaInterruptBody isaDef of
@@ -221,9 +229,8 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
             emit $ NInput irqPendW "irq_pending" 1 domInfo
             irqVecW  <- freshWire
             emit $ NInput irqVecW "irq_vector" codeAddrBits domInfo
-            r <- runSynthMIrq aluRec irqPendW irqVecW
-                     scReadRegFn scReadMemFnAlias
-                     (const (return cmemRdDataW)) getFlagFn body
+            r <- renderSynth renderCtx { rcIrqVector = Just irqVecW }
+                             (Just irqPendW) (runISABuild aluRec body)
             return (Just (irqPendW, irqVecW, r))
 
     let allResults = results ++ maybe [] (\(_, _, r) -> [r]) irqData
@@ -497,7 +504,7 @@ synthHarvardCPU :: forall dom wordW addrW codeWordW codeAddrW alu.
                    , KnownNat wordW, KnownNat addrW
                    , KnownNat codeWordW, KnownNat codeAddrW )
                 => CPUDef alu
-                -> ISADef (SynthM alu wordW addrW codeWordW codeAddrW)
+                -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
                 -> NetM ()
 synthHarvardCPU cpuDef isaDef = do
     let domInfo  = domId (Proxy @dom)
@@ -530,11 +537,11 @@ synthHarvardCPU cpuDef isaDef = do
 -- 'SynthM' context.  'isaPc' always reduces to @cpu sel@, which only reads
 -- the ALU record — no 'NetM' nodes are emitted.
 extractPcName :: alu
-              -> ISADef (SynthM alu wordW addrW codeWordW codeAddrW)
+              -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
               -> NetM String
-extractPcName aluRec isaDef = do
-    SomeCPURegister (CPURegister n) <- evalSynthM aluRec (isaPc isaDef)
-    return n
+extractPcName aluRec isaDef =
+    let SomeCPURegister (CPURegister n) = evalISABuild aluRec (isaPc isaDef)
+    in return n
 
 -- -----------------------------------------------------------------------
 -- Netlist building utilities

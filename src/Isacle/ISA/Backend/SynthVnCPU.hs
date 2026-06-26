@@ -36,6 +36,7 @@ import Hdl.Types (KnownDom(..))
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.Def
+import Isacle.ISA.Build (ISABuild, runISABuild, evalISABuild)
 import Isacle.ISA.Backend.Synth
 import Isacle.ISA.Backend.SynthCPU
     ( extractPcName, litWire, driveWire, buildOrTree, buildMuxTree, addrBitsFor )
@@ -83,7 +84,7 @@ synthVonNeumannCPU'
        ( KnownDom dom
        , KnownNat wordW, KnownNat addrW )
     => CPUDef alu
-    -> ISADef (SynthM alu wordW addrW wordW addrW)
+    -> ISADef (ISABuild alu wordW addrW wordW addrW)
     -> WireId   -- ^ pre-allocated instr_word wire
     -> WireId   -- ^ pre-allocated data_rd_data wire
     -> WireId   -- ^ stall wire (from cache)
@@ -183,18 +184,19 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
                 (return dmemRdDataW)
                 (schAliasRegs schema)
 
-    -- For VN ISAs there is no code bus; pass dmemRdDataW as a dummy so the
-    -- shared SynthM machinery compiles unchanged.  VN instruction bodies never
-    -- call readCode, so this wire is never actually driven by the result.
-    let dummyCodeRdFn :: WireId -> NetM WireId
-        dummyCodeRdFn _ = return dmemRdDataW
+    -- VN ISAs have no separate code bus; reads come from the same data bus.
+    let renderCtx = RenderCtx
+            { rcInstrWire  = instrWireId
+            , rcReadScalar = \n -> scReadRegFn n 0
+            , rcDataBus    = dmemRdDataW
+            , rcCodeBus    = dmemRdDataW
+            , rcGetFlag    = getFlagFn
+            , rcIrqVector  = Nothing
+            , rcWordW      = wordBits
+            }
 
     results <- forM (isaInstrs isaDef) $ \instr ->
-        runSynthM aluRec instrWireId scReadRegFn
-                  scReadMemFnAlias
-                  dummyCodeRdFn
-                  getFlagFn
-                  instr
+        renderSynth renderCtx Nothing (runISABuild aluRec instr)
 
     irqData <- case isaInterruptBody isaDef of
         Nothing   -> return Nothing
@@ -203,9 +205,8 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
             emit $ NInput irqPendW "irq_pending" 1 domInfo
             irqVecW  <- freshWire
             emit $ NInput irqVecW "irq_vector" addrBits domInfo
-            r <- runSynthMIrq aluRec irqPendW irqVecW
-                     scReadRegFn scReadMemFnAlias
-                     dummyCodeRdFn getFlagFn body
+            r <- renderSynth renderCtx { rcIrqVector = Just irqVecW }
+                             (Just irqPendW) (runISABuild aluRec body)
             return (Just (irqPendW, irqVecW, r))
 
     let allResults = results ++ maybe [] (\(_, _, r) -> [r]) irqData
@@ -445,7 +446,7 @@ synthVonNeumannCPU
        ( KnownDom dom
        , KnownNat wordW, KnownNat addrW )
     => CPUDef alu
-    -> ISADef (SynthM alu wordW addrW wordW addrW)
+    -> ISADef (ISABuild alu wordW addrW wordW addrW)
     -> NetM ()
 synthVonNeumannCPU cpuDef isaDef = do
     let domInfo  = domId (Proxy @dom)

@@ -40,10 +40,12 @@ import Isacle.ISA.IR
 -- the CPU synthesis pass (which owns the register file, the field decoder and
 -- the per-cycle read-result wires).
 data LowerCtx = LowerCtx
-    { lcReadReg  :: forall w. RegRef w -> NetM WireId
-    , lcField    :: FieldRef -> NetM WireId
-    , lcReadRes  :: ReadTok -> NetM WireId
-    , lcMnemonic :: Maybe String   -- ^ instruction mnemonic, for field-wire naming
+    { lcReadReg   :: forall w. RegRef w -> NetM WireId
+    , lcField     :: FieldRef -> NetM WireId
+    , lcReadRes   :: ReadTok -> NetM WireId
+    , lcReadFlag  :: CPUFlag -> NetM WireId
+    , lcIrqVector :: NetM WireId
+    , lcMnemonic  :: Maybe String   -- ^ instruction mnemonic, for field-wire naming
     }
 
 -- | A lowered wire together with the name it carries, if any.  The name is what
@@ -128,6 +130,21 @@ lowerExpr ctx = go
         let nm = fmap (\s -> s ++ "_isZero") na
         maybe (pure ()) (hintWire w) nm
         pure (Named w nm)
+
+    go (ISlice hi lo a) = do
+        Named wa na <- go a
+        w <- freshWire
+        emit $ NComb w (N.PSlice hi lo) [wa]
+        propagate w na
+
+    go (IFlagRead flag) = do
+        w <- lcReadFlag ctx flag
+        pure (Named w Nothing)
+
+    go IIrqVector = do
+        w <- lcIrqVector ctx
+        hintWire w "irq_vector"
+        pure (Named w (Just "irq_vector"))
 
     resizeLike :: forall k. Int -> IExpr k -> NetM Named
     resizeLike dst a = do

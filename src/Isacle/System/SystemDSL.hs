@@ -76,7 +76,7 @@ import Isacle.Periph.UART  (uartDefWithFSM, UART)
 import Isacle.Periph.Timer (timerDefWithFSM, Timer)
 import Isacle.ISA.CPUDef (CPUDef)
 import Isacle.ISA.Def    (ISADef)
-import Isacle.ISA.Backend.Synth    (SynthM)
+import Isacle.ISA.Build (ISABuild)
 import Isacle.ISA.Backend.SynthCPU (synthHarvardCPU', CpuMemIface(..))
 import Isacle.ISA.Backend.SynthVnCPU (synthVonNeumannCPU', VnMemIface(..))
 import Isacle.Cache.Config (CacheConfig)
@@ -436,7 +436,7 @@ createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
               )
            => String
            -> CPUDef alu
-           -> ISADef (SynthM alu (Width dat) addrW codeWordW codeAddrW)
+           -> ISADef (ISABuild alu (Width dat) addrW codeWordW codeAddrW)
            -> BusHandle
            -> [Integer]
            -> SysDSL dom dat ()
@@ -555,7 +555,7 @@ createCachedCPU
        ( KnownDom dom, KnownNat addrW, HdlType dat )
     => String
     -> CPUDef alu
-    -> ISADef (SynthM alu (Width dat) addrW (Width dat) addrW)
+    -> ISADef (ISABuild alu (Width dat) addrW (Width dat) addrW)
     -> CacheHandle
     -> SysDSL dom dat ()
 createCachedCPU instName cpuDef isaDef cacheH = SysDSL $ do
