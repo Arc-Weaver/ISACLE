@@ -198,7 +198,13 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
     (reframe step 2 groundwork; H4 array field → width).
   - **PLAN_CORE_REFRAME.md** (`d08746d`): ordered, GHDL-verified-per-step plan for
     the supervised whole-core migration.
-  - *Verified:* full pass — ISACLE tests, cl51 18, clavr 8/8 GHDL — all green.
+  - **cl51 8051 flag + state migration** (cl51 `f520403`, `17af2b2`): PSW and IE
+    moved to record `HdlType`s via `flagRec` (the AVR SREG migration mirrored on
+    the 8051 — GHDL-analyzed), and the whole 8051 state expressed as a recursive
+    record `Mcs51State` (nested Psw/Ie, Width 80, round-trips). Both CPU cores now
+    have record flags + record state at C1 parity.
+  - *Verified:* full pass — ISACLE tests, cl51 18 + synth + GHDL-analyze, clavr
+    8/8 GHDL — all green.
 - **Remaining (large, supervised):** whole-`AVRALU`-as-`HdlType` access +
   `pcW` elimination (PLAN_CORE_REFRAME.md steps 3–4); Phase F heterogeneous
   SystemDSL (multi-domain/width/CPU + per-CPU reductions); type-level A2;
