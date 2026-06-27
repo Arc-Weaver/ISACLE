@@ -45,6 +45,8 @@ data VType
     | VSigned    Int               -- signed(n-1 downto 0)
     | VArrayOf   Int VType         -- array(0 to n-1) of elem
     | VRecord    [(String, VType)] -- record ... end record
+    | VEnumRef   String            -- reference to a declared enumerated type
+    | VEnum      [String]          -- (lit0, lit1, …)  — the enum type body
 
 ppType :: VType -> String
 ppType VStdLogic         = "std_logic"
@@ -54,6 +56,13 @@ ppType (VArrayOf n t)    = "array(0 to " ++ show (n-1) ++ ") of " ++ ppType t
 ppType (VRecord fields)  = "record\n"
     ++ concatMap (\(n, t) -> "    " ++ n ++ " : " ++ ppType t ++ ";\n") fields
     ++ "  end record"
+ppType (VEnumRef name)   = name
+ppType (VEnum lits)      = "(" ++ intercalate ", " lits ++ ")"
+
+-- | Stable VHDL type name for an enum, derived from its literals (so the same
+-- enum used on many wires declares one shared type).
+enumTypeName :: [String] -> String
+enumTypeName lits = "enum_" ++ intercalate "_" lits ++ "_t"
 
 -- | Convert a wire bit-width to the appropriate scalar VHDL type.
 wireVType :: Int -> VType
@@ -65,8 +74,9 @@ wireVType n = VUnsigned n
 -- arithmetic\/comparison\/resize for free.  Untagged (the default) and 1-bit
 -- wires keep the plain 'wireVType' behaviour.
 wireVTypeR :: Repr -> Int -> VType
-wireVTypeR RSigned n | n > 1 = VSigned n
-wireVTypeR _       n         = wireVType n
+wireVTypeR (REnum lits) _     = VEnumRef (enumTypeName lits)
+wireVTypeR RSigned      n | n > 1 = VSigned n
+wireVTypeR _            n         = wireVType n
 
 -- | A wire's representation tag.  An explicit 'NRepr' tag wins; otherwise the
 -- tag propagates from the operand a combinational op preserves the numeric
@@ -165,18 +175,31 @@ ppPortLine VOut n t = n ++ " : out " ++ ppType t
 
 -- | Emit one VHDL file for the named entity.
 emitVhdl :: Design -> String -> [NetNode] -> String
-emitVhdl design name nodes = unlines
-    [ "library ieee;"
-    , "use ieee.std_logic_1164.all;"
-    , "use ieee.numeric_std.all;"
-    , ""
-    , entityDecl design name nodes'
-    , ""
-    , architectureDecl design name nm nodes'
-    ]
+emitVhdl design name nodes = unlines (header ++ body)
   where
     nodes' = cse nodes
     nm     = buildNameMap nodes'
+    pkgTypes = packageTypeDecls nodes'
+    pkgName  = name ++ "_types"
+    ieeeCtx  = [ "library ieee;"
+               , "use ieee.std_logic_1164.all;"
+               , "use ieee.numeric_std.all;" ]
+    -- Structured types (records/enums) go in a per-file package so they are
+    -- visible to the entity ports; the entity 'use' clause also covers the
+    -- architecture.  Designs with no structured types emit byte-identically.
+    header
+      | null pkgTypes = ieeeCtx ++ [ "" ]
+      | otherwise     = ieeeCtx ++ [ "" ]
+          ++ [ "package " ++ pkgName ++ " is" ]
+          ++ map ppDecl pkgTypes
+          ++ [ "end package " ++ pkgName ++ ";", "" ]
+          ++ ieeeCtx
+          ++ [ "use work." ++ pkgName ++ ".all;", "" ]
+    body =
+      [ entityDecl design name nodes'
+      , ""
+      , architectureDecl design name nm nodes'
+      ]
 
 emitVhdlFile :: FilePath -> String -> [NetNode] -> IO ()
 emitVhdlFile path name nodes = writeFile path (emitVhdl Map.empty name nodes)
@@ -437,10 +460,25 @@ architectureDecl design name nm nodes = unlines $
     ++ clockProcesses nm nodes
     ++ [ "end architecture rtl;" ]
 
+-- | Structured TYPE declarations that must be package-visible (so they can be
+-- used in entity ports, not just internal signals): record types (from
+-- 'NGroup') and enumerated types (from 'REnum' tags), deduplicated.  Emitted
+-- into a per-file @<entity>_types@ package; the entity's @use@ clause makes them
+-- visible to both the ports and the architecture.
+packageTypeDecls :: [NetNode] -> [VDecl]
+packageTypeDecls nodes =
+    [ VDType (grpName ++ "_t")
+             (VRecord [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ])
+    | NGroup grpName fields <- nodes ]
+    ++
+    Map.elems (Map.fromList
+        [ (enumTypeName lits, VDType (enumTypeName lits) (VEnum lits))
+        | NRepr _ (REnum lits) <- nodes ])
+
 -- | All architecture-region declarations: types, constants, signals.
 archDecls :: NameMap -> [NetNode] -> [VDecl]
 archDecls nm nodes =
-    -- NGroup: record type then record signal (one per group).
+    -- NGroup record SIGNALS (the record TYPES are in the package, packageTypeDecls).
     concatMap groupDecls groups
     ++
     -- Named array types for inline RAM and ROM (deduplicated by base name).
@@ -490,18 +528,16 @@ archDecls nm nodes =
     groupedWires = Set.fromList
         [ w | NGroup _ fields <- nodes, (_, w) <- fields ]
 
+    -- The record TYPE is declared in the per-file package (see 'packageTypeDecls');
+    -- here we only declare the record SIGNAL, which references that type.
     groupDecls (NGroup grpName fields) =
-        let recType = VRecord
-                [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ]
-            initStr = "("
+        let initStr = "("
                 ++ intercalate ", "
                     [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
                                                    (regInit w nodes))
                     | (fn, w) <- fields ]
                 ++ ")"
-        in [ VDType (grpName ++ "_t") recType
-           , VDSig  grpName (grpName ++ "_t") (Just initStr)
-           ]
+        in [ VDSig grpName (grpName ++ "_t") (Just initStr) ]
     groupDecls _ = []
 
     isInputWire wid ns = wid `elem` [ nOut n | n@NInput{} <- ns ]
@@ -700,16 +736,22 @@ combExpr nm ns op ins = case (op, ins) of
     w = lookupWire nm
     reprCast RSigned   = "signed"
     reprCast RUnsigned = "unsigned"
+    reprCast (REnum _) = "unsigned"  -- enums are not numerically reinterpret-cast
     -- The representation a numeric op operates in: a literal operand carries no
     -- representation of its own (it is a shared @unsigned@ bit-pattern constant),
     -- so the op's repr is taken from its first non-literal data operand.  When
     -- that is signed, literal operands must be cast to keep numeric_std types
     -- consistent (and to pick the signed overload).  All-unsigned ops are
     -- unaffected — the output is byte-for-byte identical.
-    dataRepr xs = case [ reprOf x ns | x <- xs, not (isLitWire x ns) ] of
+    -- The op's data representation: the first non-default repr among ALL
+    -- operands (so a signed signal, or a tagged enum literal, drives it).
+    dataRepr xs = case [ r | x <- xs, let r = reprOf x ns, r /= RUnsigned ] of
                     (r:_) -> r
                     []    -> RUnsigned
     castLit r src
+        | REnum lits <- r
+        , (v:_) <- [ vv | NComb o (PLit vv _) [] <- ns, o == src ]
+        , fromInteger v < length lits = lits !! fromInteger v   -- enum literal → its name
         | r == RSigned, isLitWire src ns, inferWidth src ns > 1 = "signed(" ++ w src ++ ")"
         | otherwise                                             = w src
     widthPad r ow sw src
@@ -782,4 +824,6 @@ ppLitR :: Repr -> SomeBits -> String
 ppLitR RSigned (SomeBits v w)
     | w > 1 = "to_signed(" ++ show signedVal ++ ", " ++ show w ++ ")"
   where signedVal = if v >= 2 ^ (w - 1) then v - 2 ^ w else v
+ppLitR (REnum lits) (SomeBits v _)
+    | fromInteger v < length lits = lits !! fromInteger v   -- enum value → literal
 ppLitR _ sb = ppLit sb

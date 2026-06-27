@@ -127,7 +127,9 @@ data SomeBits = SomeBits
 -- 'reprWire' so the emitter can declare @signed(…)@ vs @unsigned(…)@ and let
 -- numeric_std overloading pick the right arithmetic.  Deliberately extensible
 -- (fixed-point, enums, … add a constructor here + an emitter case).
-data Repr = RUnsigned | RSigned
+-- | @REnum literals@ — a VHDL enumerated type whose values are @literals@ (in
+-- order; the bit value indexes the literal).  Used for ADT tags / FSM states.
+data Repr = RUnsigned | RSigned | REnum [String]
     deriving (Eq, Ord, Show)
 
 data NetNode

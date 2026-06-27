@@ -38,12 +38,18 @@ module Hdl.Types
     , PortSpec(..)
       -- * Generic derivation support (satisfy derived-instance constraints)
     , PortLayout(..)
+      -- * Generic HdlType derivation (records → packed value, Width = Σ fields)
+    , GHdlType(..)
+    , GWidth
+    , genericToBits
+    , genericFromBits
       -- * Clock domain typeclass
     , KnownDom(..)
     ) where
 
 import Prelude
-import GHC.TypeLits (KnownNat, Nat, natVal)
+import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
+import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import Data.Coerce (coerce)
@@ -253,6 +259,66 @@ instance HdlType Bool where
     toBits True  = 1
     fromBits 0   = False
     fromBits _   = True
+
+-- ---------------------------------------------------------------------------
+-- Generic HdlType derivation (records → a packed value; Width = Σ fields)
+--
+-- A record whose fields are all 'HdlType' becomes an 'HdlType' by deriving
+-- 'Generic' and writing:
+--
+-- @
+-- data Foo = Foo { a :: Unsigned 4, b :: Signed 4 } deriving Generic
+-- instance HdlType Foo where
+--   type Width Foo = GWidth (Rep Foo)
+--   toBits   = genericToBits
+--   fromBits = genericFromBits
+-- @
+--
+-- Packing is MSB-first in field order (the first field occupies the high bits),
+-- matching the flatten used for memory/bus.
+-- ---------------------------------------------------------------------------
+
+-- | Type-level sum of field widths over a 'Generic' representation.
+type family GWidth (f :: Type -> Type) :: Nat where
+    GWidth U1         = 0
+    GWidth (M1 i c f) = GWidth f
+    GWidth (K1 r a)   = Width a
+    GWidth (f :*: g)  = GWidth f + GWidth g
+
+-- | Value-level packing over a 'Generic' representation.
+class GHdlType (f :: Type -> Type) where
+    gWidth    :: Int                 -- ^ runtime field-bits width
+    gToBits   :: f p -> Integer
+    gFromBits :: Integer -> f p
+
+instance GHdlType U1 where
+    gWidth      = 0
+    gToBits   _ = 0
+    gFromBits _ = U1
+
+instance GHdlType f => GHdlType (M1 i c f) where
+    gWidth          = gWidth @f
+    gToBits  (M1 x) = gToBits x
+    gFromBits n     = M1 (gFromBits n)
+
+instance HdlType a => GHdlType (K1 r a) where
+    gWidth          = fromIntegral (natVal (Proxy @(Width a)))
+    gToBits  (K1 a) = toBits a
+    gFromBits n     = K1 (fromBits n)
+
+instance (GHdlType f, GHdlType g) => GHdlType (f :*: g) where
+    gWidth            = gWidth @f + gWidth @g
+    gToBits (x :*: y) = (gToBits x `shiftL` gWidth @g) .|. gToBits y
+    gFromBits n       = gFromBits (n `shiftR` wg) :*: gFromBits (n .&. ((1 `shiftL` wg) - 1))
+      where wg = gWidth @g
+
+-- | Derived 'toBits' for a record: pack fields MSB-first in field order.
+genericToBits :: (Generic a, GHdlType (Rep a)) => a -> Integer
+genericToBits = gToBits . from
+
+-- | Derived 'fromBits' for a record: inverse of 'genericToBits'.
+genericFromBits :: (Generic a, GHdlType (Rep a)) => Integer -> a
+genericFromBits = to . gFromBits
 
 -- ---------------------------------------------------------------------------
 -- Port bundle typeclass

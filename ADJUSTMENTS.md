@@ -49,9 +49,14 @@ preservation** — everything erases to one flat wire. The emitter
   **preserves** it (VHDL record/array/variant). The current
   `toBits`/`fromBits`/`Width`/`Repr` packing view is demoted (→ H6). Lands in
   `Hdl.Types` (class shape) + `Hdl.Net`/emitter.
-- [ ] **H2 (additive)** — `Generic` deriving for **records** (products): all
-  fields `HdlType` → derived `HdlType` emitting a VHDL record. Reuse the existing
-  `HdlPorts` / `PortLayout (Rep a)` Generic pattern as the template.
+- [x] **H2 (DONE — packing deriving)** — `Generic` deriving for records implemented
+  in `Hdl.Types`: `GWidth` (type-family Σ of field widths) + `GHdlType` (value
+  packing) + `genericToBits`/`genericFromBits`. A record derives `HdlType` with a
+  one-line instance (`type Width Foo = GWidth (Rep Foo)`; `toBits = genericToBits`;
+  needs `UndecidableInstances`, already project-wide). Verified: `Foo (Unsigned 4)
+  (Signed 4)` → `Width 8`, `toBits (Foo 3 -1) = 0x3F` (MSB-first), round-trip ok.
+  *Remaining:* the structural (VHDL-record) *emission* side is H7 (the packing is
+  the flatten view, H6).
 - [ ] **H3 (design → reuse records)** — **ADTs convert to a record.** A sum
   lowers to a record `{ tag, payload }`, riding the record path (H2) instead of a
   distinct VHDL variant construct. **The `tag` is a VHDL enumerated type**
@@ -61,6 +66,24 @@ preservation** — everything erases to one flat wire. The emitter
   payload record). Remaining sub-decision: payload layout — one field per
   constructor (all present, only the tagged one valid) vs a single payload sized
   to the widest constructor. Pin field/ctor bit order to match flatten (H6).
+  - **PROGRESS (enum infra DONE, verified):** `Repr += REnum [String]` (`Hdl.Net`);
+    emitter gains `VEnum`/`VEnumRef`, `enumTypeName`, deduped enum **type
+    declarations** (from `NRepr` tags), `wireVTypeR` enum case, and enum-aware
+    `ppLitR` (a value → its literal name). Verified: an internal enum register
+    emits `type … is (Idle,Run,Done); signal state : … := Idle; state <= Idle`
+    and GHDL analyzes + elaborates. **Enum-aware `combExpr` literals DONE**:
+    `dataRepr` now picks the first non-`RUnsigned` repr among *all* operands
+    (signed unchanged), and `castLit (REnum lits)` emits a literal's name. A full
+    3-state enum FSM (compares `state = Idle`, muxes `Run when go else Idle`,
+    enum reset) emits + GHDL-elaborates. **Output-neutral**: all 8 clavr ghdl-sim
+    tests still pass (signed ramp reads −6). **Package types DONE**: structured
+    type declarations (records from `NGroup`, enums from `REnum`) now emit into a
+    per-file `<entity>_types` **package** (`packageTypeDecls` + restructured
+    `emitVhdl`), with a `use work.<entity>_types.all` clause covering both the
+    entity **ports** and the architecture. Verified: enum **ports** GHDL-elaborate;
+    `cpu.vhd`'s `cpu_state` record moved to `cpu_types` package, all 8 clavr tests
+    still green; type-free designs emit **byte-identical** (no package). Minor
+    cosmetic: dead `to_unsigned` constants for inlined enum literals (could filter).
 - [ ] **H4 (additive)** — **Fixed-size arrays** `Vec (n :: Nat)` of `HdlType`
   (`KnownNat n`) → VHDL array type. New structural form (was missing entirely).
 - [ ] **H5 (design)** — **Primitive leaf set** mapped to VHDL bus types: `Bit`
@@ -75,10 +98,23 @@ preservation** — everything erases to one flat wire. The emitter
   driver**; structure/expression is primary. So `toBits`/`fromBits`/`Width` stay
   as a derived *flatten* capability (for memory/bus where bits genuinely
   flatten), not the definition of `HdlType`.
-- [ ] **H7 (emitter — large)** — `Hdl.Emit.Vhdl` must emit/declare VHDL
-  **records, arrays, and enumerated types** (enums for ADT tags + direct use) to
-  realize structure preservation. ADTs ride records (H3) — no separate variant
-  construct. Today it is flat-wire only. Significant, gating H1–H4.
+- [ ] **H7 (emitter — SMALLER THAN FEARED)** — DISCOVERY: the emitter **already
+  has** `VRecord`, `VArrayOf`, `VDType` and an **`NGroup`** node that declares a
+  VHDL record type + signal — and it is **exercised in production**: `SynthCPU.hs`
+  emits `NGroup "cpu_state"`, so **CPU state is already a VHDL record today**.
+  Records ✅ and arrays ✅ (used for ROM/RAM) exist. So H7 reduces to: (a) **enums**
+  (`VEnum`) for ADT tags (the real gap, H3); (b) wire the structural `HdlType`
+  (H1) to `NGroup`/`VArrayOf` so *derived* records/arrays auto-emit (today
+  `NGroup` is hand-emitted by `SynthCPU`). Much less risk than "flat-wire only."
+  - **PROGRESS:** `mkGroup` added to `Hdl.Class` — a generic
+    `HdlPorts a => String -> a -> NetM ()` that emits an `NGroup` from a record of
+    signals (the generic form of the hand-rolled `NGroup "cpu_state"`). **Verified**:
+    a `deriving (Generic, HdlPorts)` record → a VHDL `record` type with correct
+    `state.<field>` mapping, GHDL analyzed + elaborated. (Note: identical
+    registers CSE-merge — correct, but means distinct fields need distinct
+    drivers.) Remaining: (a) enums (H3); (b) the `HdlType`-level structural
+    projection (H1) so a `Sig dom <record>` materialises to an `NGroup`
+    automatically (mkGroup currently takes the `HdlPorts` bundle explicitly).
 
 ### Resolved
 - [x] **H8** — "generally fixed width": confirmed. Every `HdlType` has a fixed

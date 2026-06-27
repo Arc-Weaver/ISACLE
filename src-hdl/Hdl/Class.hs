@@ -16,6 +16,8 @@ module Hdl.Class
     , outputS
       -- * Optional wire naming
     , named
+      -- * Structured (record) signal grouping
+    , mkGroup
     ) where
 
 import Prelude
@@ -135,6 +137,19 @@ named hint sig = do
     wid <- materialize sig
     hintWire wid hint
     pure (SWire wid)
+
+-- | Group a record of signals into a named VHDL record signal.
+--
+-- @a@ is any @deriving (Generic, HdlPorts)@ record whose fields are 'Sig' (or
+-- other 'HdlPorts' bundles).  The field wires are materialized and emitted as an
+-- 'NGroup', so the emitter declares @\<name\>_t@ as a record type and rewrites
+-- references to those wires as @\<name\>.\<field\>@.  This is the generic form of
+-- the hand-rolled @NGroup "cpu_state"@ in the CPU backend.
+mkGroup :: forall a. HdlPorts a => String -> a -> NetM ()
+mkGroup name a = do
+    wids <- toWireIds a
+    let names = map portName (portSpecs (Proxy @a))
+    emit $ NGroup name (zip names wids)
 
 -- | Synchronous-write / asynchronous-read block RAM.
 -- Emits a single 'NMem' node; all ports are materialized immediately.
