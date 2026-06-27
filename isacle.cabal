@@ -72,6 +72,7 @@ library isacle-hdl
     Hdl.Net
     Hdl.Prim
     Hdl.Reduce
+    Hdl.Sim
     Hdl.Types
   build-depends:
     base >= 4.12 && < 4.22,
