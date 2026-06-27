@@ -201,11 +201,16 @@ structure and the interpreter-plurality are missing.
 
 - [ ] **D1 (naming)** — `Circuit → Hdl`, `reg → register`; constrain ends as
   signal bundles (`Signal i`, `Signal o`) instead of bare `Sig` in signatures.
-- [ ] **D2 (structural — core)** — `Hdl` is **monadic + input-space-expanding =
-  an Arrow.** Give it `Category`/`Arrow` (and likely `ArrowChoice` for muxing /
-  ADT case) structure so circuits compose (`>>>`) and grow inputs
-  (`first`/`***`/`&&&`). Today `Circuit` has none. This is the "expand its input
-  space" capability.
+- [x] **D1/D2/D3 (DONE — Hdl arrow)** — `Circuit` renamed to **`Hdl`**
+  (`class Category c => Hdl c`); `reg`/`regEn` → **`register`/`registerEn`**.
+  `NetBuilder` (= `Kleisli NetM`, the synthesis interpreter) now has **`Category`,
+  `Arrow`, `ArrowChoice`** instances, so circuits **compose** (`>>>`) and **grow
+  inputs** (`first`/`second`/`***`/`&&&`) — the "monadic + input-space expansion"
+  capability. Verified: `register 0 >>> register 0` emits two chained registers
+  and GHDL-elaborates. (`Circuit`/`NetBuilder` were unused outside `Hdl.Class`, so
+  zero blast radius; clavr/cl51 build + clavr tests green.) — superseded item:
+  *D2 (structural — core)* — `Hdl` is **monadic + input-space-expanding =
+  an Arrow** (`Category`/`Arrow`/`ArrowChoice`).
 - [ ] **D3 (register sig)** — Reconcile `register`'s signature
   (`i -> Signal dom i -> Hdl (Signal dom i) (Signal dom i)`) with current
   `reg :: a -> c (Sig dom a) (Sig dom a)` (the extra explicit input-signal arg).

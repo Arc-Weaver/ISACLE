@@ -3,7 +3,7 @@
 -- | CPU-level synthesis: adjoins a 'CPUDef' with a 'ISADef' to produce a
 -- complete Harvard-architecture decode-execute circuit in the 'NetM' IR.
 --
--- = Circuit structure
+-- = Hdl structure
 --
 -- * Scalar registers (PC, SP, …) become 'NReg' nodes, initialised from
 --   'isaReset'.
