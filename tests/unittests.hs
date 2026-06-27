@@ -10,7 +10,7 @@ import qualified Tests.Isacle.Periph.Timer     as Timer
 import qualified Tests.Isacle.Periph.UART      as UART
 import qualified Tests.Isacle.Periph.DMA       as DMA
 import qualified Tests.Isacle.System.Bus       as Bus
-import qualified Tests.Isacle.System.Layout    as Layout
+import qualified Tests.Isacle.Layout    as Layout
 import qualified Tests.Isacle.Sim              as Sim
 
 main :: IO ()

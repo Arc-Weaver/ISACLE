@@ -8,7 +8,10 @@ import Prelude
 import Control.Monad.Writer
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
+import GHC.Generics (Generic, Rep)
 import Hdl.Bits
+import Hdl.Types (HdlType, Width, GFields)
+import Isacle.Layout (bitLayout, layoutSize, layoutPlacements, plName, plPos)
 import Isacle.ISA.Types
 
 -- ---------------------------------------------------------------------------
@@ -78,6 +81,28 @@ flagPack regName flagNames = CPUDef $ do
         flags = zipWith (\bitPos _ -> CPUFlag regName bitPos)
                         (reverse [0 .. length flagNames - 1])
                         flagNames
+    tell mempty
+        { schRegisters  = [(regName, w)]
+        , schStatusRegs = [(regName, w, flagNames)]
+        }
+    pure (CPURegister regName, flags)
+
+-- | Declare a status register from a record 'HdlType' — the core-side mirror of
+-- the peripheral 'Isacle.System.Periph.fieldRec'. The register width and each
+-- flag's bit position are /derived/ from the record's MSB-first layout through
+-- the shared address-mapping helper ('Isacle.Layout.bitLayout'), so a CPU flag
+-- and a peripheral bit-field share one mechanism and "flag = bit N" needs no
+-- separate declaration (C2/C5). The register's type-level width is tied to the
+-- record (@Width a@), giving length-by-default. Returns the register reference
+-- and one 'CPUFlag' per field, in declaration (MSB-first) order.
+flagRec :: forall a. (HdlType a, Generic a, GFields (Rep a))
+        => String -> CPUDef (CPURegister (Width a), [CPUFlag])
+flagRec regName = CPUDef $ do
+    let layout    = bitLayout (Proxy @a)
+        w         = layoutSize layout
+        places    = layoutPlacements layout           -- MSB-first
+        flagNames = map plName places
+        flags     = [ CPUFlag regName (plPos p) | p <- places ]
     tell mempty
         { schRegisters  = [(regName, w)]
         , schStatusRegs = [(regName, w, flagNames)]

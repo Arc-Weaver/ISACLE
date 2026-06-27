@@ -52,7 +52,7 @@ import GHC.TypeLits (natVal)
 import Hdl.Net (Repr(..))
 import Hdl.Prim (Unsigned)
 import Hdl.Types (HdlType, hdlRepr, Width, GFields)
-import Isacle.System.Layout (bitLayout, layoutSize, layoutPlacements, plPos, plHi, plName)
+import Isacle.Layout (bitLayout, layoutSize, layoutPlacements, plPos, plHi, plName)
 import GHC.Generics (Generic, Rep)
 import Isacle.System.Spec (NullSig(..))
 

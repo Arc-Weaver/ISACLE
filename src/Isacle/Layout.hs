@@ -18,7 +18,7 @@
 -- three. The bit-position case ('bitLayout') is /derived for free/ from a record
 -- 'HdlType' (C2): a flag's bit offset is simply its position in the record's
 -- MSB-first flatten, so "flag = bit N of SREG" needs no separate declaration.
-module Isacle.System.Layout
+module Isacle.Layout
     ( Placement(..)
     , plHi
     , Layout(..)

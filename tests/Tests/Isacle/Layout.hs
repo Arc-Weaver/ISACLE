@@ -4,20 +4,24 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE DataKinds #-}
 
--- | Tests for the shared address-mapping helper ('Isacle.System.Layout'): that
--- a record 'HdlType''s bit positions are derived MSB-first, that explicit
--- address windows lay out as given, and that 'placeAt' shifts a window's flat
--- view to a base — the same operation cores and buses both rely on.
-module Tests.Isacle.System.Layout (runLayoutTests) where
+-- | Tests for the shared address-mapping helper ('Isacle.Layout'): that a
+-- record 'HdlType''s bit positions are derived MSB-first, that explicit address
+-- windows lay out as given, that 'placeAt' shifts a window's flat view to a base
+-- (the same operation cores and buses both rely on), and that the core-side
+-- 'flagRec' derives CPU flags from the very same record layout.
+module Tests.Isacle.Layout (runLayoutTests) where
 
 import Prelude
 import Data.Proxy (Proxy(..))
+import Data.List  (sortOn)
 import GHC.Generics (Generic, Rep)
 import System.Exit (exitFailure)
 
 import Hdl.Types (HdlType(..), GWidth, genericToBits, genericFromBits)
 import Hdl.Bits  (Bit)
-import Isacle.System.Layout
+import Isacle.Layout
+import Isacle.ISA.CPUDef (flagRec, runCPUDef, CPUSchema(..))
+import Isacle.ISA.Types  (CPUFlag(..))
 
 assert :: String -> Bool -> IO ()
 assert msg False = putStrLn ("FAIL: " ++ msg) >> exitFailure
@@ -52,5 +56,19 @@ runLayoutTests = do
     let placed = placeAt 0x100 win
     assert "UDR placed at 0x100"  ((plPos <$> find' "UDR"  placed) == Just 0x100)
     assert "UBRR placed at 0x102" ((plPos <$> find' "UBRR" placed) == Just 0x102)
+
+    -- Core-side flagRec: a CPU status register declared from the same Sreg
+    -- record derives its flags from the same layout the peripheral path uses.
+    let ((_reg, flags), sch) = runCPUDef (flagRec @Sreg "SREG")
+    assert "flagRec declares an 8-bit SREG"
+        (schRegisters sch == [("SREG", 8)])
+    assert "flagRec records flag names MSB-first"
+        (schStatusRegs sch == [("SREG", 8, ["fI","fT","fH","fS","fV","fN","fZ","fC"])])
+    -- Bit positions match the record layout: fI=7 … fC=0, all in SREG.
+    assert "flagRec flag bits agree with bitLayout"
+        (sortOn fst [ (cpuFlagBit f, cpuFlagReg f) | f <- flags ]
+            == [ (plPos p, "SREG") | p <- sortOn plPos (layoutPlacements l) ])
+    assert "flag fC is bit 0 of SREG"
+        (any (\f -> cpuFlagBit f == 0 && cpuFlagReg f == "SREG") flags)
   where
     find' n = foldr (\p acc -> if plName p == n then Just p else acc) Nothing
