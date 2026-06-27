@@ -18,6 +18,7 @@ module Isacle.System.Periph
       -- * Register / field declarations (metadata)
     , field
     , field8
+    , fieldOf
     , register
       -- * Spec types
     , PeriphSpec(..)
@@ -39,13 +40,17 @@ module Isacle.System.Periph
 
 import Prelude
 import Data.Kind (Type)
+import Data.Proxy (Proxy(..))
 import Data.Word (Word8, Word32)
 import Control.Monad.Fix (MonadFix)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
+import GHC.TypeLits (natVal)
 
+import Hdl.Net (Repr(..))
 import Hdl.Prim (Unsigned)
+import Hdl.Types (HdlType, hdlRepr, Width)
 import Isacle.System.Spec (NullSig(..))
 
 -- ---------------------------------------------------------------------------
@@ -76,6 +81,8 @@ data FieldSpec = FieldSpec
     , fieldAccess    :: RegAccess
     , fieldName      :: String
     , fieldDesc      :: String
+    , fieldRepr      :: Repr        -- ^ how software should interpret the bits
+                                    --   (signed/unsigned/…); drives C-header types.
     , fieldBitFields :: [BitField]
     } deriving (Show)
 
@@ -255,18 +262,43 @@ onRead off sig = PeriphDef $ do
 -- Structural metadata declarations
 -- ---------------------------------------------------------------------------
 
+-- | Core field declaration: explicit width + representation.
+fieldFull :: RegWidth -> Repr -> RegAccess -> Word8 -> String -> String
+          -> PeriphDef p sig dat ()
+fieldFull width repr acc off name desc = PeriphDef $ lift $ modify $ \a ->
+    a { paFields = paFields a ++ [FieldSpec off width acc name desc repr []] }
+
+-- | Untyped register declaration: the bits are treated as unsigned.
 field :: RegWidth -> RegAccess -> Word8 -> String -> String
       -> PeriphDef p sig dat ()
-field width acc off name desc = PeriphDef $ lift $ modify $ \a ->
-    a { paFields = paFields a ++ [FieldSpec off width acc name desc []] }
+field width = fieldFull width RUnsigned
 
 field8 :: RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
 field8 = field RW8
 
+-- | Typed register declaration: the register's software type is given by an
+-- 'HdlType', so its /width/ ('Width') and /representation/ ('hdlRepr',
+-- e.g. @Signed 8@ → signed) are recorded in the metadata.  This is what lets a
+-- documentation / C-header generator emit the correct C type (@int8_t@ vs
+-- @uint8_t@ …) — the bus is just wires, the interpretation lives here.
+--
+-- > fieldOf @(Signed 8) ReadWrite 0 "SETPOINT" "Target value"
+fieldOf :: forall a p sig dat. HdlType a
+        => RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+fieldOf = fieldFull (regWidthBits (fromIntegral (natVal (Proxy @(Width a)))))
+                    (hdlRepr (Proxy @a))
+  where
+    regWidthBits :: Int -> RegWidth
+    regWidthBits 8  = RW8
+    regWidthBits 16 = RW16
+    regWidthBits 32 = RW32
+    regWidthBits n  = error ("fieldOf: unsupported register width "
+                             ++ show n ++ " bits (expected 8, 16, or 32)")
+
 register :: RegWidth -> Word8 -> String -> String -> [BitField]
          -> PeriphDef p sig dat ()
 register width off name desc bfs = PeriphDef $ lift $ modify $ \a ->
-    a { paFields = paFields a ++ [FieldSpec off width ReadWrite name desc bfs] }
+    a { paFields = paFields a ++ [FieldSpec off width ReadWrite name desc RUnsigned bfs] }
 
 bitF :: RegAccess -> Word8 -> String -> String -> BitField
 bitF acc b = BitField b b acc

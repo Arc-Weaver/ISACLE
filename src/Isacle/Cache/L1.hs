@@ -58,10 +58,10 @@ newtype CacheHandle = CacheHandle
 -- has no caching effect.  Replace the body of this function with a real
 -- tag/data-array implementation to add actual caching.
 synthL1Cache
-    :: forall dom wordW addrW.
+    :: forall dom wordW addrW busAddrW dat.
        ( KnownDom dom, KnownNat wordW, KnownNat addrW )
     => CacheConfig
-    -> BusHandle       -- ^ unified system bus (cache acts as sole bus master)
+    -> BusHandle busAddrW dat  -- ^ unified system bus (cache acts as sole bus master)
     -> NetM CacheHandle
 synthL1Cache _cfg busH = do
     let domInfo  = domId (Proxy @dom)

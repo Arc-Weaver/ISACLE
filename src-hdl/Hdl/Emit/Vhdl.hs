@@ -77,6 +77,7 @@ reprOf wid nodes =
     case [ r | NRepr w r <- nodes, w == wid ] of
       (r:_) -> r
       []    -> case [ (op, ins) | NComb o op ins <- nodes, o == wid ] of
+                 ((PReinterpret r, _):_) -> r   -- a cast wire's repr is its target
                  ((op, ins):_) -> maybe RUnsigned (`reprOf` nodes) (reprSource op ins)
                  []            -> RUnsigned
   where
@@ -638,34 +639,38 @@ combExpr nm ns op ins = case (op, ins) of
     (PAnd,  [a,b]) | a == b -> w a   -- identity: hinted a and a → a
     -- 1-bit unsigned arithmetic is mod-2: a+b = a-b = a xor b, a*b = a and b.
     -- (A width-1 wire is std_logic, which has no numeric_std "+".)
-    (PAdd,  [a,b]) -> arithOp ns " + "   " xor " a b
-    (PSub,  [a,b]) -> arithOp ns " - "   " xor " a b
+    (PAdd,  [a,b]) -> arithOp (dataRepr [a,b]) " + " " xor " a b
+    (PSub,  [a,b]) -> arithOp (dataRepr [a,b]) " - " " xor " a b
     (PMul,  [a,b])
         | max (inferWidth a ns) (inferWidth b ns) == 1 -> w a ++ " and " ++ w b
         | otherwise ->
-            let aw = inferWidth a ns
+            let r  = dataRepr [a,b]
+                aw = inferWidth a ns
                 bw = inferWidth b ns
                 ow = max aw bw
-                prod = widthPad ow aw a ++ " * " ++ widthPad ow bw b
+                prod = widthPad r ow aw a ++ " * " ++ widthPad r ow bw b
             in if ow < aw + bw
                then "resize(" ++ prod ++ ", " ++ show ow ++ ")"
                else prod
-    (PAnd,  [a,b]) -> binOp ns " and " a b
-    (POr,   [a,b]) -> binOp ns " or "  a b
-    (PXor,  [a,b]) -> binOp ns " xor " a b
+    (PAnd,  [a,b]) -> binOp (dataRepr [a,b]) " and " a b
+    (POr,   [a,b]) -> binOp (dataRepr [a,b]) " or "  a b
+    (PXor,  [a,b]) -> binOp (dataRepr [a,b]) " xor " a b
     (PNot,  [a])   -> "not " ++ w a
     (PMux,  [s,t,f]) ->
-        let tw = inferWidth t ns
+        let r  = dataRepr [t,f]
+            tw = inferWidth t ns
             fw = inferWidth f ns
             ow = max tw fw
             fit sw src
-                | sw == ow  = w src
+                | sw == ow  = castLit r src
                 | sw == 1   = "resize(unsigned'(0 => " ++ w src ++ "), " ++ show ow ++ ")"
-                | ow > 1    = "resize(" ++ w src ++ ", " ++ show ow ++ ")"
+                | ow > 1    = "resize(" ++ castLit r src ++ ", " ++ show ow ++ ")"
                 | otherwise = w src
         in fit tw t ++ " when " ++ w s ++ " = '1' else " ++ fit fw f
-    (PEq,   [a,b]) -> "'1' when " ++ w a ++ " = " ++ w b ++ " else '0'"
-    (PLt,   [a,b]) -> "'1' when " ++ w a ++ " < " ++ w b ++ " else '0'"
+    (PEq,   [a,b]) -> let r = dataRepr [a,b]
+                      in "'1' when " ++ castLit r a ++ " = " ++ castLit r b ++ " else '0'"
+    (PLt,   [a,b]) -> let r = dataRepr [a,b]
+                      in "'1' when " ++ castLit r a ++ " < " ++ castLit r b ++ " else '0'"
     (PSlice hi lo, [a])
         | inferWidth a ns == 1 -> w a   -- 1-bit source is std_logic; its only bit is itself
         | hi == lo  -> w a ++ "(" ++ show hi ++ ")"
@@ -682,25 +687,44 @@ combExpr nm ns op ins = case (op, ins) of
                 else w a ++ "(" ++ show (tgt-1) ++ " downto 0)"
     (PSignedResize tgt, [a]) ->
         "unsigned(resize(signed(" ++ w a ++ "), " ++ show tgt ++ "))"
+    -- Same-width reinterpretation: a VHDL type cast (same bits).  1-bit wires are
+    -- std_logic in either representation, so the cast is the identity there.
+    (PReinterpret r, [a])
+        | inferWidth a ns == 1 -> w a
+        | otherwise            -> reprCast r ++ "(" ++ w a ++ ")"
     (PLit v bw, []) -> ppLit (SomeBits v bw)
     (PShiftL, [a,b]) -> "shift_left("  ++ w a ++ ", to_integer(" ++ w b ++ "))"
     (PShiftR, [a,b]) -> "shift_right(" ++ w a ++ ", to_integer(" ++ w b ++ "))"
     _ -> "/* unhandled " ++ show op ++ " */"
   where
     w = lookupWire nm
-    widthPad ow sw src
-        | sw == ow  = w src
+    reprCast RSigned   = "signed"
+    reprCast RUnsigned = "unsigned"
+    -- The representation a numeric op operates in: a literal operand carries no
+    -- representation of its own (it is a shared @unsigned@ bit-pattern constant),
+    -- so the op's repr is taken from its first non-literal data operand.  When
+    -- that is signed, literal operands must be cast to keep numeric_std types
+    -- consistent (and to pick the signed overload).  All-unsigned ops are
+    -- unaffected — the output is byte-for-byte identical.
+    dataRepr xs = case [ reprOf x ns | x <- xs, not (isLitWire x ns) ] of
+                    (r:_) -> r
+                    []    -> RUnsigned
+    castLit r src
+        | r == RSigned, isLitWire src ns, inferWidth src ns > 1 = "signed(" ++ w src ++ ")"
+        | otherwise                                             = w src
+    widthPad r ow sw src
+        | sw == ow  = castLit r src
         | sw == 1   = "resize(unsigned'(0 => " ++ w src ++ "), " ++ show ow ++ ")"
-        | otherwise = "resize(" ++ w src ++ ", " ++ show ow ++ ")"
-    binOp nodes' opr a b =
-        let aw = inferWidth a nodes'
-            bw = inferWidth b nodes'
+        | otherwise = "resize(" ++ castLit r src ++ ", " ++ show ow ++ ")"
+    binOp r opr a b =
+        let aw = inferWidth a ns
+            bw = inferWidth b ns
             ow = max aw bw
-        in widthPad ow aw a ++ opr ++ widthPad ow bw b
+        in widthPad r ow aw a ++ opr ++ widthPad r ow bw b
     -- Arithmetic that degrades to a boolean op at width 1 (std_logic has no "+").
-    arithOp nodes' arithOpr boolOpr a b
-        | max (inferWidth a nodes') (inferWidth b nodes') == 1 = w a ++ boolOpr ++ w b
-        | otherwise = binOp nodes' arithOpr a b
+    arithOp r arithOpr boolOpr a b
+        | max (inferWidth a ns) (inferWidth b ns) == 1 = w a ++ boolOpr ++ w b
+        | otherwise = binOp r arithOpr a b
 
 -- ---------------------------------------------------------------------------
 -- Width inference
@@ -732,6 +756,7 @@ inferOpWidth :: PrimOp -> [WireId] -> [NetNode] -> Int
 inferOpWidth (PLit _ w)     _         _ = w
 inferOpWidth (PResize w)    _         _ = w
 inferOpWidth (PSignedResize w) _      _ = w
+inferOpWidth (PReinterpret _) (a:_)  ns = inferWidth a ns
 inferOpWidth (PSlice hi lo) _         _ = hi - lo + 1
 inferOpWidth PConcat        ins       ns = sum (map (`inferWidth` ns) ins)
 inferOpWidth PEq            _         _  = 1
