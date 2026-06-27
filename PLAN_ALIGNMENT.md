@@ -178,10 +178,29 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
     linker-script; `reduceSystem` bundles all from one elaboration.
   - **C1 AVR core SREG → record** (isacle `add23e6`, clavr `16d6b5f`): the AVR
     status register is now a bit-map record `HdlType`, flags derived via
-    `flagRec`. GHDL-verified (8/8 clavr sim tests). Whole-`AVRALU`-as-`HdlType`
-    + `pcW` elimination remains (needs H4 arrays + typed register-file projection).
-- **Remaining:** Phase C S2/S3 (crossing strategy; registers-out-of-`Sig` — both
-  stylistic/additive); Phase D core-as-`HdlType` re-expression of the AVR core +
-  ISA width typecheck (A2); Phase F heterogeneous SystemDSL (multi-domain/width/CPU)
-  — the large, design-heavy redesigns. Sub-instance + RAM simulation would extend
-  the sim to whole SoCs.
+    `flagRec`. GHDL-verified (8/8 clavr sim tests).
+- **Session 2 (overnight, additive + hardening):**
+  - **H4 array `HdlType`** (`cbdeb4d`): `Vec n a` is `HdlType` (Width = n·Width a,
+    MSB-first pack) — an array is a first-class record field.
+  - **C1 core state as record** (clavr `2291e28`): `AvrState pcW` — the whole AVR
+    state as one recursive `HdlType` (Vec gpr + Sreg + scalars), Width 344,
+    round-trips. Additive (handle machinery still drives synthesis).
+  - **A3 + BU6 width axis** (`5cd06cd`): interrupt-as-instruction uniformity
+    confirmed; `canDriveWidth` (cW ≤ mW, narrow→wide is a compile error).
+  - **PE2** (`a4f2da9`): `regField`/`roField` fuse typed-field declaration with
+    write/read logic (name/offset/width/repr single-sourced).
+  - **DEFINITIONS.md** (`a4159d4`): consolidated to the target organisation
+    (Part I HDL / Part II CPU·Bus&periph·Address-mapping·SystemDSL).
+  - **sim** (`a67d534`): 3-level hierarchy flatten+sim test; corrected the
+    whole-SoC limitation to its real scope (external/primitive sub-instances are
+    dropped, not "deep hierarchy").
+  - **regsFromRecord** (`29cfd23`): single-source CPU registers from a record
+    (reframe step 2 groundwork; H4 array field → width).
+  - **PLAN_CORE_REFRAME.md** (`d08746d`): ordered, GHDL-verified-per-step plan for
+    the supervised whole-core migration.
+  - *Verified:* full pass — ISACLE tests, cl51 18, clavr 8/8 GHDL — all green.
+- **Remaining (large, supervised):** whole-`AVRALU`-as-`HdlType` access +
+  `pcW` elimination (PLAN_CORE_REFRAME.md steps 3–4); Phase F heterogeneous
+  SystemDSL (multi-domain/width/CPU + per-CPU reductions); type-level A2;
+  BurstBus interconnect; structure-preserving `Vec` *wire* emission; whole-SoC
+  sim of external primitives.
