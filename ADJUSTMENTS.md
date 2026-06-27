@@ -516,6 +516,13 @@ repeated calls but share that single `dom`/`dat`; `createBus` is one linear bus.
   The heterogeneous topology (domains, buses, CPUs) is internal to the combined
   type; reduction projects it out. (Distinction matters: the combined system type
   carries more than the Hdl arrow exposes — same is/reduces nuance as the core.)
+  - *Reduction layer done* (commit `9645ab3`, `Isacle.System.Reduce`): the
+    "reduces to, not is" relation is now first-class — `reduceToHdl` (Hdl I/O),
+    `reduceToDoc` (BU5 introspection), `reduceToMemoryMap`/`reduceToCHeader`/
+    `reduceToLinkerScript` (SY6 renders), bundled by `reduceSystem`. The
+    remaining SY7 target is the *combined heterogeneous system type* these
+    project from (depends on SY2/SY3/SY4) — today they reduce the single-`dom`/
+    `dat` `SysDSL`, and the maps are still global (per-CPU is SY6/SY5).
 
 ## Target organization (for the DEFINITIONS.md consolidation)
 
