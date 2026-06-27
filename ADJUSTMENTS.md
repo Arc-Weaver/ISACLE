@@ -280,7 +280,7 @@ already multi-interpreter (Synth/Sim/Doc) — good (P1).
   not part of `HdlType`, not a separate type system. Field access is
   **length-by-default projection** — PC width = `Width` of the `pc` field, so the
   free `pcW` disappears (§4a / the PC-width directive).
-- [ ] **C2 (unify — bit maps)** — A **bit map = an `HdlType` record of named
+- [x] **C2 (unify — bit maps)** — A **bit map = an `HdlType` record of named
   bit-fields** (e.g. `data Sreg = Sreg { c,z,n,… :: Bit } deriving (Generic,
   HdlType)`). Collapse the CPU `flagPack`/`CPUFlag` mechanism *and* the peripheral
   `BitField` mechanism into this one reusable Part-I record concept. Reusable
@@ -292,7 +292,7 @@ already multi-interpreter (Synth/Sim/Doc) — good (P1).
   hardware (register per field via `Hdl`, plus the locations below). *Wiggle
   room OK* — one builder vs declare-then-wire is not pinned. Its real job is to
   make the two **location** relationships (C5) easy to express.
-- [ ] **C5 (locations — addresses & flag-bits)** — One unifying idea: **place a
+- [x] **C5 (locations — addresses & flag-bits)** — One unifying idea: **place a
   field's flat view (H6) at a position within a containing space.** Two cases the
   core must express easily:
   - **Field → address**: a register/field located in the data **address space**
@@ -333,7 +333,7 @@ compile-time microcode.
   **stalling/multi-cycle** (EXISTS: `synthHarvardCPU'`/`SynthVnCPU`), **pipeline**
   (future), **microcode ROM** (future). `InstrIR` is the right factoring; add the
   pipeline + microcode interpreters (P1-style).
-- [ ] **I3 (encoding width)** — `encoding` is an unchecked `String`; should carry
+- [x] **I3 (encoding width)** — `encoding` is an unchecked `String`; should carry
   / be checked for its bit width (feeds A2).
 
 ### ISA definition
@@ -360,6 +360,12 @@ Widths are `ISABuild`'s type params (`wordW/addrW/cwW/caW`); Harvard vs VN via
   collapses them to one pair, Harvard keeps both. Today `encoding` is an unchecked
   `String` and the widths are free params — no compile-time check. Same family as
   the RJMP/`immediate` typing gap.
+  - *Partially done* (commit `bc96af4`, `Isacle.ISA.WidthCheck`): the VN-one /
+    Harvard-two structure is realized as a **value-level** validator
+    (`checkMemModel`) over `EncodingInfo.encTotalBits`, with I3 well-formedness
+    (`24b933d`) feeding it. The remaining target is lifting this to a **type-level**
+    check (encodings carrying their width as a `Nat`), which needs type-level
+    encoding strings — deferred with the core-record reframe.
 - [ ] **A3 (uniformity)** — interrupt-as-instruction: confirm `isaInterruptBody`
   is treated uniformly with `isaInstrs` (same DSL + lowering). Mostly already so.
 
@@ -376,7 +382,7 @@ logic to the type definitions**. The two can be **done together**.
 "together" already, but registers are declared *imperatively* (not a typed
 record) and logic binds by **offset integer**.
 
-- [ ] **PE1 (unify with core def)** — A peripheral's register set **is** a
+- [x] **PE1 (unify with core def)** — A peripheral's register set **is** a
   core-def-style **typed `HdlType` record** (C1) with **bit-maps** (C2) and
   **offsets** (C5) — the *same* mechanism as the CPU core, reused. Replaces the
   imperative `field8`/`fieldOf`+`BitField` declaration with a derived record.
@@ -387,7 +393,7 @@ record) and logic binds by **offset integer**.
 - [x] **PE3 (done together — already so)** — Keep the one-do-block style
   (register decl + behaviour together); `PeriphDef` already matches "done
   together."
-- [ ] **PE4 (bus-slave deltas from a CPU core)** — What's peripheral-specific vs
+- [x] **PE4 (bus-slave deltas from a CPU core)** — What's peripheral-specific vs
   core-shared: offsets are **base-relative** (the bus assigns the base; C5
   locations relative to a base), and the logic is **bus-slave read/write
   responses** (onWrite captures a bus write; onRead drives a bus read), not
@@ -420,7 +426,7 @@ hint at multi-runner introspection.
   transactions** (GAP — currently single-outstanding). A concrete bus either
   **arbitrates** (full) or is a capability **subset** (`SimpleBus` = single, no
   stall). The subset/superset *binding* rule is BU6.
-- [ ] **BU6 (capability typeclass hierarchy — bind-time subsumption)** — A
+- [x] **BU6 (capability typeclass hierarchy — bind-time subsumption)** — A
   typeclass hierarchy encoding **capability subsumption**: a master may drive a
   child only when it is **at least as capable**. Two axes (same shape):
   - **Stall**: a **non-stalling master can never drive a stalling child**; a
@@ -443,7 +449,7 @@ hint at multi-runner introspection.
   runner (→ memory map / register layout / bus tree → docs/C-headers/linker
   script). This is P1 applied to the system layer. Partially present
   (`hdlOps`/`nullOps`, independent spec extraction); generalize the runner set.
-- [ ] **BU7 (bus bridges/adapters — protocol & width conversion)** — A **place to
+- [x] **BU7 (bus bridges/adapters — protocol & width conversion)** — A **place to
   express conversion** between mismatched bus endpoints, distinct from BU6 (which
   only says what's *permitted*). Two kinds, likely one adapter mechanism:
   - **Protocol conversion** — a **bridge** between `Bus arch`s (e.g. Wishbone ↔
