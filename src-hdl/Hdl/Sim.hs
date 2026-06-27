@@ -75,7 +75,7 @@ mask w = (1 `shiftL` w) - 1
 -- combinational nodes, registers (with enable), and representation tags;
 -- memories, ROMs, and sub-instances are not yet evaluated.
 simulateDesign :: [NetNode] -> Map String Integer -> Int -> [Map String Integer]
-simulateDesign nodes inputs nCycles = go initRegs nCycles
+simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
   where
     reprOfW w  = Map.findWithDefault RUnsigned w (Map.fromList [ (rw, r) | NRepr rw r <- nodes ])
     regWidth   = Map.fromList [ (nOut n, sbW)   | n@NReg{} <- nodes, let SomeBits _ sbW = nInit n ]
@@ -83,8 +83,11 @@ simulateDesign nodes inputs nCycles = go initRegs nCycles
     inputWires = [ (nPortName n, nOut n, nWidth n) | n@NInput{} <- nodes ]
     combs      = [ n | n@NComb{} <- nodes ]
 
-    go _    0 = []
-    go regs k = outs : go regs' (k - 1)
+    memInit = Map.fromList
+        [ (nOut n, Map.fromList (zip [0 ..] (nMemInit n))) | n@NMem{} <- nodes ]
+
+    go _              0 = []
+    go (regs, mems) k = outs : go (regs', mems') (k - 1)
       where
         seed = Map.fromList $
             [ (wid, ((inputs Map.! nm) .&. mask wdt, wdt, reprOfW wid))
@@ -92,7 +95,7 @@ simulateDesign nodes inputs nCycles = go initRegs nCycles
             ++
             [ (wid, (v, Map.findWithDefault 1 wid regWidth, reprOfW wid))
             | (wid, v) <- Map.toList regs ]
-        full = solve seed
+        full = solve mems seed
         outs = Map.fromList
             [ (nPortName n, v) | n@NOutput{} <- nodes
             , Just (v, _, _) <- [Map.lookup (nIn n) full] ]
@@ -102,18 +105,28 @@ simulateDesign nodes inputs nCycles = go initRegs nCycles
             | otherwise = case Map.lookup (nIn n) full of
                 Just (x, _, _) -> x
                 Nothing        -> Map.findWithDefault 0 (nOut n) regs
+        -- RAM writes: registered (rising edge) when the write enable is high.
+        mems' = Map.mapWithKey stepMem mems
+        stepMem memW st = case [ n | n@NMem{} <- nodes, nOut n == memW ] of
+            (n:_) | Just (en,_,_) <- Map.lookup (nMemWrEn n) full, en /= 0
+                  , Just (a,_,_)  <- Map.lookup (nMemWrA  n) full
+                  , Just (d,_,_)  <- Map.lookup (nMemWrD  n) full
+                      -> Map.insert a (d .&. mask (nMemDatW n)) st
+            _         -> st
 
     enabled n full = case nEn n of
         Nothing  -> True
         Just enW -> maybe True (\(ev, _, _) -> ev /= 0) (Map.lookup enW full)
 
-    roms = [ n | n@NRom{} <- nodes ]
+    roms     = [ n | n@NRom{} <- nodes ]
+    memNodes = [ n | n@NMem{} <- nodes ]
 
-    -- Fixpoint: evaluate combinational nodes (and ROM lookups) until no new wire
-    -- resolves.
-    solve known =
+    -- Fixpoint: evaluate combinational nodes, ROM lookups, and RAM reads until no
+    -- new wire resolves.
+    solve memState known =
         let kn1 = foldl tryComb known combs
             kn2 = foldl tryRom  kn1   roms
+            kn3 = foldl tryMem  kn2   memNodes
             tryComb kn n
                 | Map.member (nOut n) kn = kn
                 | otherwise = maybe kn
@@ -128,7 +141,15 @@ simulateDesign nodes inputs nCycles = go initRegs nCycles
                                   then nRomInit n !! a else 0
                         in Map.insert (nOut n) (v .&. mask (nRomDatW n), nRomDatW n, RUnsigned) kn
                     Nothing -> kn
-        in if Map.size kn2 == Map.size known then known else solve kn2
+            tryMem kn n
+                | Map.member (nOut n) kn = kn
+                | otherwise = case Map.lookup (nMemRdA n) kn of
+                    Just (addr, _, _) ->
+                        let v = Map.findWithDefault 0 addr
+                                  (Map.findWithDefault Map.empty (nOut n) memState)
+                        in Map.insert (nOut n) (v .&. mask (nMemDatW n), nMemDatW n, RUnsigned) kn
+                    Nothing -> kn
+        in if Map.size kn3 == Map.size known then known else solve memState kn3
 
 asSigned :: Integer -> Int -> Bool -> Integer
 asSigned v w True  | v >= 1 `shiftL` (w - 1) = v - (1 `shiftL` w)
