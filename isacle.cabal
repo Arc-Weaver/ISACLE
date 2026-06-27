@@ -135,6 +135,7 @@ library
     Isacle.System.HdlCircuit
     Isacle.Layout
     Isacle.System.Periph
+    Isacle.System.Reduce
     Isacle.System.Spec
     Isacle.System.SystemDSL
     Isacle.TH

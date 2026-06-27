@@ -15,6 +15,7 @@ import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
 import Isacle.System.HdlCircuit (GpioPhys(..))
 import Isacle.System.Generate (sysExtractMemoryMap)
+import Isacle.System.Reduce
 
 assert :: String -> Bool -> IO ()
 assert msg False = putStrLn ("FAIL: " ++ msg) >> exitFailure
@@ -74,6 +75,19 @@ runBusTests = do
          in adMasterWidth a == 32 && adChildWidth a == 8 && not (adInsertsStall a))
     assert "stall adapter inserts a handshake"
         (adInsertsStall (stallAdapter 8))
+
+    -- One description, many reductions (SY6/SY7/BU5): the same system reduces
+    -- to an Hdl netlist AND to software-facing renders, all from one run.
+    putStrLn "\n-- system reductions --"
+    let red = reduceSystem "gpiosys" (gpioBusSys pinSig)
+    assert "reduces to a non-empty Hdl netlist (SY7)"
+        (not (null (srHdlNodes red)))
+    assert "reduces to a memory map mentioning gpio (BU5/SY6)"
+        ("gpio" `isSubstr` srMemoryMap red)
+    assert "reduces to a C header with the guard (SY6)"
+        ("GPIOSYS_H" `isSubstr` srCHeader red)
+    assert "standalone reduceToHdl agrees with the bundle"
+        (length (snd (reduceToHdl (gpioBusSys pinSig))) == length (srHdlNodes red))
   where
     isSubstr _ []              = False
     isSubstr [] _              = True
