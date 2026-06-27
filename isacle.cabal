@@ -121,6 +121,7 @@ library
     Isacle.Periph.DMA
     Isacle.Periph.GPIO
     Isacle.Periph.Interrupt
+    Isacle.Periph.Ramp
     Isacle.Periph.Timer
     Isacle.Periph.UART
     Isacle.System

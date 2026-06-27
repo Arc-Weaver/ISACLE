@@ -41,10 +41,12 @@ module Isacle.System.SystemDSL
     , createUart
     , createGpio
     , createTimer
+    , createRamp
     , createRam
     , createRom
       -- * Utilities
     , sigFalse
+    , sigTrue
     , sysOutput
       -- * System documentation
     , SysDoc(..)
@@ -58,7 +60,7 @@ import Control.Monad (forM, forM_, replicateM, zipWithM_)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
 import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal, KnownNat)
+import GHC.TypeLits (natVal, KnownNat, type (<=))
 
 import Hdl.Net
 import Hdl.Types
@@ -74,6 +76,7 @@ import Isacle.System.HdlCircuit
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
 import Isacle.Periph.UART  (uartDefWithFSM, UART)
 import Isacle.Periph.Timer (timerDefWithFSM, Timer)
+import Isacle.Periph.Ramp  (rampDefWithFSM, Ramp)
 import Isacle.ISA.CPUDef (CPUDef)
 import Isacle.ISA.Def    (ISADef, isaInterruptBody)
 import Isacle.ISA.Build (ISABuild)
@@ -287,7 +290,7 @@ createBus
        (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> BusDSL dom dat a
-    -> SysDSL dom dat (a, BusHandle)
+    -> SysDSL dom dat (a, BusHandle 32 (Width dat))
 createBus busName (BusDSL busSt) = SysDSL $ do
     -- System-level master wires the CPU drives.  These remain the BusHandle
     -- master interface for now; the CPU-side unified port arrives with the
@@ -429,15 +432,16 @@ createSimpleVectorIrq _sources = pure $
 --
 -- The CPU address width (@addrW@) may differ from the bus address width
 -- (always 32-bit); a zero-extend resize is inserted automatically.
-createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
+createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat busAddrW alu.
               ( KnownDom dom
               , KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW
+              , KnownNat busAddrW, addrW <= busAddrW
               , HdlType dat
               )
            => String
            -> CPUDef alu
            -> ISADef (ISABuild alu (Width dat) addrW codeWordW codeAddrW)
-           -> BusHandle
+           -> BusHandle busAddrW (Width dat)
            -> [Integer]
            -> SysDSL dom dat ()
 createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
@@ -548,10 +552,10 @@ createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
 -- to the bus and returns bus read data to the CPU.  In the current stub
 -- implementation, stall is always 0 (pass-through, no actual caching).
 createL1Cache
-    :: forall dom wordW addrW dat.
-       ( KnownDom dom, KnownNat wordW, KnownNat addrW, HdlType dat )
+    :: forall dom wordW addrW busAddrW busDataW dat.
+       ( KnownDom dom, KnownNat wordW, KnownNat addrW, KnownNat busAddrW, HdlType dat )
     => CacheConfig
-    -> BusHandle
+    -> BusHandle busAddrW busDataW
     -> SysDSL dom dat CacheHandle
 createL1Cache cfg busH = SysDSL $ lift $
     synthL1Cache @dom @wordW @addrW cfg busH
@@ -685,6 +689,21 @@ createTimer name tick = pure $ PeriphToken
     , ptAddrSize = 0
     }
 
+-- | Create a signed-ramp peripheral token (PLAN_TYPED_HDL #3 demonstrator).
+-- The bus carries @Unsigned 8@ but the internal datapath is @Signed 8@; the
+-- ramp moves its CURRENT value toward SETPOINT by STEP each tick.  Register
+-- map: 0 SETPOINT (RW), 1 STEP (RW), 2 CURRENT (RO).
+createRamp
+    :: KnownDom dom
+    => String
+    -> Sig dom Bool                  -- ^ tick / advance enable
+    -> SysDSL dom (Unsigned 8) (PeriphToken Ramp dom (Unsigned 8) ())
+createRamp name tick = pure $ PeriphToken
+    { ptName     = name
+    , ptDef      = rampDefWithFSM tick
+    , ptAddrSize = 0
+    }
+
 -- | Create a synchronous block RAM peripheral token.
 -- Attach with @attachPeripheral base ram0@; the RAM occupies @size@ entries
 -- starting at @base@.
@@ -732,4 +751,11 @@ sigFalse :: Sig dom Bool
 sigFalse = SExpr $ do
     out <- freshWire
     emit $ NComb out (PLit 0 1) []
+    pure out
+
+-- | Constant-true Bool signal (1-bit one literal).
+sigTrue :: Sig dom Bool
+sigTrue = SExpr $ do
+    out <- freshWire
+    emit $ NComb out (PLit 1 1) []
     pure out

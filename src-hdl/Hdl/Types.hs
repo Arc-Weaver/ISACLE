@@ -7,6 +7,7 @@ module Hdl.Types
     , materialize
       -- * Representation tagging
     , withRepr
+    , sigReinterpret
       -- * Combinational operations
     , (.==.)
     , (.<.)
@@ -96,6 +97,16 @@ withRepr s = SExpr $ do
     w <- materialize s
     reprWire w (hdlRepr (Proxy @a))
     pure w
+
+-- | Reinterpret a signal's bits as another representation of the /same width/
+-- (e.g. @Unsigned n@ ↔ @Signed n@).  Unlike 'withRepr', which retags a leaf
+-- wire in place, this emits a distinct cast wire (VHDL @signed(..)@\/@unsigned(..)@),
+-- so the source wire keeps its own representation and may still be used under it.
+-- This is the seam to cross between an unsigned bus and a signed datapath.
+sigReinterpret :: forall b dom a. HdlType b => Sig dom a -> Sig dom b
+sigReinterpret s = SExpr $ do
+    w <- materialize s
+    lookupOrEmit (PReinterpret (hdlRepr (Proxy @b))) [w]
 
 -- ---------------------------------------------------------------------------
 -- Comparison and logical operations

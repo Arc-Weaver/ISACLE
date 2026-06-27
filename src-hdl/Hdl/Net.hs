@@ -103,6 +103,7 @@ data PrimOp
     | PConcat
     | PResize Int
     | PSignedResize Int   -- ^ sign-extend from src width to target width, return unsigned
+    | PReinterpret Repr   -- ^ same-width bit reinterpretation (VHDL signed()/unsigned() cast)
     | PLit Integer Int
     | PShiftL   -- ^ logical shift left  (a, amount)
     | PShiftR   -- ^ logical shift right (a, amount)
@@ -127,7 +128,7 @@ data SomeBits = SomeBits
 -- numeric_std overloading pick the right arithmetic.  Deliberately extensible
 -- (fixed-point, enums, … add a constructor here + an emitter case).
 data Repr = RUnsigned | RSigned
-    deriving (Eq, Show)
+    deriving (Eq, Ord, Show)
 
 data NetNode
     = NReg
