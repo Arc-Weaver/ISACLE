@@ -373,8 +373,13 @@ Widths are `ISABuild`'s type params (`wordW/addrW/cwW/caW`); Harvard vs VN via
     (`24b933d`) feeding it. The remaining target is lifting this to a **type-level**
     check (encodings carrying their width as a `Nat`), which needs type-level
     encoding strings — deferred with the core-record reframe.
-- [ ] **A3 (uniformity)** — interrupt-as-instruction: confirm `isaInterruptBody`
-  is treated uniformly with `isaInstrs` (same DSL + lowering). Mostly already so.
+- [x] **A3 (uniformity)** — interrupt-as-instruction: confirmed. In all three
+  backends (`SynthCPU`, `SynthVnCPU`, `Sim`) both `isaInstrs` and
+  `isaInterruptBody` go through the *identical* pipeline — `runISABuild aluRec`
+  (the same `MonadALU` DSL) → `renderSynth`/`renderInstrSim` (the same lowering).
+  The interrupt body differs only in passing the pending-gate (`Just irqPendW`)
+  and an IRQ-vector context — the semantic difference of an interrupt, not a
+  separate mechanism. Uniform by construction.
 
 ## Peripheral — `PeriphDef` (typed register block + bound HDL logic)
 

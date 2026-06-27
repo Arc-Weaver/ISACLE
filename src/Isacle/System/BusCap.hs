@@ -3,6 +3,8 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 -- | Bus capability hierarchy and crossing adapters (BU6 / BU7).
 --
@@ -25,6 +27,7 @@ module Isacle.System.BusCap
       Capability(..)
     , Subsumes
     , canDrive
+    , canDriveWidth
       -- * Crossing adapters (BU7)
     , BusAdapter(..)
     , widthAdapter
@@ -33,6 +36,7 @@ module Isacle.System.BusCap
 
 import Prelude
 import Data.Proxy (Proxy)
+import GHC.TypeLits (Nat, type (<=))
 
 -- | A bus port's stall capability: whether it participates in a handshake.
 data Capability = NonStalling | Stalling
@@ -57,6 +61,15 @@ instance Subsumes 'NonStalling 'NonStalling
 -- make the rule enforced rather than merely documented.
 canDrive :: Subsumes m c => Proxy m -> Proxy c -> ()
 canDrive _ _ = ()
+
+-- | Width subsumption (BU6, width axis): a master may drive a slave only when
+-- its data width is at least the slave's — a 32-bit master can read/write an
+-- 8-bit slave, but an 8-bit master cannot drive a 32-bit slave. Witnessed by the
+-- type-level @<=@ (child width ≤ master width), so the narrow-drives-wide case
+-- is a compile error.
+canDriveWidth :: forall (mW :: Nat) (cW :: Nat). (cW <= mW)
+              => Proxy mW -> Proxy cW -> ()
+canDriveWidth _ _ = ()
 
 -- | A crossing between two bus faces (BU7). Records the master-side and
 -- child-side capability and data width so a runner can introspect the

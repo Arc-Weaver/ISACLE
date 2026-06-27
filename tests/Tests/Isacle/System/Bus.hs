@@ -9,7 +9,7 @@ import System.Exit (exitFailure)
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
 import Isacle.System.BusCap
-    ( Capability(..), canDrive, BusAdapter(..), widthAdapter, stallAdapter )
+    ( Capability(..), canDrive, canDriveWidth, BusAdapter(..), widthAdapter, stallAdapter )
 import Hdl.Types (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
@@ -68,6 +68,13 @@ runBusTests = do
         (canDrive (Proxy @'Stalling)    (Proxy @'NonStalling) == ())
     assert "non-stalling drives non-stalling"
         (canDrive (Proxy @'NonStalling) (Proxy @'NonStalling) == ())
+
+    -- Width axis: a wider (or equal) master may drive a narrower slave; the
+    -- forbidden narrow→wide case (8-bit master, 32-bit slave) has no @<=@ witness.
+    assert "32-bit master drives 8-bit slave"
+        (canDriveWidth (Proxy @32) (Proxy @8) == ())
+    assert "8-bit master drives 8-bit slave"
+        (canDriveWidth (Proxy @8) (Proxy @8) == ())
 
     -- Crossing adapters (BU7): widths recorded for introspection.
     assert "width adapter records 32->8"
