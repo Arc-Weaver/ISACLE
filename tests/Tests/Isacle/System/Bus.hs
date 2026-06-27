@@ -95,6 +95,12 @@ runBusTests = do
         ("GPIOSYS_H" `isSubstr` srCHeader red)
     assert "standalone reduceToHdl agrees with the bundle"
         (length (snd (reduceToHdl (gpioBusSys pinSig))) == length (srHdlNodes red))
+    assert "reduceToDesign yields a non-empty hierarchical design"
+        (not (null (reduceToDesign "gpiosys" (gpioBusSys pinSig))))
+    assert "reduceToLinkerScript mentions MEMORY"
+        ("MEMORY" `isSubstr` srLinkerScript red)
+    assert "reduceToMemoryMap standalone agrees with bundle"
+        (reduceToMemoryMap (gpioBusSys pinSig) == srMemoryMap red)
   where
     isSubstr _ []              = False
     isSubstr [] _              = True
