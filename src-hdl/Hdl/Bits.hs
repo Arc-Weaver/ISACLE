@@ -5,6 +5,8 @@
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE TypeOperators       #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE NoStarIsType        #-}
 -- | Clash-free bit-vector types for ISA simulation and pure combinational
 -- logic.  A single @import Hdl.Bits@ provides everything needed:
 -- bit types, numeric instances, bit-vector operations, and the 'Bits'
@@ -47,7 +49,7 @@ import Prelude hiding (repeat, (!!))
 import qualified Prelude as P
 import Data.Bits (Bits(..), FiniteBits(..))
 import Data.Proxy (Proxy(..))
-import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
+import GHC.TypeLits (KnownNat, Nat, natVal, type (+), type (*))
 
 import Hdl.Prim (Unsigned(..), Bit(..))
 import Hdl.Types (HdlType(..))
@@ -118,6 +120,24 @@ newtype Vec (n :: Nat) a = Vec [a]
 
 instance Show a => Show (Vec n a) where
     show (Vec xs) = show xs
+
+-- | A 'Vec' of 'HdlType' elements is itself an 'HdlType' (H4): its width is the
+-- element width times the count, and it packs MSB-first — element 0 occupies
+-- the highest bits, mirroring the record packing ('genericToBits') so an array
+-- field of a core/peripheral record behaves like any other field. The value
+-- representation is flat (the elements' bits concatenated); structure-preserving
+-- VHDL-array emission is a separate signal-layer concern.
+instance (HdlType a, KnownNat n, KnownNat (n * Width a))
+      => HdlType (Vec n a) where
+    type Width (Vec n a) = n * Width a
+    toBits (Vec xs) = foldl (\acc x -> (acc `shiftL` w) .|. toBits x) 0 xs
+      where w = fromIntegral (natVal (Proxy @(Width a)))
+    fromBits packed = Vec
+        [ fromBits ((packed `shiftR` (w * (cnt - 1 - i))) .&. mask) | i <- [0 .. cnt - 1] ]
+      where
+        w    = fromIntegral (natVal (Proxy @(Width a)))
+        cnt  = fromIntegral (natVal (Proxy @n))
+        mask = (1 `shiftL` w) - 1
 
 (!!) :: Vec n a -> Index n -> a
 Vec xs !! i = xs P.!! i

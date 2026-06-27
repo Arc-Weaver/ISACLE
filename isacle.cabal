@@ -233,6 +233,7 @@ test-suite test-library
     Tests.Isacle.ISA.WidthCheck
     Tests.Isacle.System.Bus
     Tests.Isacle.Layout
+    Tests.Isacle.HdlTypes
     Tests.Isacle.Sim
   build-depends:
     base >= 4.12 && < 4.22,

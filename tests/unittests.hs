@@ -11,6 +11,7 @@ import qualified Tests.Isacle.Periph.UART      as UART
 import qualified Tests.Isacle.Periph.DMA       as DMA
 import qualified Tests.Isacle.System.Bus       as Bus
 import qualified Tests.Isacle.Layout    as Layout
+import qualified Tests.Isacle.HdlTypes         as HdlTypes
 import qualified Tests.Isacle.Sim              as Sim
 
 main :: IO ()
@@ -35,5 +36,7 @@ main = do
     putStrLn "\n=== ISA width check ==="
     WidthCheck.runWidthCheckTests
     putStrLn "\n=== Simulation interpreter ==="
+    putStrLn "\n=== HdlType instances ==="
+    HdlTypes.runHdlTypesTests
     Sim.runSimTests
     putStrLn "\n=== all tests passed ==="
