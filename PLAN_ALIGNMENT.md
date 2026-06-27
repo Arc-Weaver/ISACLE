@@ -160,6 +160,16 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
     — `Capability`/`Subsumes` (forbidden non-stalling→stalling has no instance →
     compile error, verified), `canDrive` witness, `BusAdapter`/`widthAdapter`/
     `stallAdapter`. `BusArch` gains `type Cap arch`.
+  - **A2 ISA↔memory-model width check** (commit `bc96af4`): `Isacle.ISA.WidthCheck`
+    — `MemModel` (VonNeumann one width / Harvard code+data), `checkMemModel` runs
+    one combined check for VN, two for Harvard. Same structural-compatibility
+    shape as `BusCap`, over widths. Tested with AVR-Harvard + RV32I-VN shapes.
+  - **C1/C2/C5 core flags from a record** (commit `8a6f9c3`): address-mapping
+    helper moved to neutral `Isacle.Layout` (shared by ISA + System, under
+    neither); `CPUDef.flagRec @Record` mirrors peripheral `fieldRec` — a status
+    register's width + flag bit-positions derive from the record via `bitLayout`,
+    register width tied to `Width a` (length-by-default). CPU flag ≡ peripheral
+    bit-field, one mechanism.
 - **Remaining:** Phase C S2/S3 (crossing strategy; registers-out-of-`Sig` — both
   stylistic/additive); Phase D core-as-`HdlType` re-expression of the AVR core +
   ISA width typecheck (A2); Phase F heterogeneous SystemDSL (multi-domain/width/CPU)
