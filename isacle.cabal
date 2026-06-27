@@ -127,6 +127,7 @@ library
     Isacle.Periph.UART
     Isacle.System
     Isacle.System.BusArch
+    Isacle.System.BusCap
     Isacle.System.BusDef
     Isacle.System.BusHandle
     Isacle.System.Generate

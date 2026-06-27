@@ -1,3 +1,5 @@
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DataKinds #-}
 -- NB: NoImplicitPrelude is active from cabal common-options.
 -- | Bus architectures (protocols): the Layer-2 definition of how a bus behaves.
 --
@@ -28,6 +30,7 @@ import Control.Monad (forM, foldM)
 import Hdl.Net
     ( WireId, NetM, DomId, NetNode(..), PrimOp(..)
     , freshWire, emit, hintWire, comment )
+import Isacle.System.BusCap (Capability(..))
 
 -- ---------------------------------------------------------------------------
 -- BusPort — the single connection object shared by master and slave ends
@@ -80,6 +83,13 @@ type BusChild = (Integer, Integer, BusPort)
 -- A system may contain several buses with different architectures; the
 -- architecture is a phantom type on 'Isacle.System.BusDef.Bus'.
 class BusArch arch where
+    -- | This architecture's stall capability (BU6). Governs which children it
+    -- may drive: a 'NonStalling' master cannot drive a 'Stalling' child without
+    -- a 'Isacle.System.BusCap.stallAdapter'. Defaults to 'NonStalling' (the
+    -- conservative, most-restrictive face).
+    type Cap arch :: Capability
+    type Cap arch = 'NonStalling
+
     -- | Synthesise this bus's interconnect.
     --
     -- @synthBus arch dom up children@ wires the upstream port @up@ (this bus
@@ -136,7 +146,9 @@ instance BusArch SimpleBus where
 -- bus when an L1 cache bridges a von Neumann CPU to the memory fabric.
 data BurstBus = BurstBus
 
-instance BusArch BurstBus
+instance BusArch BurstBus where
+    -- A burst/refill bus has a handshake — it is stalling-capable.
+    type Cap BurstBus = 'Stalling
     -- synthBus uses the default (error) until the burst interconnect lands.
 
 -- ---------------------------------------------------------------------------
