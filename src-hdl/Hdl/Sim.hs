@@ -107,15 +107,28 @@ simulateDesign nodes inputs nCycles = go initRegs nCycles
         Nothing  -> True
         Just enW -> maybe True (\(ev, _, _) -> ev /= 0) (Map.lookup enW full)
 
-    -- Fixpoint: evaluate combinational nodes until no new wire resolves.
+    roms = [ n | n@NRom{} <- nodes ]
+
+    -- Fixpoint: evaluate combinational nodes (and ROM lookups) until no new wire
+    -- resolves.
     solve known =
-        let kn' = foldl tryNode known combs
-            tryNode kn n
+        let kn1 = foldl tryComb known combs
+            kn2 = foldl tryRom  kn1   roms
+            tryComb kn n
                 | Map.member (nOut n) kn = kn
                 | otherwise = maybe kn
                     (\ops -> Map.insert (nOut n) (evalSimOp (nOp n) ops) kn)
                     (mapM (`Map.lookup` kn) (nIns n))
-        in if Map.size kn' == Map.size known then known else solve kn'
+            tryRom kn n
+                | Map.member (nOut n) kn = kn
+                | otherwise = case Map.lookup (nRomRdA n) kn of
+                    Just (addr, _, _) ->
+                        let a = fromInteger addr
+                            v = if a >= 0 && a < length (nRomInit n)
+                                  then nRomInit n !! a else 0
+                        in Map.insert (nOut n) (v .&. mask (nRomDatW n), nRomDatW n, RUnsigned) kn
+                    Nothing -> kn
+        in if Map.size kn2 == Map.size known then known else solve kn2
 
 asSigned :: Integer -> Int -> Bool -> Integer
 asSigned v w True  | v >= 1 `shiftL` (w - 1) = v - (1 `shiftL` w)
