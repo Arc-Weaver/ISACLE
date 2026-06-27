@@ -9,6 +9,7 @@ import Prelude hiding (Word)
 import Data.Kind (Type)
 import GHC.TypeLits (KnownNat, Nat)
 import Hdl.Bits (Bit(..))
+import Hdl.Types (HdlType, Width)
 import Isacle.ISA.Types
 import Isacle.ISA.IR
 
@@ -34,17 +35,17 @@ class Monad m => MonadALU m where
 
     -- | Get a register reference by indexing a register file with an
     -- instruction field. The field name must match a name in the encoding.
-    register :: (AluDef m -> CPURegFile count w)
+    register :: (AluDef m -> CPURegFile count t)
              -> String
-             -> m (CPURegister w)
+             -> m (CPURegister t)
 
     -- | Like 'register', but adds a compile-time constant to the field value
     -- before forming the register index.  Used for instruction encodings that
     -- address a sub-range of a register file — e.g. AVR upper registers
     -- R16–R31 where the 4-bit 'd' field encodes (Rd − 16).
     -- Default: ignores offset (suitable for documentation backends).
-    registerWithOffset :: (AluDef m -> CPURegFile count w)
-                       -> String -> Int -> m (CPURegister w)
+    registerWithOffset :: (AluDef m -> CPURegFile count t)
+                       -> String -> Int -> m (CPURegister t)
     registerWithOffset sel field _ = register sel field
 
     -- | Get a flag reference from the ALU definition
@@ -66,8 +67,8 @@ class Monad m => MonadALU m where
     -- Register operations
     -- ------------------------------------------------------------------
 
-    readReg  :: KnownNat w => CPURegister w -> m (IExpr w)
-    writeReg :: KnownNat w => CPURegister w -> IExpr w -> m ()
+    readReg  :: HdlType t => CPURegister t -> m (IExpr (Width t))
+    writeReg :: HdlType t => CPURegister t -> IExpr (Width t) -> m ()
 
     -- ------------------------------------------------------------------
     -- Data memory operations
@@ -111,7 +112,7 @@ class Monad m => MonadALU m where
     isZero = pure . tIsZero
 
     -- | Conditional absolute jump: write target to pcReg only when cond == 1.
-    absJumpIf :: KnownNat w => CPURegister w -> IExpr 1 -> IExpr w -> m ()
+    absJumpIf :: HdlType t => CPURegister t -> IExpr 1 -> IExpr (Width t) -> m ()
 
     -- ------------------------------------------------------------------
     -- ALU operations
@@ -167,12 +168,33 @@ class Monad m => MonadALU m where
 -- ---------------------------------------------------------------------------
 
 -- | Read a register named by a field selector of the core state record.
-readField :: (MonadALU m, KnownNat w) => (AluDef m -> CPURegister w) -> m (IExpr w)
+readField :: (MonadALU m, HdlType t) => (AluDef m -> CPURegister t) -> m (IExpr (Width t))
 readField sel = cpu sel >>= readReg
 
 -- | Write a register named by a field selector of the core state record.
-writeField :: (MonadALU m, KnownNat w) => (AluDef m -> CPURegister w) -> IExpr w -> m ()
+writeField :: (MonadALU m, HdlType t) => (AluDef m -> CPURegister t) -> IExpr (Width t) -> m ()
 writeField sel e = cpu sel >>= \r -> writeReg r e
+
+-- | Read a register-file slot: the file field selector + the encoding field that
+-- indexes it. No handle is exposed to the instruction.
+readRegFile :: (MonadALU m, HdlType t)
+            => (AluDef m -> CPURegFile count t) -> String -> m (IExpr (Width t))
+readRegFile sel field = register sel field >>= readReg
+
+-- | Write a register-file slot (file selector + index field).
+writeRegFile :: (MonadALU m, HdlType t)
+             => (AluDef m -> CPURegFile count t) -> String -> IExpr (Width t) -> m ()
+writeRegFile sel field e = register sel field >>= \r -> writeReg r e
+
+-- | 'readRegFile' with a compile-time index offset (e.g. AVR R16–R31).
+readRegFileOffset :: (MonadALU m, HdlType t)
+                  => (AluDef m -> CPURegFile count t) -> String -> Int -> m (IExpr (Width t))
+readRegFileOffset sel field off = registerWithOffset sel field off >>= readReg
+
+-- | 'writeRegFile' with a compile-time index offset.
+writeRegFileOffset :: (MonadALU m, HdlType t)
+                   => (AluDef m -> CPURegFile count t) -> String -> Int -> IExpr (Width t) -> m ()
+writeRegFileOffset sel field off e = registerWithOffset sel field off >>= \r -> writeReg r e
 
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU
@@ -217,22 +239,22 @@ class MonadALU m => MonadIRQ m where
 -- ---------------------------------------------------------------------------
 
 -- | Relative jump: add a signed offset to the current PC
-relJump :: (MonadALU m, KnownNat w)
-        => CPURegister w -> IExpr w -> m ()
+relJump :: (MonadALU m, HdlType t)
+        => CPURegister t -> IExpr (Width t) -> m ()
 relJump pcReg offset = do
     current <- readReg pcReg
     writeReg pcReg (current + offset)
 
 -- | Absolute jump: load a new value directly into the PC
-absJump :: (MonadALU m, KnownNat w)
-        => CPURegister w -> IExpr w -> m ()
+absJump :: (MonadALU m, HdlType t)
+        => CPURegister t -> IExpr (Width t) -> m ()
 absJump pcReg target = writeReg pcReg target
 
 -- | Push a word onto the stack.
 -- Reads the SP, writes to mem[SP], decrements SP.
 -- Byte order for multi-word values determined by CPUDef endianness.
-push :: (MonadALU m, DataAddr m ~ IExpr spWidth, KnownNat spWidth)
-     => CPURegister spWidth -> Word m -> m ()
+push :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+     => CPURegister t -> Word m -> m ()
 push spReg val = do
     sp <- readReg spReg
     writeMem (bitCoerce sp) val
@@ -240,8 +262,8 @@ push spReg val = do
 
 -- | Pop a word from the stack.
 -- Increments SP, reads from mem[SP].
-pop :: (MonadALU m, DataAddr m ~ IExpr spWidth, KnownNat spWidth)
-    => CPURegister spWidth -> m (Word m)
+pop :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+    => CPURegister t -> m (Word m)
 pop spReg = do
     sp <- readReg spReg
     let sp' = sp + 1
@@ -253,28 +275,28 @@ pop spReg = do
 -- ---------------------------------------------------------------------------
 
 -- | Read via a register used as a data pointer
-indirectRead :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
-             => CPURegister addrWidth -> m (Word m)
+indirectRead :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+             => CPURegister t -> m (Word m)
 indirectRead ptrReg = readReg ptrReg >>= readMem . bitCoerce
 
 -- | Write via a register used as a data pointer
-indirectWrite :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
-              => CPURegister addrWidth -> Word m -> m ()
+indirectWrite :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+              => CPURegister t -> Word m -> m ()
 indirectWrite ptrReg val = do
     ptr <- readReg ptrReg
     writeMem (bitCoerce ptr) val
 
 -- | Read with post-increment
-indirectReadPostInc :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
-                    => CPURegister addrWidth -> m (Word m)
+indirectReadPostInc :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+                    => CPURegister t -> m (Word m)
 indirectReadPostInc ptrReg = do
     ptr <- readReg ptrReg
     writeReg ptrReg (ptr + 1)
     readMem (bitCoerce ptr)
 
 -- | Read with pre-decrement
-indirectReadPreDec :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
-                   => CPURegister addrWidth -> m (Word m)
+indirectReadPreDec :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+                   => CPURegister t -> m (Word m)
 indirectReadPreDec ptrReg = do
     ptr <- readReg ptrReg
     let ptr' = ptr - 1
@@ -282,8 +304,8 @@ indirectReadPreDec ptrReg = do
     readMem (bitCoerce ptr')
 
 -- | Read with constant offset
-indirectReadOffset :: (MonadALU m, DataAddr m ~ IExpr addrWidth, KnownNat addrWidth)
-                   => CPURegister addrWidth -> IExpr addrWidth -> m (Word m)
+indirectReadOffset :: (MonadALU m, HdlType t, DataAddr m ~ IExpr (Width t))
+                   => CPURegister t -> IExpr (Width t) -> m (Word m)
 indirectReadOffset ptrReg offset = do
     ptr <- readReg ptrReg
     readMem (bitCoerce (ptr + offset))

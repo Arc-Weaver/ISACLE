@@ -12,9 +12,9 @@ import Isacle.ISA
 -- ---------------------------------------------------------------------------
 
 data AVRAlu = AVRAlu
-    { gpr       :: CPURegFile 32 8
-    , sp        :: CPURegister 16
-    , pc        :: CPURegister 22
+    { gpr       :: CPURegFile 32 (Unsigned 8)
+    , sp        :: CPURegister (Unsigned 16)
+    , pc        :: CPURegister (Unsigned 22)
     , carry     :: CPUFlag
     , zero      :: CPUFlag
     , negative  :: CPUFlag
@@ -28,9 +28,9 @@ data AVRAlu = AVRAlu
 avrCPUDef :: CPUDef AVRAlu
 avrCPUDef = do
     endianness LittleEndian
-    g   <- regFile "GPR" (width @32) byte
-    sp' <- reg    "SP"  w16
-    pc' <- reg    "PC"  (width @22)
+    g   <- newRegFile "GPR"
+    sp' <- newReg "SP"
+    pc' <- newReg "PC"
     (sreg, fs) <- flagPack @8 "SREG" ["I","T","H","S","V","N","Z","C"]
     let i = fs!!0; t = fs!!1; h = fs!!2; s = fs!!3
         v = fs!!4; n = fs!!5; z = fs!!6; c = fs!!7

@@ -37,8 +37,8 @@ import Isacle.ISA
 -- ---------------------------------------------------------------------------
 
 data TinyVnAlu = TinyVnAlu
-    { tvGpr  :: CPURegFile 8 32
-    , tvPc   :: CPURegister 32
+    { tvGpr  :: CPURegFile 8 (Unsigned 32)
+    , tvPc   :: CPURegister (Unsigned 32)
     , tvZero :: CPUFlag
     }
 
@@ -49,8 +49,8 @@ data TinyVnAlu = TinyVnAlu
 tinyVnCPUDef :: CPUDef TinyVnAlu
 tinyVnCPUDef = do
     endianness LittleEndian
-    g          <- regFile "GPR" (width @8) w32
-    p          <- reg     "PC"  w32
+    g          <- newRegFile "GPR"
+    p          <- newReg "PC"
     (_, zs)    <- flagPack @1 "FLAGS" ["Z"]
     let z       = head zs
     pure TinyVnAlu { tvGpr = g, tvPc = p, tvZero = z }

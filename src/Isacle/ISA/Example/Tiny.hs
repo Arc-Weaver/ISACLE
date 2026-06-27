@@ -32,8 +32,8 @@ import Isacle.ISA
 -- ---------------------------------------------------------------------------
 
 data TinyAlu = TinyAlu
-    { gpr  :: CPURegFile 4 8
-    , pc   :: CPURegister 8
+    { gpr  :: CPURegFile 4 (Unsigned 8)
+    , pc   :: CPURegister (Unsigned 8)
     , zero :: CPUFlag   -- bit 0 of the 1-bit "FLAGS" status register
     }
 
@@ -44,8 +44,8 @@ data TinyAlu = TinyAlu
 tinyCPUDef :: CPUDef TinyAlu
 tinyCPUDef = do
     endianness LittleEndian
-    g      <- regFile "GPR" (width @4) byte
-    p      <- reg    "PC"  byte
+    g      <- newRegFile "GPR"
+    p      <- newReg "PC"
     (_, zs)  <- flagPack @1 "FLAGS" ["Z"]
     let z    =  head zs
     pure TinyAlu { gpr = g, pc = p, zero = z }

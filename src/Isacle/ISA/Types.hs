@@ -1,9 +1,11 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE KindSignatures #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 module Isacle.ISA.Types where
 
 import Prelude
+import Data.Kind (Type)
 import GHC.OverloadedLabels (IsLabel(..))
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Data.Proxy (Proxy(..))
@@ -44,8 +46,22 @@ data CPUFlag = CPUFlag
     , cpuFlagBit :: Int      -- ^ bit position within the register (0 = LSB)
     } deriving (Show, Eq)
 
-newtype CPURegister (w    :: Nat)          = CPURegister String
-newtype CPURegFile  (count :: Nat) (w :: Nat) = CPURegFile  String
+-- | A register handle, typed by the register's /value type/ (e.g.
+-- @CPURegister (Unsigned 16)@, @CPURegister Sreg@) — not a bare width. The bit
+-- width is @'Width' t@; reading a register yields an @IExpr (Width t)@.
+newtype CPURegister (t :: Type) = CPURegister String
+
+-- | A register-file handle: @count@ registers each of value type @t@.
+newtype CPURegFile  (count :: Nat) (t :: Type) = CPURegFile  String
+
+-- | Spelling preferred at core-definition sites: @RegisterFile 32 (Unsigned 8)@.
+type RegisterFile = CPURegFile
+
+-- | Project a single bit of a register as a flag view: @sreg ! 0@ is bit 0 of
+-- the @sreg@ register. Combine with 'Isacle.ISA.CPUDef.newFlag' to name it.
+(!) :: CPURegister t -> Int -> CPUFlag
+CPURegister name ! bit = CPUFlag name bit
+infixl 9 !
 
 -- ---------------------------------------------------------------------------
 -- Endianness

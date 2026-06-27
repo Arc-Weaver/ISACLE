@@ -23,16 +23,20 @@ module Isacle.ISA
     , CPURegFile
       -- * CPU definition monad
     , CPUDef
+    , ISACoreDefinition
     , CPUSchema
     , runCPUDef
     , endianness
-    , regFile
+    , newRegFile
+    , newReg
     , reg
+    , newFlag
     , regsFromRecord
     , flagPack
     , flagRec
     , aliasReg
     , aliasFile
+    , (!)
       -- * Endianness
     , Endianness(..)
       -- * ALU primitives
@@ -42,6 +46,10 @@ module Isacle.ISA
       -- * Register access by field projection
     , readField
     , writeField
+    , readRegFile
+    , writeRegFile
+    , readRegFileOffset
+    , writeRegFileOffset
       -- * MonadHarvardALU
     , MonadHarvardALU(..)
       -- * MonadIRQ
