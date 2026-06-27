@@ -4,6 +4,20 @@
 > the ISACLE stack's vocabulary, layers, types, and contracts. Where a concept
 > is still being *refined* (not yet built), it is marked **[target]**. Prose
 > architecture lives in `ARCHITECTURE.html`; migration history in `PLAN_*.md`.
+>
+> **Foundation status (Phases A–B, DONE & committed):** the four HDL pillars are
+> now typeclasses with the synthesis path as one interpreter —
+> **`HdlType`** is structure-preserving (records/arrays/enums → real VHDL
+> records/arrays/enumerated types, package-scoped for ports); **`Signal`** is the
+> combinational typeclass (`Sig` = synth instance) with operations anchored on
+> the value type (`HdlEq`/`HdlOrd`, signed-vs-unsigned via `hdlRepr`);
+> **`Hdl`** is the stateful **arrow** (`Category`/`Arrow`/`register`;
+> `NetBuilder` = synth instance); **`KnownDom`** is the clock-domain class.
+> What follows still describes some pieces in their pre-refactor form — trust the
+> backlog (`ADJUSTMENTS.md`) and plan (`PLAN_ALIGNMENT.md`) for the live state.
+> Remaining: **Part II — the system layer** (CPU-core-as-`HdlType`, bus
+> capability hierarchy + bridges, heterogeneous SystemDSL) and a **sim**
+> interpreter (a second `Signal`/`Hdl` instance).
 
 ## 0. Purpose
 
