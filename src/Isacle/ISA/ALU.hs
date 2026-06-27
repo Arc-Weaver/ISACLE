@@ -3,19 +3,12 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE AllowAmbiguousTypes #-}
 module Isacle.ISA.ALU where
 
 import Prelude hiding (Word)
-import Data.Char (toUpper)
 import Data.Kind (Type)
-import Data.Proxy (Proxy(..))
-import GHC.Records (HasField)
-import GHC.TypeLits (KnownNat, Nat, Symbol, KnownSymbol, symbolVal)
+import GHC.TypeLits (KnownNat, Nat)
 import Hdl.Bits (Bit(..))
-import Hdl.Types (HdlType, Width)
 import Isacle.ISA.Types
 import Isacle.ISA.IR
 
@@ -160,43 +153,26 @@ class Monad m => MonadALU m where
     subWithFlags a b _ = do r <- aluOp PSub a b; return (r, Lo, Lo)
 
 -- ---------------------------------------------------------------------------
--- Typed register access (C1)
+-- Register access by record-field projection (C1)
 --
--- A CPU's ALU /handle/ record (e.g. @AVRALU pcW@) stands for a typed
--- architectural-state record (e.g. @AvrState pcW@). Declaring
--- @type instance CoreState (AVRALU pcW) = AvrState pcW@ lets instruction bodies
--- read/write a scalar register by its state field name, with the width taken
--- from the field's type — no hand-written width, no loose string key:
+-- A scalar register is a real field of the CPU's architectural-state record, so
+-- it is reached by /projecting that field/ — never by a string. 'readField' and
+-- 'writeField' take the field selector itself and fuse the projection with the
+-- read/write; the register's width comes from the field's type:
 --
--- > sreg <- readField @"sreg"     -- IExpr (Width Sreg)
--- > writeField @"pc" newPc        -- width = the pc field's width
+-- > sreg <- readField avrSREG     -- IExpr 8  (the SREG field is CPURegister 8)
+-- > writeField avrZ ptr1          -- width = the Z field's width
 --
--- The register key is the field name upper-cased, matching the schema the
--- 'Isacle.ISA.CPUDef.CPUDef' declares.
+-- (The register file is indexed, so it keeps 'register'/'registerWithOffset'.)
 -- ---------------------------------------------------------------------------
 
--- | The typed architectural-state record an ALU handle record stands for.
-type family CoreState (alu :: Type) :: Type
+-- | Read a register named by a field selector of the core state record.
+readField :: (MonadALU m, KnownNat w) => (AluDef m -> CPURegister w) -> m (IExpr w)
+readField sel = cpu sel >>= readReg
 
--- | A register key from a state field name: the name, upper-cased.
-fieldKeyU :: forall (name :: Symbol). KnownSymbol name => String
-fieldKeyU = map toUpper (symbolVal (Proxy @name))
-
--- | Read a scalar register by its 'CoreState' field name; width = the field's.
-readField :: forall (name :: Symbol) a m.
-    ( KnownSymbol name, MonadALU m
-    , HasField name (CoreState (AluDef m)) a
-    , HdlType a, KnownNat (Width a) )
-    => m (IExpr (Width a))
-readField = readReg (CPURegister (fieldKeyU @name) :: CPURegister (Width a))
-
--- | Write a scalar register by its 'CoreState' field name; width = the field's.
-writeField :: forall (name :: Symbol) a m.
-    ( KnownSymbol name, MonadALU m
-    , HasField name (CoreState (AluDef m)) a
-    , HdlType a, KnownNat (Width a) )
-    => IExpr (Width a) -> m ()
-writeField = writeReg (CPURegister (fieldKeyU @name) :: CPURegister (Width a))
+-- | Write a register named by a field selector of the core state record.
+writeField :: (MonadALU m, KnownNat w) => (AluDef m -> CPURegister w) -> IExpr w -> m ()
+writeField sel e = cpu sel >>= \r -> writeReg r e
 
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU

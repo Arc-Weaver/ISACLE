@@ -39,8 +39,7 @@ module Isacle.ISA
     , ALUPrim(..)
       -- * MonadALU
     , MonadALU(..)
-      -- * Typed register access
-    , CoreState
+      -- * Register access by field projection
     , readField
     , writeField
       -- * MonadHarvardALU
