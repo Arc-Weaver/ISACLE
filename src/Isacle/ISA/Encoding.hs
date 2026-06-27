@@ -3,6 +3,9 @@ module Isacle.ISA.Encoding
       EncodingInfo(..)
     , FieldName
     , parseEncoding
+      -- * Well-formedness (I3)
+    , encodingErrors
+    , isValidEncoding
       -- * Field extraction
     , fieldKey
     , extractField
@@ -11,6 +14,7 @@ module Isacle.ISA.Encoding
 
 import Prelude
 import Data.Char (isAlpha)
+import Data.List (nub)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -72,6 +76,25 @@ parseEncoding s =
     in foldl go empty indexed
   where
     bit p = 1 `shiftL` p
+
+-- | Well-formedness problems with an encoding string (I3). 'parseEncoding'
+-- silently ignores characters it does not understand — but still counts them
+-- toward the total width — so a typo corrupts 'encTotalBits' invisibly. This
+-- surfaces those: the only legal characters are @0@ @1@ (fixed bits), @.@ (don't
+-- care), a separating @_@, and alphabetic field keys. Returns one message per
+-- distinct offending character, plus a message if the string is empty.
+encodingErrors :: String -> [String]
+encodingErrors s =
+    [ "empty encoding" | null stripped ]
+    ++ [ "invalid character " ++ show c ++ " in encoding " ++ show s
+       | c <- nub stripped, not (legal c) ]
+  where
+    stripped = filter (/= '_') s
+    legal c  = c == '0' || c == '1' || c == '.' || isAlpha c
+
+-- | True when an encoding string is well-formed (no 'encodingErrors').
+isValidEncoding :: String -> Bool
+isValidEncoding = null . encodingErrors
 
 -- | Extract a field value from a concrete instruction word.
 --   Bit positions are in MSB-first order (left = highest bit of the field).

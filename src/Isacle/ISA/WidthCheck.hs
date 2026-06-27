@@ -20,12 +20,13 @@ module Isacle.ISA.WidthCheck
     , dataWidth
     , WidthError(..)
     , checkInstrWidths
+    , checkInstrEncodings
     , checkDataWidths
     , checkMemModel
     ) where
 
 import Prelude
-import Isacle.ISA.Encoding (EncodingInfo(..))
+import Isacle.ISA.Encoding (EncodingInfo(..), parseEncoding, encodingErrors)
 
 -- | A memory model and its bus width(s), in bits.
 data MemModel
@@ -68,6 +69,20 @@ checkInstrWidths w maxFetch = concatMap check
             [WidthError name (encTotalBits enc)
                 ("exceeds MaxFetch (" ++ show maxFetch ++ ") * code width " ++ show w)]
         | otherwise = []
+
+-- | Check raw encoding /strings/ against the code bus (I3 + A2 in one pass):
+-- first their well-formedness ('encodingErrors' — a malformed string would
+-- otherwise yield a meaningless width), then their parsed width via
+-- 'checkInstrWidths'. The convenient entry point for an ISA whose instructions
+-- carry encoding strings.
+checkInstrEncodings :: Int                  -- ^ code-bus width (bits)
+                    -> Int                  -- ^ MaxFetch
+                    -> [(String, String)]   -- ^ (name, encoding string)
+                    -> [WidthError]
+checkInstrEncodings w maxFetch instrs =
+    [ WidthError name 0 msg | (name, enc) <- instrs, msg <- encodingErrors enc ]
+    ++ checkInstrWidths w maxFetch
+         [ (name, parseEncoding enc) | (name, enc) <- instrs ]
 
 -- | Check declared data-value widths against the /data/ bus: each value must
 -- fit in one data word. (The data-side check.)

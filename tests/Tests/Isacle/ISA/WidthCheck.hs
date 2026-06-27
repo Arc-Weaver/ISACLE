@@ -6,7 +6,7 @@ module Tests.Isacle.ISA.WidthCheck (runWidthCheckTests) where
 import Prelude
 import System.Exit (exitFailure)
 
-import Isacle.ISA.Encoding  (parseEncoding)
+import Isacle.ISA.Encoding  (parseEncoding, encodingErrors, isValidEncoding)
 import Isacle.ISA.WidthCheck
 
 assert :: String -> Bool -> IO ()
@@ -45,3 +45,20 @@ runWidthCheckTests = do
         (null (checkMemModel (VonNeumann 32) 1 [addi] values))
     assert "checkMemModel Harvard-16/8: 16-bit value rejected on data bus"
         (length (checkMemModel (Harvard 16 8) 2 [add] values) == 1)
+
+    -- I3: encoding well-formedness. A typo'd character is caught rather than
+    -- silently corrupting the width.
+    assert "well-formed AVR ADD encoding is valid"
+        (isValidEncoding "000011rdddddrrrr")
+    assert "encoding with a stray '2' is rejected"
+        (encodingErrors "00001x2dddddrrrr" /= [])
+    assert "empty encoding is rejected"
+        (encodingErrors "" == ["empty encoding"])
+    assert "underscores are allowed as separators"
+        (isValidEncoding "000011_ddddd_rrrr")
+
+    -- checkInstrEncodings: raw strings, well-formedness + width in one pass.
+    assert "raw 16-bit encoding OK on a 16-bit code bus"
+        (null (checkInstrEncodings 16 1 [("ADD", "000011rdddddrrrr")]))
+    assert "raw malformed encoding produces an error"
+        (not (null (checkInstrEncodings 16 1 [("BAD", "0000$$rdddddrrrr")])))
