@@ -72,6 +72,29 @@ passed to `reg`. Two couplings block a clean swap:
 5. **Retire `AVRALU` (optional).** If steps 1–4 leave `AVRALU` as a thin shim
    over `AvrState` projections, collapse them into one type.
 
+### 4a. Concrete finding (name mismatch — surfaced by `regsFromRecord`)
+
+`regsFromRecord @AvrState` derives register names from the record field
+selectors — `asGPR`, `asSP`, `asPC`, … — whereas the live schema uses `GPR`,
+`SP`, `PC` (uppercase, no prefix). Since Haskell record fields must be
+lowercase-initial, the derived names can **never** equal the current uppercase
+strings verbatim. So step 1's "derived keys == current strings" cannot hold as
+an identity; the migration must pick one:
+
+- **(a) Adopt the record-derived names wholesale.** Switch *both* the schema and
+  the access path to the record names in one go. The names feed VHDL signal
+  *hints* and the resolution map keys, not behaviour — as long as schema and
+  access use the same derived names, synthesis is consistent (GHDL-neutral; only
+  wire-hint text changes). Cleanest end state, but a single coordinated cut.
+- **(b) Normalise.** Give `regsFromRecord` a name-mapping (e.g. strip an `as`/`ms`
+  prefix and upper-case) so derived names match the existing strings, keeping
+  wire hints byte-identical. More machinery, but a drop-in step 2.
+
+Recommendation: **(a)** — the names are cosmetic to synthesis, and carrying a
+normalisation function is exactly the kind of duplicated-naming the reframe is
+meant to remove. Verify with the clavr GHDL suite (wire-name changes don't
+affect simulation).
+
 ## 5. Risks & mitigations
 
 - **Name drift breaks synthesis resolution** (the string keys feed
