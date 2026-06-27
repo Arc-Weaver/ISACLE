@@ -144,7 +144,24 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
   tests added to `test-library`. **The "one description, many interpreters"
   principle is now concrete: synth (→VHDL→GHDL) and sim (→values) of the same
   `Signal` program agree.**
+- **Phase D/E (system-layer increments) — IN PROGRESS:**
+  - **C2 / PE1 bit-maps from records** (commit `7eb120e`): `GFields`/`recordFields`
+    + `fieldRec @Record` — a register's bit-fields *are* its record `HdlType`
+    structure; CPU flags and peripheral bit-fields share one mechanism.
+  - **PE C-header consumer** (commit `03d3af2`): `sysGenCHeader` now carries each
+    register's C type (from its `Repr`+width) and a `_BIT` macro per bit-field —
+    the typed-peripheral → firmware-header loop closed end to end.
+  - **C5 / PE4 address-mapping helper** (commit `bf9dc65`): `Isacle.System.Layout`
+    — `Placement`/`Layout`, `bitLayout` (MSB-first from a record), `addrLayout`,
+    `placeAt`. One "place a flat view at a position in a containing space"
+    mechanism for flag-bits, register offsets and bus bases; `fieldRec`
+    single-sources through it.
+  - **BU6 / BU7 bus capability hierarchy** (commit `a6cee61`): `Isacle.System.BusCap`
+    — `Capability`/`Subsumes` (forbidden non-stalling→stalling has no instance →
+    compile error, verified), `canDrive` witness, `BusAdapter`/`widthAdapter`/
+    `stallAdapter`. `BusArch` gains `type Cap arch`.
 - **Remaining:** Phase C S2/S3 (crossing strategy; registers-out-of-`Sig` — both
-  stylistic/additive); Phases D–F (system layer: CPU-core-as-`HdlType`, bus
-  capability hierarchy, heterogeneous SystemDSL) — the large, design-heavy
-  redesigns. Sub-instance + RAM simulation would extend the sim to whole SoCs.
+  stylistic/additive); Phase D core-as-`HdlType` re-expression of the AVR core +
+  ISA width typecheck (A2); Phase F heterogeneous SystemDSL (multi-domain/width/CPU)
+  — the large, design-heavy redesigns. Sub-instance + RAM simulation would extend
+  the sim to whole SoCs.

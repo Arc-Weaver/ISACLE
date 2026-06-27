@@ -3,6 +3,7 @@ module Main where
 import Prelude
 
 import qualified Tests.Isacle.Harvard.ISA      as ISA
+import qualified Tests.Isacle.ISA.WidthCheck   as WidthCheck
 import qualified Tests.Isacle.Harvard.Pipeline as Pipeline
 import qualified Tests.Isacle.GPIO             as GPIO
 import qualified Tests.Isacle.Periph.Timer     as Timer
@@ -31,6 +32,8 @@ main = do
     Bus.runBusTests
     putStrLn "\n=== Address-mapping layout ==="
     Layout.runLayoutTests
+    putStrLn "\n=== ISA width check ==="
+    WidthCheck.runWidthCheckTests
     putStrLn "\n=== Simulation interpreter ==="
     Sim.runSimTests
     putStrLn "\n=== all tests passed ==="

@@ -116,6 +116,7 @@ library
     Isacle.ISA.Example.TinyVN
     Isacle.ISA.Types
     Isacle.ISA.VonNeumann
+    Isacle.ISA.WidthCheck
     Isacle.Cache.Config
     Isacle.Cache.L1
     Isacle.Memory
@@ -228,6 +229,7 @@ test-suite test-library
     Tests.Isacle.Periph.Timer
     Tests.Isacle.Periph.UART
     Tests.Isacle.Periph.DMA
+    Tests.Isacle.ISA.WidthCheck
     Tests.Isacle.System.Bus
     Tests.Isacle.System.Layout
     Tests.Isacle.Sim
