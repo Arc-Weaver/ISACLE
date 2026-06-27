@@ -170,6 +170,16 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
     register's width + flag bit-positions derive from the record via `bitLayout`,
     register width tied to `Width a` (length-by-default). CPU flag ≡ peripheral
     bit-field, one mechanism.
+  - **A2/I3 ISA width cluster** (commits `bc96af4`, `24b933d`): `Isacle.ISA.WidthCheck`
+    (`MemModel` VN-one / Harvard-two, `checkMemModel`) + encoding well-formedness
+    (`encodingErrors`/`checkInstrEncodings`).
+  - **SY7/SY6/BU5 reduction layer** (commit `9645ab3`): `Isacle.System.Reduce` —
+    a system *reduces to* (not *is*) Hdl I/O / doc / memory-map / C-header /
+    linker-script; `reduceSystem` bundles all from one elaboration.
+  - **C1 AVR core SREG → record** (isacle `add23e6`, clavr `16d6b5f`): the AVR
+    status register is now a bit-map record `HdlType`, flags derived via
+    `flagRec`. GHDL-verified (8/8 clavr sim tests). Whole-`AVRALU`-as-`HdlType`
+    + `pcW` elimination remains (needs H4 arrays + typed register-file projection).
 - **Remaining:** Phase C S2/S3 (crossing strategy; registers-out-of-`Sig` — both
   stylistic/additive); Phase D core-as-`HdlType` re-expression of the AVR core +
   ISA width typecheck (A2); Phase F heterogeneous SystemDSL (multi-domain/width/CPU)

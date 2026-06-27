@@ -280,6 +280,13 @@ already multi-interpreter (Synth/Sim/Doc) — good (P1).
   not part of `HdlType`, not a separate type system. Field access is
   **length-by-default projection** — PC width = `Width` of the `pc` field, so the
   free `pcW` disappears (§4a / the PC-width directive).
+  - *Partially done* (isacle `add23e6` + clavr `16d6b5f`): the AVR core's SREG is
+    now a bit-map record `HdlType` (`Sreg`) and its flags derive from the record
+    layout via `flagRec`/`bitLayout` (C2/C5), GHDL-verified (8/8 sim tests). The
+    remaining full reframe — the *whole* `AVRALU` as one `HdlType` record (gpr as
+    an array field, length-by-default projection, `pcW` elimination) — is the
+    large structural step still pending; it depends on H4 array `HdlType` and a
+    typed field-projection mechanism for the register file.
 - [x] **C2 (unify — bit maps)** — A **bit map = an `HdlType` record of named
   bit-fields** (e.g. `data Sreg = Sreg { c,z,n,… :: Bit } deriving (Generic,
   HdlType)`). Collapse the CPU `flagPack`/`CPUFlag` mechanism *and* the peripheral
