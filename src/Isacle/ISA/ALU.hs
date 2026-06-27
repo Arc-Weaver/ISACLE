@@ -222,6 +222,12 @@ writeRegFileF sel f e = register sel [fldKey f] >>= \r -> writeReg r e
 immediateF :: KnownNat (Width t) => Field t -> IExpr (Width t)
 immediateF = fieldVal
 
+-- | Conditional absolute jump by register field selector (no handle exposed):
+-- writes @target@ to the selected register only when @cond@ is 1.
+absJumpIfF :: (MonadALU m, HdlType t)
+           => (AluDef m -> CPURegister t) -> IExpr 1 -> IExpr (Width t) -> m ()
+absJumpIfF sel cond target = cpu sel >>= \r -> absJumpIf r cond target
+
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU
 -- Extends MonadALU with a separate read-only code address space.

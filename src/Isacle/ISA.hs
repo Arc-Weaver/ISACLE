@@ -56,6 +56,7 @@ module Isacle.ISA
     , readRegFileF
     , writeRegFileF
     , immediateF
+    , absJumpIfF
       -- * MonadHarvardALU
     , MonadHarvardALU(..)
       -- * MonadIRQ
