@@ -115,6 +115,18 @@ runBusTests = do
         (M.lookup "gpio_GpioPhys_gpioPort" socOut == Just 0)
     assert "whole-SoC sim resolves gpio ddr output"
         (M.lookup "gpio_GpioPhys_gpioDdr" socOut == Just 0)
+
+    -- Typed peripheral → C header, end to end: the ramp's signed registers
+    -- (declared via regField/roField @(Signed 8)) surface as int8_t.
+    putStrLn "\n-- signed peripheral C header --"
+    let rampSys :: SysDSL Clk (Unsigned 8) ()
+        rampSys = do
+            r <- createRamp "ramp0" (SExpr (pure 1))
+            _ <- createBus "rbus" (attachPeripheral 0x40 r >> return ())
+            return ()
+        rampHdr = reduceToCHeader "ramphdr" rampSys
+    assert "ramp SETPOINT is int8_t in the C header"
+        (("RAMP0_SETPOINT" `isSubstr` rampHdr) && ("int8_t" `isSubstr` rampHdr))
   where
     isSubstr _ []              = False
     isSubstr [] _              = True
