@@ -7,10 +7,13 @@
 -- ('Repr'), so the 'Signal' operations compute exactly what the emitter would
 -- produce (signed-vs-unsigned comparison via the representation, etc.).
 module Hdl.Sim
-    ( SimSig(..)
+    ( -- * Signal-level interpreter
+      SimSig(..)
     , simLit
     , simResult
     , evalSimOp
+      -- * Graph-level interpreter
+    , simulateDesign
     ) where
 
 import Prelude
@@ -18,8 +21,11 @@ import Data.Bits ((.&.), (.|.), xor, shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
 
-import Hdl.Net   (PrimOp(..), Repr(..))
+import Hdl.Net
+    ( PrimOp(..), Repr(..), NetNode(..), SomeBits(..) )
 import Hdl.Types (Signal(..), HdlType(..))
 
 -- | A simulated combinational signal: @SimSig value width repr@.
@@ -59,6 +65,58 @@ mk (v, w, r) = SimSig v w r
 mask :: Int -> Integer
 mask w = (1 `shiftL` w) - 1
 
+-- ---------------------------------------------------------------------------
+-- Graph-level interpreter: simulate a flat entity over clock cycles
+-- ---------------------------------------------------------------------------
+
+-- | Simulate one entity's flat 'NetNode' list for @nCycles@ cycles, given
+-- constant input-port values (port name → value).  Returns the output-port
+-- values for each cycle (index 0 = the reset/initial register state).  Handles
+-- combinational nodes, registers (with enable), and representation tags;
+-- memories, ROMs, and sub-instances are not yet evaluated.
+simulateDesign :: [NetNode] -> Map String Integer -> Int -> [Map String Integer]
+simulateDesign nodes inputs nCycles = go initRegs nCycles
+  where
+    reprOfW w  = Map.findWithDefault RUnsigned w (Map.fromList [ (rw, r) | NRepr rw r <- nodes ])
+    regWidth   = Map.fromList [ (nOut n, sbW)   | n@NReg{} <- nodes, let SomeBits _ sbW = nInit n ]
+    initRegs   = Map.fromList [ (nOut n, sbVal) | n@NReg{} <- nodes, let SomeBits sbVal _ = nInit n ]
+    inputWires = [ (nPortName n, nOut n, nWidth n) | n@NInput{} <- nodes ]
+    combs      = [ n | n@NComb{} <- nodes ]
+
+    go _    0 = []
+    go regs k = outs : go regs' (k - 1)
+      where
+        seed = Map.fromList $
+            [ (wid, ((inputs Map.! nm) .&. mask wdt, wdt, reprOfW wid))
+            | (nm, wid, wdt) <- inputWires, Map.member nm inputs ]
+            ++
+            [ (wid, (v, Map.findWithDefault 1 wid regWidth, reprOfW wid))
+            | (wid, v) <- Map.toList regs ]
+        full = solve seed
+        outs = Map.fromList
+            [ (nPortName n, v) | n@NOutput{} <- nodes
+            , Just (v, _, _) <- [Map.lookup (nIn n) full] ]
+        regs' = Map.fromList [ (nOut n, nextOf n) | n@NReg{} <- nodes ]
+        nextOf n
+            | not (enabled n full) = Map.findWithDefault 0 (nOut n) regs
+            | otherwise = case Map.lookup (nIn n) full of
+                Just (x, _, _) -> x
+                Nothing        -> Map.findWithDefault 0 (nOut n) regs
+
+    enabled n full = case nEn n of
+        Nothing  -> True
+        Just enW -> maybe True (\(ev, _, _) -> ev /= 0) (Map.lookup enW full)
+
+    -- Fixpoint: evaluate combinational nodes until no new wire resolves.
+    solve known =
+        let kn' = foldl tryNode known combs
+            tryNode kn n
+                | Map.member (nOut n) kn = kn
+                | otherwise = maybe kn
+                    (\ops -> Map.insert (nOut n) (evalSimOp (nOp n) ops) kn)
+                    (mapM (`Map.lookup` kn) (nIns n))
+        in if Map.size kn' == Map.size known then known else solve kn'
+
 asSigned :: Integer -> Int -> Bool -> Integer
 asSigned v w True  | v >= 1 `shiftL` (w - 1) = v - (1 `shiftL` w)
 asSigned v _ _     = v
@@ -82,8 +140,7 @@ evalSimOp op ins = case (op, ins) of
         let signed = ra == RSigned || rb == RSigned
         in (if asSigned a wa signed < asSigned b wb signed then 1 else 0, 1, RUnsigned)
     (PSlice hi lo, [(a, _, _)])             -> ((a `shiftR` lo) .&. mask (hi - lo + 1), hi - lo + 1, RUnsigned)
-    (PConcat, [(a, _, _), (b, wb, _)])      -> ((a `shiftL` wb) .|. b, wb + msbW, RUnsigned)
-      where msbW = case ins of { ((_, wa, _) : _) -> wa; _ -> 0 }
+    (PConcat, [(a, wa, _), (b, wb, _)])     -> ((a `shiftL` wb) .|. b, wa + wb, RUnsigned)
     (PResize w, [(a, wa, ra)])              -> (a .&. mask w, w, if w < wa then RUnsigned else ra)
     (PReinterpret r, [(a, wa, _)])          -> (a, wa, r)
     (PShiftL, [(a, wa, ra), (n, _, _)])     -> ((a `shiftL` fromInteger n) .&. mask wa, wa, ra)
