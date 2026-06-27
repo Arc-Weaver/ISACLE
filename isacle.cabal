@@ -109,6 +109,7 @@ library
     Isacle.ISA.CPUDef
     Isacle.ISA.Def
     Isacle.ISA.Encoding
+    Isacle.ISA.EncodingDSL
     Isacle.ISA.IR
     Isacle.ISA.Build
     Isacle.ISA.Example.AVR

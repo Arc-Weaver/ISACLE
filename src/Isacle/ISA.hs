@@ -50,6 +50,12 @@ module Isacle.ISA
     , writeRegFile
     , readRegFileOffset
     , writeRegFileOffset
+      -- * Encoding DSL (typed field placeholders)
+    , module Isacle.ISA.EncodingDSL
+    , defineInstruction
+    , readRegFileF
+    , writeRegFileF
+    , immediateF
       -- * MonadHarvardALU
     , MonadHarvardALU(..)
       -- * MonadIRQ
@@ -108,6 +114,7 @@ module Isacle.ISA
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.ALU
+import Isacle.ISA.EncodingDSL
 import Isacle.ISA.Def
 import Isacle.ISA.Encoding
 import Isacle.ISA.IR

@@ -12,6 +12,7 @@ import Hdl.Bits (Bit(..))
 import Hdl.Types (HdlType, Width)
 import Isacle.ISA.Types
 import Isacle.ISA.IR
+import Isacle.ISA.EncodingDSL (Encoding, Field, runEncoding, fldKey, fieldVal)
 
 -- ---------------------------------------------------------------------------
 -- MonadALU
@@ -195,6 +196,31 @@ readRegFileOffset sel field off = registerWithOffset sel field off >>= readReg
 writeRegFileOffset :: (MonadALU m, HdlType t)
                    => (AluDef m -> CPURegFile count t) -> String -> Int -> IExpr (Width t) -> m ()
 writeRegFileOffset sel field off e = registerWithOffset sel field off >>= \r -> writeReg r e
+
+-- ---------------------------------------------------------------------------
+-- Encoding-DSL front end (typed field placeholders)
+-- ---------------------------------------------------------------------------
+
+-- | Build an instruction's encoding from fixed bits and typed field
+-- placeholders, lifting the result (the placeholders) into the instruction
+-- monad and setting the encoding. See "Isacle.ISA.EncodingDSL".
+defineInstruction :: MonadALU m => Encoding a -> m a
+defineInstruction enc = let (a, str) = runEncoding enc in encoding str >> pure a
+
+-- | Read a register-file slot indexed by a field /placeholder/ — no string
+-- field name, no exposed handle. The placeholder carries the decoded index.
+readRegFileF :: (MonadALU m, HdlType t)
+             => (AluDef m -> CPURegFile count t) -> Field idx -> m (IExpr (Width t))
+readRegFileF sel f = register sel [fldKey f] >>= readReg
+
+-- | Write a register-file slot indexed by a field placeholder.
+writeRegFileF :: (MonadALU m, HdlType t)
+              => (AluDef m -> CPURegFile count t) -> Field idx -> IExpr (Width t) -> m ()
+writeRegFileF sel f e = register sel [fldKey f] >>= \r -> writeReg r e
+
+-- | Read a field placeholder as a width-typed value (re-exported convenience).
+immediateF :: KnownNat (Width t) => Field t -> IExpr (Width t)
+immediateF = fieldVal
 
 -- ---------------------------------------------------------------------------
 -- MonadHarvardALU
