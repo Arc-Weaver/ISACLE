@@ -31,6 +31,8 @@ module Isacle.ISA.EncodingDSL
     , fixed
     , placeholder
     , bind
+    , field
+    , bindBits
     , runEncoding
     , fieldVal
     ) where
@@ -79,6 +81,18 @@ placeholder = do
 bind :: Field t -> Encoding ()
 bind (Field k w) = modify $ \s ->
     s { esChars = esChars s ++ replicate w k }
+
+-- | Allocate /and/ place a contiguous field in one step (the common case):
+-- @field \@(Unsigned 5)@ ≡ @placeholder \@(Unsigned 5) >>= \\f -> bind f >> pure f@.
+field :: forall t. HdlType t => Encoding (Field t)
+field = do { f <- placeholder @t; bind f; pure f }
+
+-- | Place @n@ bits of a placeholder at the current position — for a split field,
+-- emit its high group then (later) its low group. The placements of one field,
+-- read MSB-first by position, reconstruct its value. (@bind f ≡ bindBits f (fldWidth f)@.)
+bindBits :: Field t -> Int -> Encoding ()
+bindBits (Field k _) n = modify $ \s ->
+    s { esChars = esChars s ++ replicate n k }
 
 -- | Run an encoding builder: the result (the placeholders) and the assembled
 -- encoding string in the existing character format.
