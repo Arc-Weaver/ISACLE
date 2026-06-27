@@ -14,6 +14,9 @@ module Hdl.Sim
     , evalSimOp
       -- * Graph-level interpreter
     , simulateDesign
+      -- * Whole-system: flatten a hierarchical design, then simulate
+    , flattenDesign
+    , simulateSystem
     ) where
 
 import Prelude
@@ -23,9 +26,11 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Control.Monad.State.Strict (State, evalState, get, put)
 
 import Hdl.Net
-    ( PrimOp(..), Repr(..), NetNode(..), SomeBits(..) )
+    ( PrimOp(..), Repr(..), WireId, NetNode(..), SomeBits(..)
+    , Design, EntityRef, localEntityName )
 import Hdl.Types (Signal(..), HdlType(..))
 
 -- | A simulated combinational signal: @SimSig value width repr@.
@@ -180,3 +185,75 @@ evalSimOp op ins = case (op, ins) of
     (PShiftL, [(a, wa, ra), (n, _, _)])     -> ((a `shiftL` fromInteger n) .&. mask wa, wa, ra)
     (PShiftR, [(a, wa, ra), (n, _, _)])     -> (a `shiftR` fromInteger n, wa, ra)
     _                                       -> error ("evalSimOp: unhandled " ++ show op)
+
+-- ---------------------------------------------------------------------------
+-- Whole-system: flatten a hierarchical Design into one node list
+-- ---------------------------------------------------------------------------
+
+-- | Inline every sub-instance of the named top entity into a single flat
+-- 'NetNode' list (wire IDs of each instance offset to avoid collision; ports
+-- connected by aliasing).  The result can be fed to 'simulateDesign', so a whole
+-- synthesized SoC is simulable in Haskell.
+flattenDesign :: Design -> String -> [NetNode]
+flattenDesign design top = evalState (go 0 top) 1
+  where
+    stride :: WireId
+    stride = 1 + maximum (0 : concatMap (concatMap nodeWires) (Map.elems design))
+
+    go :: WireId -> String -> State Int [NetNode]
+    go base name =
+        concat <$> mapM expand (map (mapWires (+ base)) (Map.findWithDefault [] name design))
+
+    expand :: NetNode -> State Int [NetNode]
+    expand (NSubInst _ ent ip op) = do
+        i <- get; put (i + 1)
+        case localEntityName ent of
+            Nothing  -> pure []
+            Just sub -> do
+                subNodes <- go (i * stride) sub
+                let inMap  = Map.fromList ip
+                    outMap = Map.fromList [ (p, w) | (p, w, _) <- op ]
+                pure (concatMap (connect inMap outMap) subNodes)
+    expand n = pure [n]
+
+    -- A sub-entity's input port becomes a wire driven by the parent; its output
+    -- port drives the parent's wire.  (Single-input POr is an identity alias.)
+    connect inMap outMap n = case n of
+        NInput  w p _ _ | Just pw <- Map.lookup p inMap  -> [NComb w  POr [pw, pw]]
+        NOutput s p _ _ | Just pw <- Map.lookup p outMap -> [NComb pw POr [s,  s ]]
+        _                                                -> [n]
+
+-- | Flatten a hierarchical design and simulate its top entity for @nCycles@.
+simulateSystem :: Design -> String -> Map String Integer -> Int -> [Map String Integer]
+simulateSystem design top = simulateDesign (flattenDesign design top)
+
+-- | Re-map every wire id in a node.
+mapWires :: (WireId -> WireId) -> NetNode -> NetNode
+mapWires f n = case n of
+    NReg o i e ini d            -> NReg (f o) (f i) (fmap f e) ini d
+    NComb o op ins              -> NComb (f o) op (map f ins)
+    NInput o nm w d             -> NInput (f o) nm w d
+    NOutput i nm w d            -> NOutput (f i) nm w d
+    NSubInst nm en ip op        -> NSubInst nm en [ (p, f w) | (p, w) <- ip ]
+                                                  [ (p, f w, wd) | (p, w, wd) <- op ]
+    NMem o ra wa wd we sz dw ix d -> NMem (f o) (f ra) (f wa) (f wd) (f we) sz dw ix d
+    NRom o ra sz dw ix          -> NRom (f o) (f ra) sz dw ix
+    NHint w nm                  -> NHint (f w) nm
+    NRepr w r                   -> NRepr (f w) r
+    NComment t                  -> NComment t
+    NGroup nm fs                -> NGroup nm [ (fn, f w) | (fn, w) <- fs ]
+
+-- | Every wire id referenced by a node (for computing the offset stride).
+nodeWires :: NetNode -> [WireId]
+nodeWires n = case n of
+    NReg o i e _ _              -> o : i : maybe [] pure e
+    NComb o _ ins               -> o : ins
+    NInput o _ _ _              -> [o]
+    NOutput i _ _ _             -> [i]
+    NSubInst _ _ ip op          -> map snd ip ++ [ w | (_, w, _) <- op ]
+    NMem o ra wa wd we _ _ _ _  -> [o, ra, wa, wd, we]
+    NRom o ra _ _ _             -> [o, ra]
+    NHint w _                   -> [w]
+    NRepr w _                   -> [w]
+    NComment _                  -> []
+    NGroup _ fs                 -> map snd fs

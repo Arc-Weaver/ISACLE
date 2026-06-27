@@ -60,3 +60,17 @@ runSimTests = do
                      (simulateDesign (ramp M.! "ramp")
                                      (M.fromList [("sp", 250), ("st", 2), ("tick", 1)]) 6)
     assert "signed ramp sim == GHDL" (rtrace == [0, 254, 252, 250, 250, 250])
+
+    -- Whole-system: a top entity that instantiates a "+1" sub-entity, flattened
+    -- and simulated (dout = din + 1).
+    let hier = execDesign "top" $ do
+            din <- freshWire; emit (NInput din "din" 8 dom)
+            (_, subOuts) <- inBlock "u_inc" "inc" [din] $ do
+                xW   <- freshWire; emit (NInput xW "x" 8 dom)
+                oneW <- freshWire; emit (NComb oneW (PLit 1 8) [])
+                yW   <- freshWire; emit (NComb yW PAdd [xW, oneW])
+                emit (NOutput yW "y" 8 dom)
+            emit (NOutput (case subOuts of { ((_,w,_):_) -> w; _ -> 0 }) "dout" 8 dom)
+    let hout = M.lookup "dout" (head (simulateSystem hier "top" (M.fromList [("din", 5)]) 1))
+    assert "flatten+sim hierarchy (dout = din+1)" (hout == Just 6)
+
