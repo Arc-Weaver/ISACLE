@@ -124,3 +124,15 @@ the deriving mechanism (H2) before committing the root reframe (H1). Also a Phas
 doc task: **rewrite `DEFINITIONS.md` to the target** (it currently mixes
 current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
 (CPU / Bus&peripherals / Address mapping / SystemDSL).
+
+## Progress log
+
+- **Phase A — DONE** (commit `7949f3a`): structure-preserving `HdlType` (record
+  `Generic` deriving, `mkGroup`, enums, package types). GHDL-verified;
+  output-neutral.
+- **Phase B — DONE** (commits `7ac39a3`, `b026883`): `Signal` typeclass (ops
+  lifted, anchored on `HdlType` via `HdlEq`/`HdlOrd`); `Hdl` arrow
+  (`Category`/`Arrow`/`register`). Naming settled — kept `KnownDom`, `Signal`
+  (class) / `Sig` (synth instance). All four pillars are now typeclasses.
+- **Next:** Phase C (sim interpreter — second `Signal`/`Hdl` instance; S2/S3) →
+  D/E/F (system layer).

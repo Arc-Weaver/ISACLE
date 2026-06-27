@@ -133,8 +133,11 @@ so we can build/work with `HdlType`s within a domain.
 type error. Combinational ops (`mux`, `.==.`, arithmetic) are pure `Sig→Sig`.
 **Largely matches** the model, incl. the monadic `SExpr` carrier.
 
-- [ ] **S1 (naming)** — Canonical names: `Sig` vs `Signal`, `KnownDom` vs
-  `ClockDomain`. Pick one; align the API surface + docs.
+- [x] **S1 (naming — RESOLVED)** — `ClockDomain` rejected; keep **`KnownDom`**
+  (user: "KnownDomain is a fine name, or KnownDom also ok" → kept `KnownDom` to
+  match the committed pillar work, no churn). `Sig` and `Signal` now coexist by
+  design: **`Signal`** is the combinational typeclass (the lift), **`Sig`** is its
+  synthesis instance.
 - [ ] **S2 (additive)** — Domain crossing is **provided**, with the *how*
   **type-injected from a separate crossing-strategy class** (2-FF sync / async
   FIFO / handshake …), selected by instance resolution. **NOT a signal
