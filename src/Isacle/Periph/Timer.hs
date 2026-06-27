@@ -48,18 +48,21 @@ timerDef
     => sig dat                     -- ^ current counter value (from counter FSM)
     -> PeriphDef Timer sig dat (sig dat, sig dat, sig dat, sig Bool)
 timerDef cntSig = do
+    -- TCCR: has the CTC bit-field, so it keeps the explicit register/bitF
+    -- declaration (the read-back is the written value).
     register RW8 0 "TCCR" "Timer control"
         [ bitF ReadWrite 0 "CTC" "CTC mode: reset counter on compare match" ]
     tccr <- onWrite "tccr" 0 0
     onRead 0 tccr
 
-    field8 ReadWrite 1 "TCNT" "Counter value (write to preset)"
+    -- TCNT: typed metadata, but the read returns the FSM counter and the write
+    -- presets via a strobe — explicit logic kept.
+    fieldOf @(Unsigned 8) ReadWrite 1 "TCNT" "Counter value (write to preset)"
     (tcntPreset, tcntWritten) <- onWriteStrobe "tcnt" 1 0
     onRead 1 cntSig
 
-    field8 ReadWrite 2 "OCR" "Output compare register"
-    ocr <- onWrite "ocr" 2 0
-    onRead 2 ocr
+    -- OCR: a plain read/write register — the fused typed PE2 combinator fits.
+    ocr <- regField @(Unsigned 8) 2 "OCR" "Output compare register" 0
 
     return (tccr, ocr, tcntPreset, tcntWritten)
 
