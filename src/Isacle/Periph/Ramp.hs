@@ -70,17 +70,11 @@ rampDef
     -> PeriphDef Ramp (Sig dom) (Unsigned 8)
                  (Sig dom (Signed 8), Sig dom (Signed 8))
 rampDef curU = do
-    fieldOf @(Signed 8) ReadWrite 0 "SETPOINT" "Target value (signed)"
-    spU <- onWrite "setpoint" 0 0
-    onRead 0 spU
-
-    fieldOf @(Signed 8) ReadWrite 1 "STEP" "Step magnitude per tick (signed)"
-    stU <- onWrite "step" 1 0
-    onRead 1 stU
-
-    fieldOf @(Signed 8) ReadOnly 2 "CURRENT" "Current ramp value (signed, read-only)"
-    onRead 2 curU
-
+    -- Fused typed PE2 combinators — and a signed-register exercise (regField/
+    -- roField @(Signed 8) carry the RSigned representation into the metadata).
+    spU <- regField @(Signed 8) 0 "SETPOINT" "Target value (signed)" 0
+    stU <- regField @(Signed 8) 1 "STEP" "Step magnitude per tick (signed)" 0
+    roField @(Signed 8) 2 "CURRENT" "Current ramp value (signed, read-only)" curU
     return (asSigned spU, asSigned stU)
 
 -- ---------------------------------------------------------------------------
