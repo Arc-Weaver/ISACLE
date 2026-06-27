@@ -203,8 +203,18 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
     the 8051 — GHDL-analyzed), and the whole 8051 state expressed as a recursive
     record `Mcs51State` (nested Psw/Ie, Width 80, round-trips). Both CPU cores now
     have record flags + record state at C1 parity.
-  - *Verified:* full pass — ISACLE tests, cl51 18 + synth + GHDL-analyze, clavr
-    8/8 GHDL — all green.
+  - **Whole-SoC sim fix** (`e530a2a`): diagnosed the "gpio unresolved" gap —
+    flattening is clean; the cause was a master-less bus leaving its interface
+    wires undriven, stalling the solver. Tie undriven operand wires to 0 → the
+    gpio SoC now simulates (port/ddr = 0 at reset). Whole-SoC sim test added.
+  - **Emitter reserved-word fix + peripheral PE2 adoption** (`316b41b`,
+    `92a37cf`, `32d04b0`, `fada328`): migrating GPIO to `regField`/`roField`
+    surfaced a case-sensitive reserved-word check (`PORT` → invalid VHDL);
+    fixed to fold case (`PORT` → `PORT_s`). Then GPIO/UART/Timer/Ramp adopt the
+    typed PE2 combinators where they fit (Ramp exercises the *signed* path).
+    Each GHDL-verified — all 8 clavr benches PASS after every step.
+  - *Verified:* full pass — ISACLE tests, cl51 21 + synth + GHDL-analyze, clavr
+    unit + 8/8 GHDL — all green.
 - **Remaining (large, supervised):** whole-`AVRALU`-as-`HdlType` access +
   `pcW` elimination (PLAN_CORE_REFRAME.md steps 3–4); Phase F heterogeneous
   SystemDSL (multi-domain/width/CPU + per-CPU reductions); type-level A2;
