@@ -19,6 +19,7 @@ module Isacle.System.Periph
     , field
     , field8
     , fieldOf
+    , fieldRec
     , register
       -- * Spec types
     , PeriphSpec(..)
@@ -50,7 +51,8 @@ import GHC.TypeLits (natVal)
 
 import Hdl.Net (Repr(..))
 import Hdl.Prim (Unsigned)
-import Hdl.Types (HdlType, hdlRepr, Width)
+import Hdl.Types (HdlType, hdlRepr, Width, GFields, recordFields)
+import GHC.Generics (Generic, Rep)
 import Isacle.System.Spec (NullSig(..))
 
 -- ---------------------------------------------------------------------------
@@ -294,6 +296,32 @@ fieldOf = fieldFull (regWidthBits (fromIntegral (natVal (Proxy @(Width a)))))
     regWidthBits 32 = RW32
     regWidthBits n  = error ("fieldOf: unsupported register width "
                              ++ show n ++ " bits (expected 8, 16, or 32)")
+
+-- | Typed register declaration whose **bit-fields are derived from a record
+-- 'HdlType'** — so a CPU flag register and a peripheral control register share
+-- the same mechanism (define the record once; the bit-field layout, width, and
+-- representation all come from it).  Bits are MSB-first in field order (matching
+-- the 'Hdl.Types.genericToBits' packing).
+--
+-- > data Ctrl = Ctrl { enable :: Bit, mode :: Unsigned 2, irq :: Bit }
+-- >   deriving (Generic, HdlType)
+-- > fieldRec @Ctrl ReadWrite 0 "CTRL" "control register"
+fieldRec :: forall a p sig dat. (HdlType a, Generic a, GFields (Rep a))
+         => RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+fieldRec acc off name desc = PeriphDef $ lift $ modify $ \st ->
+    st { paFields = paFields st
+                 ++ [FieldSpec off width acc name desc (hdlRepr (Proxy @a)) bfs] }
+  where
+    fields = recordFields (Proxy @a)
+    total  = sum (map snd fields)
+    width  = case total of
+        8  -> RW8; 16 -> RW16; 32 -> RW32
+        n  -> error ("fieldRec: unsupported register width " ++ show n)
+    bfs = layoutBits (total - 1) fields
+    layoutBits _  []              = []
+    layoutBits hi ((fn, w) : rest) =
+        let lo = hi - w + 1
+        in BitField (fromIntegral lo) (fromIntegral hi) acc fn "" : layoutBits (lo - 1) rest
 
 register :: RegWidth -> Word8 -> String -> String -> [BitField]
          -> PeriphDef p sig dat ()

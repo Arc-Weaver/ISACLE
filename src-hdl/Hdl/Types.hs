@@ -47,6 +47,9 @@ module Hdl.Types
     , GWidth
     , genericToBits
     , genericFromBits
+      -- * Record field extraction (bit-maps)
+    , GFields(..)
+    , recordFields
       -- * Clock domain typeclass
     , KnownDom(..)
     ) where
@@ -62,7 +65,7 @@ import GHC.Generics
     ( Generic, Rep, from, to
     , M1(..), K1(..), U1(..)
     , (:*:)(..), (:+:)(..)
-    , S, R, C
+    , D, S, R, C
     , Selector, selName
     , Constructor, conName
     )
@@ -369,6 +372,36 @@ class HdlEq a => HdlOrd a where
 
 instance HdlType a => HdlEq a
 instance HdlType a => HdlOrd a
+
+-- ---------------------------------------------------------------------------
+-- Record field extraction (for bit-maps / documentation)
+-- ---------------------------------------------------------------------------
+
+-- | Generic extraction of a record's field names and bit widths, in
+-- declaration order.  Used to derive a register's bit-fields from a record
+-- 'HdlType' (so CPU flags and peripheral bit-fields share one mechanism).
+class GFields (f :: Type -> Type) where
+    gFields :: [(String, Int)]
+
+instance GFields U1 where
+    gFields = []
+
+instance GFields f => GFields (M1 D c f) where
+    gFields = gFields @f
+
+instance GFields f => GFields (M1 C c f) where
+    gFields = gFields @f
+
+instance (Selector s, HdlType a) => GFields (M1 S s (K1 R a)) where
+    gFields = [ ( selName (undefined :: M1 S s (K1 R a) ())
+                , fromIntegral (natVal (Proxy @(Width a))) ) ]
+
+instance (GFields f, GFields g) => GFields (f :*: g) where
+    gFields = gFields @f ++ gFields @g
+
+-- | A record 'HdlType'\'s @(fieldName, bitWidth)@ list, in declaration order.
+recordFields :: forall a. (Generic a, GFields (Rep a)) => Proxy a -> [(String, Int)]
+recordFields _ = gFields @(Rep a)
 
 -- ---------------------------------------------------------------------------
 -- Port bundle typeclass

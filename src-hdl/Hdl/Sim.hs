@@ -30,7 +30,7 @@ import Control.Monad.State.Strict (State, evalState, get, put)
 
 import Hdl.Net
     ( PrimOp(..), Repr(..), WireId, NetNode(..), SomeBits(..)
-    , Design, EntityRef, localEntityName )
+    , Design, localEntityName )
 import Hdl.Types (Signal(..), HdlType(..))
 
 -- | A simulated combinational signal: @SimSig value width repr@.
