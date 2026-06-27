@@ -136,3 +136,15 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
   (class) / `Sig` (synth instance). All four pillars are now typeclasses.
 - **Next:** Phase C (sim interpreter — second `Signal`/`Hdl` instance; S2/S3) →
   D/E/F (system layer).
+- **Phase C (sim) — DONE** (commits `2ee59f2`…`247c689`): `Hdl.Sim` — a second
+  `Signal` interpreter (`SimSig`, computes values) **and** a graph-level
+  `simulateDesign` (runs synthesized `NetNode` designs over cycles; combinational
+  + registers + ROM). Signed-correct via the value type's `Repr`. Cross-validated:
+  the sim's signed-ramp trajectory matches GHDL exactly (`0,-2,-4,-6`); unit
+  tests added to `test-library`. **The "one description, many interpreters"
+  principle is now concrete: synth (→VHDL→GHDL) and sim (→values) of the same
+  `Signal` program agree.**
+- **Remaining:** Phase C S2/S3 (crossing strategy; registers-out-of-`Sig` — both
+  stylistic/additive); Phases D–F (system layer: CPU-core-as-`HdlType`, bus
+  capability hierarchy, heterogeneous SystemDSL) — the large, design-heavy
+  redesigns. Sub-instance + RAM simulation would extend the sim to whole SoCs.
