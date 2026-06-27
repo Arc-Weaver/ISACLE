@@ -373,10 +373,13 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
                                    , let c = base ++ "_" ++ show i
                                    , not (Set.member c used) ]
 
+    -- VHDL identifiers are case-insensitive, so a reserved word must be matched
+    -- regardless of case (e.g. "PORT" is as reserved as "port"); vhdlReserved is
+    -- all-lowercase, so fold the hint before testing.
     safeHint wid h
-        | Set.member h portNames    = h ++ if isReg wid then "_r" else "_s"
-        | Set.member h vhdlReserved = h ++ "_s"
-        | otherwise                 = h
+        | Set.member h portNames               = h ++ if isReg wid then "_r" else "_s"
+        | Set.member (map toLower h) vhdlReserved = h ++ "_s"
+        | otherwise                            = h
     isReg wid = any (\case { NReg out _ _ _ _ -> out == wid; _ -> False }) nodes
 
     litMap = Map.fromList
