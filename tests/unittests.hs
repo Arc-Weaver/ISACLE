@@ -9,6 +9,7 @@ import qualified Tests.Isacle.GPIO             as GPIO
 import qualified Tests.Isacle.Periph.Timer     as Timer
 import qualified Tests.Isacle.Periph.UART      as UART
 import qualified Tests.Isacle.Periph.DMA       as DMA
+import qualified Tests.Isacle.Periph.PE2       as PE2
 import qualified Tests.Isacle.System.Bus       as Bus
 import qualified Tests.Isacle.Layout    as Layout
 import qualified Tests.Isacle.HdlTypes         as HdlTypes
@@ -29,6 +30,8 @@ main = do
     UART.runUartTests
     putStrLn "\n=== DMA engine ==="
     DMA.runDmaTests
+    putStrLn "\n=== Peripheral PE2 typed fields ==="
+    PE2.runPE2Tests
     putStrLn "\n=== System Bus DSL ==="
     Bus.runBusTests
     putStrLn "\n=== Address-mapping layout ==="

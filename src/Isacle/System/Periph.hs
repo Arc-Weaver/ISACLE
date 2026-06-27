@@ -15,6 +15,9 @@ module Isacle.System.Periph
     , onWrite
     , onWriteStrobe
     , onRead
+      -- * Typed field + logic in one (PE2)
+    , regField
+    , roField
       -- * Register / field declarations (metadata)
     , field
     , field8
@@ -260,6 +263,32 @@ onRead off sig = PeriphDef $ do
     lift $ modify $ \acc ->
         let prev = paRdData acc
         in acc { paRdData = sigMux ops (biRdEqAddr bus off) sig prev }
+
+-- | PE2: declare a /typed/ read-write register AND wire its write register and
+-- read-back mux in one call. The field's name, byte offset, width and
+-- representation are single-sourced — the metadata ('fieldOf') and the logic
+-- ('onWrite'/'onRead') agree by construction, instead of repeating the offset
+-- across a separate metadata/logic pair. Returns the register's value signal.
+--
+-- > setpoint <- regField @(Signed 8) 0 "SETPOINT" "target value" 0
+regField :: forall a p sig dat. HdlType a
+         => Word8 -> String -> String -> dat
+         -> PeriphDef p sig dat (sig dat)
+regField off name desc initVal = do
+    fieldOf @a ReadWrite off name desc
+    val <- onWrite name (fromIntegral off) initVal
+    onRead (fromIntegral off) val
+    pure val
+
+-- | PE2: declare a /typed/ read-only register AND wire its read mux from a
+-- peripheral-supplied signal, single-sourcing the field metadata and the read
+-- logic. For status/input registers the hardware drives.
+roField :: forall a p sig dat. HdlType a
+        => Word8 -> String -> String -> sig dat
+        -> PeriphDef p sig dat ()
+roField off name desc sig = do
+    fieldOf @a ReadOnly off name desc
+    onRead (fromIntegral off) sig
 
 -- ---------------------------------------------------------------------------
 -- Structural metadata declarations

@@ -230,6 +230,7 @@ test-suite test-library
     Tests.Isacle.Periph.Timer
     Tests.Isacle.Periph.UART
     Tests.Isacle.Periph.DMA
+    Tests.Isacle.Periph.PE2
     Tests.Isacle.ISA.WidthCheck
     Tests.Isacle.System.Bus
     Tests.Isacle.Layout
