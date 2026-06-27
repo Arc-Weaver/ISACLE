@@ -18,9 +18,10 @@ import GHC.Generics (Generic, Rep)
 import System.Exit (exitFailure)
 
 import Hdl.Types (HdlType(..), GWidth, genericToBits, genericFromBits)
-import Hdl.Bits  (Bit)
+import Hdl.Bits  (Bit, Vec)
+import Hdl.Prim  (Unsigned)
 import Isacle.Layout
-import Isacle.ISA.CPUDef (flagRec, runCPUDef, CPUSchema(..))
+import Isacle.ISA.CPUDef (flagRec, regsFromRecord, runCPUDef, CPUSchema(..))
 import Isacle.ISA.Types  (CPUFlag(..))
 
 assert :: String -> Bool -> IO ()
@@ -35,6 +36,19 @@ data Sreg = Sreg
 
 instance HdlType Sreg where
     type Width Sreg = GWidth (Rep Sreg)
+    toBits   = genericToBits
+    fromBits = genericFromBits
+
+-- A miniature core state with an array field and two scalars, to check that
+-- regsFromRecord single-sources register (name, width) pairs from the record.
+data CoreSt = CoreSt
+    { csGPR :: Vec 4 (Unsigned 8)
+    , csSP  :: Unsigned 16
+    , csPC  :: Unsigned 12
+    } deriving Generic
+
+instance HdlType CoreSt where
+    type Width CoreSt = GWidth (Rep CoreSt)
     toBits   = genericToBits
     fromBits = genericFromBits
 
@@ -70,5 +84,11 @@ runLayoutTests = do
             == [ (plPos p, "SREG") | p <- sortOn plPos (layoutPlacements l) ])
     assert "flag fC is bit 0 of SREG"
         (any (\f -> cpuFlagBit f == 0 && cpuFlagReg f == "SREG") flags)
+
+    -- regsFromRecord: register names + widths single-sourced from the record
+    -- (the array field's width is count*element = 4*8 = 32).
+    let (_, coreSch) = runCPUDef (regsFromRecord (Proxy @CoreSt))
+    assert "regsFromRecord derives (name,width) from the record fields"
+        (schRegisters coreSch == [("csGPR", 32), ("csSP", 16), ("csPC", 12)])
   where
     find' n = foldr (\p acc -> if plName p == n then Just p else acc) Nothing

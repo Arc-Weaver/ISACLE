@@ -10,7 +10,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 import GHC.Generics (Generic, Rep)
 import Hdl.Bits
-import Hdl.Types (HdlType, Width, GFields)
+import Hdl.Types (HdlType, Width, GFields, recordFields)
 import Isacle.Layout (bitLayout, layoutSize, layoutPlacements, plName, plPos)
 import Isacle.ISA.Types
 
@@ -108,6 +108,16 @@ flagRec regName = CPUDef $ do
         , schStatusRegs = [(regName, w, flagNames)]
         }
     pure (CPURegister regName, flags)
+
+-- | Declare every field of a record 'HdlType' as a CPU register, single-sourcing
+-- each register's name (the field selector) and width (the field's 'Width') from
+-- the record — groundwork for the core-as-record reframe (C1/C3, step 2 of
+-- @PLAN_CORE_REFRAME.md@). Adopting this in a core def replaces the hand-written
+-- @reg "PC"@ / @reg "SP"@ calls: the schema's names and widths /are/ the record's
+-- fields, so they cannot drift from the Haskell type. Status registers still use
+-- 'flagRec' (for the bit-fields); this covers the plain scalar/array registers.
+regsFromRecord :: forall a. (Generic a, GFields (Rep a)) => Proxy a -> CPUDef ()
+regsFromRecord _ = CPUDef $ tell mempty { schRegisters = recordFields (Proxy @a) }
 
 -- Declare that a register is readable/writable via a data space address.
 -- The pipeline uses these to detect hazards across the register/memory boundary.
