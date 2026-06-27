@@ -9,6 +9,7 @@ import qualified Tests.Isacle.Periph.Timer     as Timer
 import qualified Tests.Isacle.Periph.UART      as UART
 import qualified Tests.Isacle.Periph.DMA       as DMA
 import qualified Tests.Isacle.System.Bus       as Bus
+import qualified Tests.Isacle.Sim              as Sim
 
 main :: IO ()
 main = do
@@ -27,4 +28,6 @@ main = do
     DMA.runDmaTests
     putStrLn "\n=== System Bus DSL ==="
     Bus.runBusTests
+    putStrLn "\n=== Simulation interpreter ==="
+    Sim.runSimTests
     putStrLn "\n=== all tests passed ==="

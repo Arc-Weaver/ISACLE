@@ -227,6 +227,7 @@ test-suite test-library
     Tests.Isacle.Periph.UART
     Tests.Isacle.Periph.DMA
     Tests.Isacle.System.Bus
+    Tests.Isacle.Sim
   build-depends:
     base >= 4.12 && < 4.22,
     containers >= 0.6,
