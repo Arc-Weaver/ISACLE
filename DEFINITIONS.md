@@ -313,5 +313,8 @@ it sits under neither layer):
 - **Protocol library** — a real `BurstBus` interconnect; Wishbone/AXI-lite.
 - **Structure-preserving array emission** — `Vec`-typed *wires* → VHDL arrays
   (the value-level `HdlType (Vec n a)` is done; signal/emitter path remains).
-- Whole-SoC simulation: deep sub-instance + RAM chaining in `simulateSystem`.
+- Whole-SoC simulation now handles multi-level local hierarchies and
+  un-stimulated (master-less) subsystems (undriven wires tie off to 0); the
+  remaining gap is routing data *through* an external primitive (e.g. an IP RAM
+  block) that flattening cannot inline — that needs a behavioural model.
 - A monadic sequential-process DSL at the HDL layer (auto state/transitions).

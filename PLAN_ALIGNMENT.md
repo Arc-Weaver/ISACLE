@@ -209,4 +209,5 @@ current/`[target]`), organised per the `ADJUSTMENTS` "Target organization"
   `pcW` elimination (PLAN_CORE_REFRAME.md steps 3–4); Phase F heterogeneous
   SystemDSL (multi-domain/width/CPU + per-CPU reductions); type-level A2;
   BurstBus interconnect; structure-preserving `Vec` *wire* emission; whole-SoC
-  sim of external primitives.
+  sim of data routed *through* external primitives (the un-stimulated /
+  master-less and multi-level-local cases are now handled — commit `e530a2a`).
