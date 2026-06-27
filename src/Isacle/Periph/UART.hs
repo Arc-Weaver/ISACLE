@@ -48,19 +48,22 @@ uartDef
     -> sig dat    -- ^ RX buffer (read side of UDR, driven by serial FSM)
     -> PeriphDef UART sig dat (sig dat, sig Bool, sig dat)
 uartDef stat rxData = do
-    field8 ReadWrite 0 "UDR" "TX write / RX read (reads return Rx buffer)"
+    -- UDR: typed metadata, but the read side returns the FSM's RX buffer (not the
+    -- written value) and the write side needs a strobe, so the logic stays
+    -- explicit (onWriteStrobe/onRead) rather than the fused regField.
+    fieldOf @(Unsigned 8) ReadWrite 0 "UDR" "TX write / RX read (reads return Rx buffer)"
     (txData, txStrobe) <- onWriteStrobe "udr" 0 0
     onRead 0 rxData
 
+    -- USR: sparse read-only status bits driven by the FSM (explicit bitF).
     register RW8 1 "USR" "Status"
         [ bitF ReadOnly 0 "UDRE" "TX data register empty (safe to write)"
         , bitF ReadOnly 1 "RXC"  "RX complete (received byte ready)"
         ]
     onRead 1 stat
 
-    field8 ReadWrite 2 "UBRR" "Baud rate divisor (system clocks per baud period)"
-    baud <- onWrite "ubrr" 2 0
-    onRead 2 baud
+    -- UBRR: a plain read/write register — the fused typed PE2 combinator fits.
+    baud <- regField @(Unsigned 8) 2 "UBRR" "Baud rate divisor (system clocks per baud period)" 0
 
     return (txData, txStrobe, baud)
 
