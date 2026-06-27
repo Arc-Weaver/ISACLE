@@ -82,6 +82,9 @@ mask w = (1 `shiftL` w) - 1
 -- Sub-instances are expected to have been inlined first by 'flattenDesign'; a
 -- residual 'NSubInst' (an /external/ entity that flattening could not inline)
 -- contributes nothing, so wires it would have driven stay unresolved.
+-- Operand wires that no node drives (e.g. an un-stimulated bus-master interface
+-- in a subsystem with no master) are tied off to 0, so the solver's fixpoint
+-- completes instead of stalling and leaving every downstream value unresolved.
 simulateDesign :: [NetNode] -> Map String Integer -> Int -> [Map String Integer]
 simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
   where
@@ -90,6 +93,29 @@ simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
     initRegs   = Map.fromList [ (nOut n, sbVal) | n@NReg{} <- nodes, let SomeBits sbVal _ = nInit n ]
     inputWires = [ (nPortName n, nOut n, nWidth n) | n@NInput{} <- nodes ]
     combs      = [ n | n@NComb{} <- nodes ]
+
+    -- Wires referenced as an operand but produced by no node — undriven (e.g. an
+    -- un-stimulated bus-master interface in a subsystem with no master attached).
+    -- VHDL would leave these 'U'; for simulation we tie them off to 0 so the
+    -- fixpoint can complete instead of stalling on the dangling wire (which would
+    -- otherwise block every downstream value, leaving outputs unresolved).
+    produced w = case w of
+        NReg o _ _ _ _              -> [o]
+        NComb o _ _                 -> [o]
+        NInput o _ _ _              -> [o]
+        NRom o _ _ _ _              -> [o]
+        NMem o _ _ _ _ _ _ _ _      -> [o]
+        _                           -> []
+    operand w = case w of
+        NComb _ _ ins               -> ins
+        NReg _ i e _ _              -> i : maybe [] pure e
+        NOutput s _ _ _             -> [s]
+        NMem _ ra wa wd we _ _ _ _  -> [ra, wa, wd, we]
+        NRom _ ra _ _ _             -> [ra]
+        _                           -> []
+    drivenSet = Map.fromList [ (w, ()) | n <- nodes, w <- produced n ]
+    tieOffs   = [ w | w <- Map.keys (Map.fromList [ (w, ()) | n <- nodes, w <- operand n ])
+                    , not (Map.member w drivenSet) ]
 
     memInit = Map.fromList
         [ (nOut n, Map.fromList (zip [0 :: Integer ..] (nMemInit n))) | n@NMem{} <- nodes ]
@@ -100,6 +126,8 @@ simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
     go (regs, mems) k = outs : go (regs', mems') (k - 1)
       where
         seed = Map.fromList $
+            [ (wid, (0, 1, RUnsigned)) | wid <- tieOffs ]
+            ++
             [ (wid, ((inputs Map.! nm) .&. mask wdt, wdt, reprOfW wid))
             | (nm, wid, wdt) <- inputWires, Map.member nm inputs ]
             ++
@@ -200,13 +228,14 @@ evalSimOp op ins = case (op, ins) of
 -- connected by aliasing).  Recurses through nested /local/ entities to any
 -- depth — a top → mid → leaf hierarchy flattens fully (see the Sim tests).
 -- The result can be fed to 'simulateDesign', so a whole locally-defined SoC is
--- simulable in Haskell.
+-- simulable in Haskell — including one whose bus has no master attached (the
+-- un-driven master interface ties off to 0 in 'simulateDesign').
 --
 -- Limitation: a sub-instance of an /external/ entity (one with no
 -- 'localEntityName' — a primitive RAM/IP block not defined in this 'Design') is
--- dropped rather than inlined, so any wire it would drive is left unresolved.
--- Simulating an SoC that routes through such a primitive needs a model for it
--- (future work); purely local hierarchies are unaffected.
+-- dropped rather than inlined, so a design that routes data /through/ such a
+-- primitive needs a model for it (future work); purely local hierarchies, and
+-- un-stimulated inputs, are handled.
 flattenDesign :: Design -> String -> [NetNode]
 flattenDesign design top = evalState (go 0 top) 1
   where

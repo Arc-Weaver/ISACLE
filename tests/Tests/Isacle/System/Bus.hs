@@ -5,9 +5,11 @@ module Tests.Isacle.System.Bus where
 import Prelude
 import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
+import qualified Data.Map.Strict as M
 import System.Exit (exitFailure)
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
+import Hdl.Sim   (simulateSystem)
 import Isacle.System.BusCap
     ( Capability(..), canDrive, canDriveWidth, BusAdapter(..), widthAdapter, stallAdapter )
 import Hdl.Types (KnownDom(..), Sig(..))
@@ -101,6 +103,18 @@ runBusTests = do
         ("MEMORY" `isSubstr` srLinkerScript red)
     assert "reduceToMemoryMap standalone agrees with bundle"
         (reduceToMemoryMap (gpioBusSys pinSig) == srMemoryMap red)
+
+    -- Whole-SoC simulation: the gpio system has no CPU master, so its bus-master
+    -- interface is undriven. Those wires tie off to 0 (rather than stalling the
+    -- solver), so the SoC simulates and its gpio outputs resolve — at reset both
+    -- the port and DDR registers read 0.
+    putStrLn "\n-- whole-SoC simulation --"
+    let design = execSystemDSL @Clk @(Unsigned 8) "top" (gpioBusSys pinSig)
+        socOut = head (simulateSystem design "top" M.empty 1)
+    assert "whole-SoC sim resolves gpio port output"
+        (M.lookup "gpio_GpioPhys_gpioPort" socOut == Just 0)
+    assert "whole-SoC sim resolves gpio ddr output"
+        (M.lookup "gpio_GpioPhys_gpioDdr" socOut == Just 0)
   where
     isSubstr _ []              = False
     isSubstr [] _              = True
