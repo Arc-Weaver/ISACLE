@@ -4,6 +4,7 @@
 module Hdl.Types
     ( -- * Per-signal domain tags
       Sig(..)
+    , Signal(..)
     , materialize
       -- * Representation tagging
     , withRepr
@@ -34,6 +35,9 @@ module Hdl.Types
     , sigResize
       -- * Synthesizability constraints
     , HdlType(..)
+      -- * Operation classes on HdlType values (lifted to signals)
+    , HdlEq(..)
+    , HdlOrd(..)
     , HdlPorts(..)
     , PortSpec(..)
       -- * Generic derivation support (satisfy derived-instance constraints)
@@ -52,7 +56,6 @@ import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import Data.Coerce (coerce)
 import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
@@ -70,7 +73,7 @@ import Hdl.Net
 -- Per-signal clock domain
 -- ---------------------------------------------------------------------------
 
-data Sig (dom :: k) a
+data Sig (dom :: k) (a :: Type)
     = SWire WireId
     | SExpr (NetM WireId)
 
@@ -93,6 +96,39 @@ primSig1 :: PrimOp -> Sig dom a -> Sig dom b
 primSig1 op a = SExpr $ do
     wa <- materialize a
     lookupOrEmit op [wa]
+
+-- ---------------------------------------------------------------------------
+-- Signal — the combinational signal surface, abstract over the interpreter
+-- ---------------------------------------------------------------------------
+
+-- | The combinational signal value surface, abstract over the interpreter
+-- (tagless-final, P1).  'Sig' is the synthesis interpreter (→ NetNode graph);
+-- simulation / documentation interpreters are future instances.  The two
+-- primitive-application methods are the core; the pure combinational operators
+-- (comparison, logic, bitwise, …) are derived free functions over any 'Signal'.
+--
+-- Synth-specific operations — 'withRepr', 'sigReinterpret', 'materialize' — are
+-- deliberately /not/ methods: they belong to the wire/synthesis model, not to a
+-- backend-agnostic signal.
+class Signal (sig :: k -> Type -> Type) where
+    -- | Apply a unary primitive operation.
+    sigPrim1 :: PrimOp -> sig dom a -> sig dom b
+    -- | Apply a binary primitive operation.
+    sigPrim2 :: PrimOp -> sig dom a -> sig dom b -> sig dom c
+    -- | Apply a ternary primitive operation (e.g. mux).
+    sigPrim3 :: PrimOp -> sig dom a -> sig dom b -> sig dom c -> sig dom d
+    -- | A raw bit-pattern literal of the given value and width.
+    sigLitW  :: Integer -> Int -> sig dom a
+
+instance Signal Sig where
+    sigPrim1 = primSig1
+    sigPrim2 = primSig2
+    sigPrim3 op a b c = SExpr $ do
+        wa <- materialize a
+        wb <- materialize b
+        wc <- materialize c
+        lookupOrEmit op [wa, wb, wc]
+    sigLitW v w = SExpr (lookupOrEmit (PLit v w) [])
 
 -- | Tag a typed signal's wire with its representation (from 'hdlRepr'), so the
 -- emitter declares it with the right VHDL signal type.  Apply where a typed
@@ -119,73 +155,61 @@ sigReinterpret s = SExpr $ do
 -- ---------------------------------------------------------------------------
 
 infix 4 .==.
-(.==.) :: HdlType a => Sig dom a -> Sig dom a -> Sig dom Bool
-(.==.) = primSig2 PEq
+(.==.) :: (Signal sig, HdlEq a) => sig dom a -> sig dom a -> sig dom Bool
+(.==.) = sigPrim2 PEq
 
 infix 4 .<.
-(.<.) :: HdlType a => Sig dom a -> Sig dom a -> Sig dom Bool
-(.<.) = primSig2 PLt
+(.<.) :: (Signal sig, HdlOrd a) => sig dom a -> sig dom a -> sig dom Bool
+(.<.) = sigPrim2 PLt
 
 infixr 3 .&&.
-(.&&.) :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
-(.&&.) = primSig2 PAnd
+(.&&.) :: Signal sig => sig dom Bool -> sig dom Bool -> sig dom Bool
+(.&&.) = sigPrim2 PAnd
 
 infixr 2 .||.
-(.||.) :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
-(.||.) = primSig2 POr
+(.||.) :: Signal sig => sig dom Bool -> sig dom Bool -> sig dom Bool
+(.||.) = sigPrim2 POr
 
-sigAnd :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
-sigAnd = primSig2 PAnd
+sigAnd :: Signal sig => sig dom Bool -> sig dom Bool -> sig dom Bool
+sigAnd = sigPrim2 PAnd
 
-sigOr :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
-sigOr = primSig2 POr
+sigOr :: Signal sig => sig dom Bool -> sig dom Bool -> sig dom Bool
+sigOr = sigPrim2 POr
 
-sigNot :: Sig dom Bool -> Sig dom Bool
-sigNot = primSig1 PNot
+sigNot :: Signal sig => sig dom Bool -> sig dom Bool
+sigNot = sigPrim1 PNot
 
 -- | Multiplexer: @mux sel t f@ chooses @t@ when @sel@ is high, @f@ otherwise.
-mux :: Sig dom Bool -> Sig dom a -> Sig dom a -> Sig dom a
-mux sel t f = SExpr $ do
-    ws <- materialize sel
-    wt <- materialize t
-    wf <- materialize f
-    lookupOrEmit PMux [ws, wt, wf]
+mux :: Signal sig => sig dom Bool -> sig dom a -> sig dom a -> sig dom a
+mux = sigPrim3 PMux
 
 -- | Logical shift left by a dynamic (runtime) amount signal.
-sigShiftLDyn :: Sig dom a -> Sig dom b -> Sig dom a
-sigShiftLDyn = primSig2 PShiftL
+sigShiftLDyn :: Signal sig => sig dom a -> sig dom b -> sig dom a
+sigShiftLDyn = sigPrim2 PShiftL
 
 -- | Logical shift right by a dynamic (runtime) amount signal.
-sigShiftRDyn :: Sig dom a -> Sig dom b -> Sig dom a
-sigShiftRDyn = primSig2 PShiftR
+sigShiftRDyn :: Signal sig => sig dom a -> sig dom b -> sig dom a
+sigShiftRDyn = sigPrim2 PShiftR
 
 -- | Extract a single bit at a dynamic (runtime) index.
-sigBitDyn :: Sig dom a -> Sig dom b -> Sig dom Bool
+sigBitDyn :: Signal sig => sig dom a -> sig dom b -> sig dom Bool
 sigBitDyn val idx = sigBit 0 (sigShiftRDyn val idx)
 
 -- | Logical shift left by a compile-time constant.
-sigShiftL :: Int -> Sig dom a -> Sig dom a
-sigShiftL n s = SExpr $ do
-    ws <- materialize s
-    wa <- lookupOrEmit (PLit (toInteger n) 8) []
-    lookupOrEmit PShiftL [ws, wa]
+sigShiftL :: Signal sig => Int -> sig dom a -> sig dom a
+sigShiftL n s = sigPrim2 PShiftL s (sigLitW (toInteger n) 8)
 
 -- | Logical shift right by a compile-time constant.
-sigShiftR :: Int -> Sig dom a -> Sig dom a
-sigShiftR n s = SExpr $ do
-    ws <- materialize s
-    wa <- lookupOrEmit (PLit (toInteger n) 8) []
-    lookupOrEmit PShiftR [ws, wa]
+sigShiftR :: Signal sig => Int -> sig dom a -> sig dom a
+sigShiftR n s = sigPrim2 PShiftR s (sigLitW (toInteger n) 8)
 
 -- | Extract a single bit at position @n@ as a Bool signal.
-sigBit :: Int -> Sig dom a -> Sig dom Bool
-sigBit n s = SExpr $ do
-    ws <- materialize s
-    lookupOrEmit (PSlice n n) [ws]
+sigBit :: Signal sig => Int -> sig dom a -> sig dom Bool
+sigBit n = sigPrim1 (PSlice n n)
 
 infixl 9 !
 -- | Bit-index operator: @sig ! n@ extracts bit @n@ (0 = LSB).
-(!) :: Sig dom a -> Int -> Sig dom Bool
+(!) :: Signal sig => sig dom a -> Int -> sig dom Bool
 (!) = flip sigBit
 
 -- ---------------------------------------------------------------------------
@@ -193,38 +217,35 @@ infixl 9 !
 -- ---------------------------------------------------------------------------
 
 -- | Bitwise AND — works on any HdlType, not just Bool.
-sigBwAnd :: Sig dom a -> Sig dom a -> Sig dom a
-sigBwAnd = primSig2 PAnd
+sigBwAnd :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwAnd = sigPrim2 PAnd
 
 -- | Bitwise OR.
-sigBwOr :: Sig dom a -> Sig dom a -> Sig dom a
-sigBwOr = primSig2 POr
+sigBwOr :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwOr = sigPrim2 POr
 
 -- | Bitwise XOR.
-sigBwXor :: Sig dom a -> Sig dom a -> Sig dom a
-sigBwXor = primSig2 PXor
+sigBwXor :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwXor = sigPrim2 PXor
 
 -- | Bitwise NOT.
-sigBwNot :: Sig dom a -> Sig dom a
-sigBwNot = primSig1 PNot
+sigBwNot :: Signal sig => sig dom a -> sig dom a
+sigBwNot = sigPrim1 PNot
 
 -- ---------------------------------------------------------------------------
 -- Concatenation and resize
 -- ---------------------------------------------------------------------------
 
 -- | Concatenate two signals: @sigConcat hi lo@ places @hi@ in the upper bits.
-sigConcat :: Sig dom a -> Sig dom b -> Sig dom c
-sigConcat = primSig2 PConcat
+sigConcat :: Signal sig => sig dom a -> sig dom b -> sig dom c
+sigConcat = sigPrim2 PConcat
 
 -- | Resize a signal to @m@ bits (zero-extend or truncate).
 -- The output phantom type @b@ is unconstrained — caller picks it via context
 -- or a type annotation.  Use @TypeApplications@ to supply @m@.
-sigResize :: forall m dom (a :: Type) (b :: Type). KnownNat m => Sig dom a -> Sig dom b
-sigResize s = coerce (result :: Sig dom a)
-  where
-    result = SExpr $ do
-        ws <- materialize s
-        lookupOrEmit (PResize (fromIntegral (natVal (Proxy @m)))) [ws]
+sigResize :: forall m sig dom (a :: Type) (b :: Type).
+             (Signal sig, KnownNat m) => sig dom a -> sig dom b
+sigResize = sigPrim1 (PResize (fromIntegral (natVal (Proxy @m))))
 
 -- ---------------------------------------------------------------------------
 
@@ -319,6 +340,35 @@ genericToBits = gToBits . from
 -- | Derived 'fromBits' for a record: inverse of 'genericToBits'.
 genericFromBits :: (Generic a, GHdlType (Rep a)) => Integer -> a
 genericFromBits = to . gFromBits
+
+-- ---------------------------------------------------------------------------
+-- Operation classes on HdlType values — the per-type semantics, lifted to
+-- signals (the lift is 'Signal'/'sigPrim').  Each method is the value-level
+-- meaning of the operation, which also yields the simulation interpreter
+-- directly.  Defaults cover every 'HdlType' (signed vs unsigned via 'hdlRepr'),
+-- so the blanket instances below carry no per-type boilerplate.
+-- ---------------------------------------------------------------------------
+
+-- | Equality.  Lifted to signals as '(.==.)'.
+class HdlType a => HdlEq a where
+    hEq :: a -> a -> Bool
+    hEq x y = toBits x == toBits y
+
+-- | Ordering — signed or unsigned per the type's 'hdlRepr'.  Lifted to signals
+-- as '(.<.)'.
+class HdlEq a => HdlOrd a where
+    hLt :: a -> a -> Bool
+    hLt x y = case hdlRepr (Proxy @a) of
+        RSigned -> asSigned (toBits x) < asSigned (toBits y)
+        _       -> toBits x < toBits y
+      where
+        n :: Int
+        n = fromIntegral (natVal (Proxy @(Width a)))
+        asSigned v = if v >= (2 :: Integer) ^ (n - 1)
+                       then v - (2 :: Integer) ^ n else v
+
+instance HdlType a => HdlEq a
+instance HdlType a => HdlOrd a
 
 -- ---------------------------------------------------------------------------
 -- Port bundle typeclass

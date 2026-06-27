@@ -150,7 +150,29 @@ type error. Combinational ops (`mux`, `.==.`, arithmetic) are pure `Sig→Sig`.
   consequence: the current pattern that hides a register *inside* a `Sig`
   (`rampFSM`'s `SExpr`/`defer`) must move to explicit **monadic** register ops, so
   pure `Sig→Sig` is *strictly* combinational. Refactor of `Sig`/`Hdl.Class`.
-- [ ] **S4 (reframe — structural)** — Make **`Signal` a typeclass** *derived from
+- [x] **S4 (DONE — Signal fully converted)** — `Signal` typeclass in `Hdl.Types`
+  is the **lift**: `sigPrim1`/`sigPrim2`/`sigPrim3` (apply a `PrimOp`) + `sigLitW`
+  (bit literal); `Sig` is the synthesis instance (`Sig (dom :: k) (a :: Type)` —
+  value kind pinned to `Type`). **Every** combinational op now lifts through it:
+  compare (`.==.`/`.<.`), logic, bitwise, `mux`, shifts (dyn + const), `sigBit`/
+  `!`, `sigConcat`, `sigResize`. **Operations anchored on `HdlType`s**: `HdlEq`/
+  `HdlOrd` carry the value semantics (signed-vs-unsigned via `hdlRepr` defaults,
+  blanket instances → no call-site ripple; also gives the sim interpreter
+  directly); `.==.`/`.<.` are the lifts; arithmetic stays via `Num (Sig dom a)`
+  anchored on `Num a`. Synth-specific ops (`withRepr`, `sigReinterpret`,
+  `materialize`) stay **outside** the class. isacle/clavr/cl51 build; clavr (8) +
+  cl51 suites green — **output-neutral**. NEXT (own increment): a **sim** `Signal`
+  instance using the `HdlEq`/`HdlOrd`/`Num` value semantics.
+  - **DESIGN REFINEMENT (user, 2026-06-26):** the **operations** (compare, arith,
+    logic, …) should themselves be a **typeclass**, with **concrete instances on
+    the `HdlType`s** (value-level semantics — e.g. `Signed` vs `Unsigned` compare
+    differs *per type*; this also yields the sim/value interpreter directly), and
+    then those operations are **lifted into `Signal`**. So the op meaning is
+    anchored on the value type, and `Signal`/`sigPrim` is the *lift* — instead of
+    raw `sigPrim2 PEq` free functions that rely on the emitter's repr inference
+    to choose signed-vs-unsigned. NEXT: re-express the ops as an HdlType-anchored
+    operation class + a generic lift through `Signal`.
+  Original target: Make **`Signal` a typeclass** *derived from
   a monad* (the signal *value* surface is abstract; multiple interpreters —
   synth, sim, …). Its methods are the **combinational** ops only (`mux`, `.==.`,
   arithmetic, slice/concat). **State is NOT here** — registers/crossings live in
