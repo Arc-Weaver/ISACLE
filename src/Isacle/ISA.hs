@@ -55,6 +55,8 @@ module Isacle.ISA
     , defineInstruction
     , readRegFileF
     , writeRegFileF
+    , readRegFileFOffset
+    , writeRegFileFOffset
     , immediateF
     , absJumpIfF
       -- * MonadHarvardALU

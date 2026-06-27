@@ -218,6 +218,16 @@ writeRegFileF :: (MonadALU m, HdlType t)
               => (AluDef m -> CPURegFile count t) -> Field idx -> IExpr (Width t) -> m ()
 writeRegFileF sel f e = register sel [fldKey f] >>= \r -> writeReg r e
 
+-- | 'readRegFileF' with a compile-time index offset (e.g. AVR upper regs R16–R31).
+readRegFileFOffset :: (MonadALU m, HdlType t)
+                   => (AluDef m -> CPURegFile count t) -> Field idx -> Int -> m (IExpr (Width t))
+readRegFileFOffset sel f off = registerWithOffset sel [fldKey f] off >>= readReg
+
+-- | 'writeRegFileF' with a compile-time index offset.
+writeRegFileFOffset :: (MonadALU m, HdlType t)
+                    => (AluDef m -> CPURegFile count t) -> Field idx -> Int -> IExpr (Width t) -> m ()
+writeRegFileFOffset sel f off e = registerWithOffset sel [fldKey f] off >>= \r -> writeReg r e
+
 -- | Read a field placeholder as a width-typed value (re-exported convenience).
 immediateF :: KnownNat (Width t) => Field t -> IExpr (Width t)
 immediateF = fieldVal
