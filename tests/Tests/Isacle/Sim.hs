@@ -74,3 +74,20 @@ runSimTests = do
     let hout = M.lookup "dout" (head (simulateSystem hier "top" (M.fromList [("din", 5)]) 1))
     assert "flatten+sim hierarchy (dout = din+1)" (hout == Just 6)
 
+    -- Three-level hierarchy: top → mid → leaf (+1), to check the flattening
+    -- chains cross-instance connections through more than one level.
+    let firstW os = case os of { ((_,w,_):_) -> w; _ -> 0 }
+        deep = execDesign "top3" $ do
+            din <- freshWire; emit (NInput din "din" 8 dom)
+            (_, midOuts) <- inBlock "u_mid" "mid" [din] $ do
+                mx <- freshWire; emit (NInput mx "mx" 8 dom)
+                (_, leafOuts) <- inBlock "u_leaf" "leaf" [mx] $ do
+                    lx  <- freshWire; emit (NInput lx "lx" 8 dom)
+                    one <- freshWire; emit (NComb one (PLit 1 8) [])
+                    ly  <- freshWire; emit (NComb ly PAdd [lx, one])
+                    emit (NOutput ly "ly" 8 dom)
+                emit (NOutput (firstW leafOuts) "my" 8 dom)
+            emit (NOutput (firstW midOuts) "dout" 8 dom)
+        dout3 = M.lookup "dout" (head (simulateSystem deep "top3" (M.fromList [("din", 9)]) 1))
+    assert "flatten+sim 3-level hierarchy (dout = din+1)" (dout3 == Just 10)
+

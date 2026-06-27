@@ -77,8 +77,11 @@ mask w = (1 `shiftL` w) - 1
 -- | Simulate one entity's flat 'NetNode' list for @nCycles@ cycles, given
 -- constant input-port values (port name → value).  Returns the output-port
 -- values for each cycle (index 0 = the reset/initial register state).  Handles
--- combinational nodes, registers (with enable), and representation tags;
--- memories, ROMs, and sub-instances are not yet evaluated.
+-- combinational nodes, registers (with enable), representation tags, and
+-- synchronous ROMs/RAMs (read combinationally, written on the rising edge).
+-- Sub-instances are expected to have been inlined first by 'flattenDesign'; a
+-- residual 'NSubInst' (an /external/ entity that flattening could not inline)
+-- contributes nothing, so wires it would have driven stay unresolved.
 simulateDesign :: [NetNode] -> Map String Integer -> Int -> [Map String Integer]
 simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
   where
@@ -194,8 +197,16 @@ evalSimOp op ins = case (op, ins) of
 
 -- | Inline every sub-instance of the named top entity into a single flat
 -- 'NetNode' list (wire IDs of each instance offset to avoid collision; ports
--- connected by aliasing).  The result can be fed to 'simulateDesign', so a whole
--- synthesized SoC is simulable in Haskell.
+-- connected by aliasing).  Recurses through nested /local/ entities to any
+-- depth — a top → mid → leaf hierarchy flattens fully (see the Sim tests).
+-- The result can be fed to 'simulateDesign', so a whole locally-defined SoC is
+-- simulable in Haskell.
+--
+-- Limitation: a sub-instance of an /external/ entity (one with no
+-- 'localEntityName' — a primitive RAM/IP block not defined in this 'Design') is
+-- dropped rather than inlined, so any wire it would drive is left unresolved.
+-- Simulating an SoC that routes through such a primitive needs a model for it
+-- (future work); purely local hierarchies are unaffected.
 flattenDesign :: Design -> String -> [NetNode]
 flattenDesign design top = evalState (go 0 top) 1
   where
