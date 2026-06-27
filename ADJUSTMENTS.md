@@ -295,6 +295,12 @@ already multi-interpreter (Synth/Sim/Doc) — good (P1).
 - [ ] **C3 (naming)** — Register/signal/doc names come from the **record field
   names** (via deriving), single-sourced — not duplicated string args
   (`reg "PC"` beside Haskell `avrPC`).
+  - *Partially done*: for **bit-fields/flags** the names are now single-sourced
+    from the record via `flagRec`/`fieldRec` (`recordFields` → `selName`), and
+    `regField`/`roField` fuse a register's name across metadata+logic (PE2). The
+    remaining gap is the **register-level** names in the core (`reg "PC"` still
+    passes a string beside the `avrPC` field) — closes with the full C1 reframe
+    that replaces the handle record with a derived `HdlType` record.
 - [ ] **C4 (wire-up monad — flexible)** — A monad wires the derived record into
   hardware (register per field via `Hdl`, plus the locations below). *Wiggle
   room OK* — one builder vs declare-then-wire is not pinned. Its real job is to
@@ -398,10 +404,12 @@ record) and logic binds by **offset integer**.
   core-def-style **typed `HdlType` record** (C1) with **bit-maps** (C2) and
   **offsets** (C5) — the *same* mechanism as the CPU core, reused. Replaces the
   imperative `field8`/`fieldOf`+`BitField` declaration with a derived record.
-- [ ] **PE2 (bind logic to typed fields)** — Bind read/write logic to the
-  **typed register fields** (field projection), not raw offset integers
-  (`onWrite "setpoint" 0 0`); the offset comes from the record/location, the
-  behaviour names the field.
+- [x] **PE2 (bind logic to typed fields)** — `regField`/`roField` (commit
+  `a4f2da9`) fuse a typed-field declaration with its write-register / read-mux
+  logic in one call: `regField @(Signed 8) 0 "SETPOINT" "…" 0`. Name, offset,
+  width and representation are single-sourced — metadata and logic agree by
+  construction, no repeated offset across an `onWrite`/`fieldOf` pair. (The
+  primitive `onWrite`/`onRead` remain for raw cases.)
 - [x] **PE3 (done together — already so)** — Keep the one-do-block style
   (register decl + behaviour together); `PeriphDef` already matches "done
   together."
