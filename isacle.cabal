@@ -131,6 +131,7 @@ library
     Isacle.System.BusHandle
     Isacle.System.Generate
     Isacle.System.HdlCircuit
+    Isacle.System.Layout
     Isacle.System.Periph
     Isacle.System.Spec
     Isacle.System.SystemDSL
@@ -227,6 +228,7 @@ test-suite test-library
     Tests.Isacle.Periph.UART
     Tests.Isacle.Periph.DMA
     Tests.Isacle.System.Bus
+    Tests.Isacle.System.Layout
     Tests.Isacle.Sim
   build-depends:
     base >= 4.12 && < 4.22,

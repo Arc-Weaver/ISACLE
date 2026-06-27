@@ -51,7 +51,8 @@ import GHC.TypeLits (natVal)
 
 import Hdl.Net (Repr(..))
 import Hdl.Prim (Unsigned)
-import Hdl.Types (HdlType, hdlRepr, Width, GFields, recordFields)
+import Hdl.Types (HdlType, hdlRepr, Width, GFields)
+import Isacle.System.Layout (bitLayout, layoutSize, layoutPlacements, plPos, plHi, plName)
 import GHC.Generics (Generic, Rep)
 import Isacle.System.Spec (NullSig(..))
 
@@ -312,16 +313,14 @@ fieldRec acc off name desc = PeriphDef $ lift $ modify $ \st ->
     st { paFields = paFields st
                  ++ [FieldSpec off width acc name desc (hdlRepr (Proxy @a)) bfs] }
   where
-    fields = recordFields (Proxy @a)
-    total  = sum (map snd fields)
-    width  = case total of
+    -- The bit-field layout is the record's bit-position layout (C5/C2),
+    -- single-sourced through the shared address-mapping helper.
+    layout = bitLayout (Proxy @a)
+    width  = case layoutSize layout of
         8  -> RW8; 16 -> RW16; 32 -> RW32
         n  -> error ("fieldRec: unsupported register width " ++ show n)
-    bfs = layoutBits (total - 1) fields
-    layoutBits _  []              = []
-    layoutBits hi ((fn, w) : rest) =
-        let lo = hi - w + 1
-        in BitField (fromIntegral lo) (fromIntegral hi) acc fn "" : layoutBits (lo - 1) rest
+    bfs = [ BitField (fromIntegral (plPos p)) (fromIntegral (plHi p)) acc (plName p) ""
+          | p <- layoutPlacements layout ]
 
 register :: RegWidth -> Word8 -> String -> String -> [BitField]
          -> PeriphDef p sig dat ()
