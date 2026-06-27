@@ -89,7 +89,9 @@ simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
     combs      = [ n | n@NComb{} <- nodes ]
 
     memInit = Map.fromList
-        [ (nOut n, Map.fromList (zip [0 ..] (nMemInit n))) | n@NMem{} <- nodes ]
+        [ (nOut n, Map.fromList (zip [0 :: Integer ..] (nMemInit n))) | n@NMem{} <- nodes ]
+    romData = Map.fromList
+        [ (nOut n, Map.fromList (zip [0 :: Integer ..] (nRomInit n))) | n@NRom{} <- nodes ]
 
     go _              0 = []
     go (regs, mems) k = outs : go (regs', mems') (k - 1)
@@ -141,9 +143,8 @@ simulateDesign nodes inputs nCycles = go (initRegs, memInit) nCycles
                 | Map.member (nOut n) kn = kn
                 | otherwise = case Map.lookup (nRomRdA n) kn of
                     Just (addr, _, _) ->
-                        let a = fromInteger addr
-                            v = if a >= 0 && a < length (nRomInit n)
-                                  then nRomInit n !! a else 0
+                        let v = Map.findWithDefault 0 addr
+                                  (Map.findWithDefault Map.empty (nOut n) romData)
                         in Map.insert (nOut n) (v .&. mask (nRomDatW n), nRomDatW n, RUnsigned) kn
                     Nothing -> kn
             tryMem kn n
@@ -181,6 +182,7 @@ evalSimOp op ins = case (op, ins) of
     (PSlice hi lo, [(a, _, _)])             -> ((a `shiftR` lo) .&. mask (hi - lo + 1), hi - lo + 1, RUnsigned)
     (PConcat, [(a, wa, _), (b, wb, _)])     -> ((a `shiftL` wb) .|. b, wa + wb, RUnsigned)
     (PResize w, [(a, wa, ra)])              -> (a .&. mask w, w, if w < wa then RUnsigned else ra)
+    (PSignedResize w, [(a, wa, _)])         -> (asSigned a wa True .&. mask w, w, RUnsigned)
     (PReinterpret r, [(a, wa, _)])          -> (a, wa, r)
     (PShiftL, [(a, wa, ra), (n, _, _)])     -> ((a `shiftL` fromInteger n) .&. mask wa, wa, ra)
     (PShiftR, [(a, wa, ra), (n, _, _)])     -> (a `shiftR` fromInteger n, wa, ra)
