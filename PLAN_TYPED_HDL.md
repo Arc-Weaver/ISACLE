@@ -77,6 +77,51 @@ Reproduce a check: build a small `NetM` that emits `NInput`/`NOutput` ports
 `runDesign`/`emitVhdl` to a `.vhd`, then `ghdl -a/-e/-r` against a testbench.
 (See the throwaway harnesses used during development; none are committed.)
 
+## Value-typed ISA expression layer (DONE — supersedes the width-only `IExpr w`)
+
+The ISA IR is now **value-typed**: `IExpr (a :: Type)` carries the HDL value type
+(`IExpr (Unsigned 8)`, `IExpr (Signed 8)`), and the type drives *both* width
+(`Width a`) and signedness (`hdlRepr a`) at lowering. This replaces the earlier
+`IExpr (w :: Nat)` width-only design (and its motivating "ISA level = width laws"
+framing above): signedness is no longer faked through `ALUPrim` variants
+(`PMulSigned` is dead) — it is the operand type.
+
+- **`readReg :: CPURegister t -> m (IExpr t)`** keeps the register's declared type;
+  a body opts into signed arithmetic with an explicit reinterpret cast
+  `asSigned`/`asUnsigned` (lowered via the HDL layer's `PReinterpret`) — the only
+  new IR node. `aluOp` is **deleted** from `MonadALU`; bodies use a typed surface
+  (`+ - *` modular `Num`; `.&. .|. xor inv shiftL shiftR arithShiftR`; width
+  adapters) plus the width-growing `add`/`mul` (the `Hdl.Bits.Arith` lift, as
+  smart constructors over `IBin` + repr-correct resize — no new lowering case).
+- **MUL/MULS fixed and GHDL-verified.** `mul` grows to `Unsigned 16` / `Signed 16`;
+  MUL vs MULS is just `Unsigned 8` vs `asSigned` (no opcode variant). The 16-bit
+  product's low/high bytes go to R0/R1.
+- **Register files are register banks, not block RAM.** `RegisterFile count t`
+  lowers to a *bank of individual `NReg` flip-flops* (`SynthCPU`/`SynthVnCPU`):
+  one decoded write port per simultaneous-write slot (`nPorts` = max writes per
+  instruction to the file), each entry written by whichever port's address
+  matches it, and combinational read muxes per read slot. Because every entry is
+  an independent register, **multiple writes per instruction commit in the same
+  cycle** — MUL writes R0 and R1 at once, a single-cycle instruction. (The earlier
+  one-write-port `NMem` model forced an ugly multi-cycle write sequencing; that is
+  gone — `seqNAcc` counts only data-memory accesses again.) `schAliasFiles` is
+  metadata-only (not synthesized), so no alias re-routing was needed.
+- **The bank lives in the `cpu_state_t` record, with indexed access.** A new
+  `NRegFile` node (Hdl.Net) is an array-valued clocked register that is a *field*
+  of a record group: it emits `type cpu_state_GPR_t is array(0 to 31) of
+  unsigned(7 downto 0)` / `GPR : cpu_state_GPR_t` inside `cpu_state_t`, with one
+  **indexed** write port per simultaneous-write slot in the clock process
+  (`if en then cpu_state.GPR(to_integer(addr)) <= data`) and indexed
+  combinational reads via `NRegFileRead` (`cpu_state.GPR(to_integer(addr))`).
+  nPorts = max writes/instr (2 for MUL), so MUL's R0/R1 commit in one cycle.
+  Emitter gained `VTypeRef`, `recordGroups` (record = scalar `NGroup` fields +
+  array `NRegFile` fields), and clocked/comb cases. The whole architectural state
+  — scalars, flags, PC, register file — is one record (the "core is one HdlType"
+  view). Both `SynthCPU` (AVR/cl51) and `SynthVnCPU` (TinyVN) use it.
+- **Verified:** isacle tests pass; clavr 9 GHDL benches pass incl. a new `test_mul`
+  (`200*3=600` → R1:R0=0x02:0x58; `(-3)*5=-15` → 0xFF:0xF1; folded to GPIO=0xAA);
+  cl51 21 unit tests + synth/ghdl pass. Examples (Tiny/TinyVN/AVR) migrated.
+
 ## Remaining work
 
 ### #3 — signed peripheral, integrated (the chosen demonstrator)
@@ -162,6 +207,86 @@ ramp's SETPOINT/STEP/CURRENT are signed *registers*, not a signed bus.
     (`IExpr 12`) and widening to PC width *required* an explicit `signExtendC` /
     `zeroExtendC`, the silent default would be impossible — the author would be
     forced to choose, and the wrong choice would be a visible, checkable one.
+
+### HwOp operation contracts — one contract, three interpreters (DESIGN, not built)
+
+Motivation: the ISA is a **typed DAG** of operations. Today an op is a fixed
+`ALUPrim` enum interpreted one way. We want an operation to be a *typed contract*
+(value-types in → value-type out, width adaptation included) that the DAG carries,
+with the *realization* chosen per-core at lowering — so combinational, multi-cycle,
+and pipelined cores are the **same instruction definitions** under different
+interpreters. This is the same "typed surface, many interpreters" pattern as
+`HdlType`/`Signal`/`Hdl`, lifted to whole operations. Drove out of the MUL work:
+the width-adapting `Arith` (`add :: Unsigned n -> Unsigned m -> Unsigned (Max n m
++ 1)`, `mul :: ... -> Unsigned (n + m)`, now in `Hdl.Bits`) is the *combinational*
+realization; this section is how the *sequential* and *pipelined* ones share its
+contract.
+
+The contract + three realizations:
+
+```haskell
+-- The typed contract: what value-types in, what out. Width adaptation lives here.
+class HwOp op where
+    type Args   op :: Type     -- e.g. (Unsigned n, Unsigned m)
+    type Result op :: Type     -- e.g. Unsigned (n + m)
+
+-- A: combinational — a pure function on the value types (latency 0).
+class HwOp op => Comb op where
+    evalComb :: Args op -> Result op            -- bodies are the Arith ops
+
+-- B: sequential — a clocked unit with an explicit start/done handshake; the
+--    core stalls (the existing `latency`/`StallEvent` path). Shared resource.
+class HwOp op => Seq op where
+    latency :: proxy op -> Int
+    circuit :: (Hdl c, KnownDom dom) => proxy op
+            -> c (Sig dom Bool, Sig dom (Args op)) (Sig dom Bool, Sig dom (Result op))
+            --     start          a,b                done            product
+
+-- C: pipelined — a stage over a streaming value that carries its own valid, so
+--    validity threads itself (no manual handshake). Throughput 1, latency `depth`.
+class HwOp op => Pipe op where
+    depth :: proxy op -> Int
+    stage :: (Hdl c, KnownDom dom) => proxy op
+          -> c (Stream dom (Args op)) (Stream dom (Result op))
+```
+
+The streaming value (the type the user liked):
+
+```haskell
+-- Data with an *implicit* valid. The valid is part of the value, so it
+-- propagates without anyone wiring it by hand.
+type Stream dom a = (Sig dom Bool, Sig dom a)        -- (valid, data)
+
+combStage f = arr (\(v, d) -> (v, f d))              -- latency 0: valid passes through
+regStage    = \(v, d) -> (register False -< v, register 0 -< d)  -- latency 1: valid delayed WITH data
+```
+
+Multiply is one op with all three realizations (`evalComb (a,b) = mul a b` over
+`Arith`); `MUL` vs `MULS` is just `Unsigned 8` vs `Signed 8` operands, never a
+`PMulSigned` variant. New ops (divide, popcount, sequential shifter) drop in as
+new `HwOp` instances without touching DAG machinery.
+
+**How the three fold onto the ISA DAG** (the payoff): the instruction DAG is a
+graph of `HwOp` nodes (`Args → Result`). Pick the interpreter and the *same DAG*
+becomes — `Comb`: one combinational cone (single-cycle core); `Seq`: ops share a
+unit, core stalls on `done`; `Pipe`: the DAG *is* the pipeline — each edge is a
+`Stream` (valid = that value's liveness), each node a stage, and CPU pipeline
+bubbles/flushes are exactly `valid = False` propagating. That last case is what
+the Harvard/VN pipeline machinery currently hand-rolls per core; once ops are
+`HwOp` and the value is a `Stream`, the DAG folds onto the pipeline for free.
+
+**Status / sequencing:**
+- ✅ The combinational foundation exists: `Arith` (`add`/`mul`, width-adapting,
+  carry/sign-correct) in `Hdl.Bits`, GHDL-verified.
+- ⬜ NOT YET BUILT (deliberately deferred). When built: add `HwOp` + `Comb`/`Seq`/
+  `Pipe` + `Stream`, make `Mul`/`Add` instances over `Arith`, and prove a
+  combinational, a multi-cycle (handshake), and a pipelined multiply through GHDL
+  against the *one* contract.
+- **Mul stays combinational for now.** Before building `Seq`/`Pipe` multipliers,
+  **check the AVR datasheet for the real cycle counts** (AVR `MUL`/`MULS`/`MULSU`/
+  `FMUL` are believed ~2 cycles, but confirm from docs — do not hardcode the 2 in
+  the current `latency` stub on memory) and pin the actual timing model. Then the
+  `Seq`/`Pipe` `latency`/`depth` reflect documented hardware, not a guess.
 
 ### Known gaps / follow-ons
 - **Signed literals in *expressions*** ✅ FIXED. `combExpr` (`Hdl.Emit.Vhdl`)

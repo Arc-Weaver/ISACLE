@@ -46,6 +46,7 @@ data VType
     | VArrayOf   Int VType         -- array(0 to n-1) of elem
     | VRecord    [(String, VType)] -- record ... end record
     | VEnumRef   String            -- reference to a declared enumerated type
+    | VTypeRef   String            -- reference to any declared named type
     | VEnum      [String]          -- (lit0, lit1, …)  — the enum type body
 
 ppType :: VType -> String
@@ -57,6 +58,7 @@ ppType (VRecord fields)  = "record\n"
     ++ concatMap (\(n, t) -> "    " ++ n ++ " : " ++ ppType t ++ ";\n") fields
     ++ "  end record"
 ppType (VEnumRef name)   = name
+ppType (VTypeRef name)   = name
 ppType (VEnum lits)      = "(" ++ intercalate ", " lits ++ ")"
 
 -- | Stable VHDL type name for an enum, derived from its literals (so the same
@@ -226,6 +228,7 @@ allClockDomains design nodes = nub (directClocks ++ subClocks)
   where
     directClocks = [ nDom n | n@NReg{} <- nodes ]
                 ++ [ nDom n | n@NMem{} <- nodes ]
+                ++ [ nrfDom n | n@NRegFile{} <- nodes ]
     subClocks    = concatMap lookupChild [ entRef | NSubInst _ entRef _ _ <- nodes ]
     lookupChild entRef = case localEntityName entRef >>= (`Map.lookup` design) of
         Nothing    -> []
@@ -317,6 +320,10 @@ cse nodes = map (rewrite finalSubst) kept
             NRom out (sub subst rdA) sz dw ini
         NGroup name fields ->
             NGroup name [(fn, sub subst w) | (fn, w) <- fields]
+        NRegFile g fld c w wr dom ->
+            NRegFile g fld c w [(sub subst a, sub subst d, sub subst e) | (a, d, e) <- wr] dom
+        NRegFileRead out g fld a c ->
+            NRegFileRead out g fld (sub subst a) c
         _ -> n
 
 -- ---------------------------------------------------------------------------
@@ -405,6 +412,7 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
     drivenWires (NSubInst _ _ _ outs) = [w | (_, w, _) <- outs]
     drivenWires n@NMem{}              = [nOut n]
     drivenWires n@NRom{}              = [nOut n]
+    drivenWires (NRegFileRead out _ _ _ _) = [out]
     drivenWires _                     = []
 
 litConstName :: Integer -> Int -> String
@@ -470,13 +478,32 @@ architectureDecl design name nm nodes = unlines $
 -- visible to both the ports and the architecture.
 packageTypeDecls :: [NetNode] -> [VDecl]
 packageTypeDecls nodes =
-    [ VDType (grpName ++ "_t")
-             (VRecord [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ])
-    | NGroup grpName fields <- nodes ]
+    concatMap groupTypes (recordGroups nodes)
     ++
     Map.elems (Map.fromList
         [ (enumTypeName lits, VDType (enumTypeName lits) (VEnum lits))
         | NRepr _ (REnum lits) <- nodes ])
+  where
+    -- A register file is an array field of its record; declare the named array
+    -- type before the record type that references it.
+    groupTypes (grpName, fields, arrays) =
+        [ VDType (groupArrayTypeName grpName fn) (VArrayOf cnt (wireVType wdt))
+        | (fn, cnt, wdt) <- arrays ]
+        ++
+        [ VDType (grpName ++ "_t")
+                 (VRecord ( [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ]
+                         ++ [ (fn, VTypeRef (groupArrayTypeName grpName fn)) | (fn, _, _) <- arrays ] )) ]
+
+-- | One record per group name: its scalar fields (from 'NGroup') and its array
+-- fields (register files, from 'NRegFile'), in first-seen order.
+recordGroups :: [NetNode] -> [(String, [(String, WireId)], [(String, Int, Int)])]
+recordGroups nodes =
+    [ (nm, [ (fn, w) | NGroup n fs <- nodes, n == nm, (fn, w) <- fs ]
+         , [ (nrfField r, nrfCount r, nrfWidth r) | r@NRegFile{} <- nodes, nrfGroup r == nm ])
+    | nm <- nub ([ n | NGroup n _ <- nodes ] ++ [ nrfGroup r | r@NRegFile{} <- nodes ]) ]
+
+groupArrayTypeName :: String -> String -> String
+groupArrayTypeName grpName fldName = grpName ++ "_" ++ fldName ++ "_t"
 
 -- | All architecture-region declarations: types, constants, signals.
 archDecls :: NameMap -> [NetNode] -> [VDecl]
@@ -525,23 +552,25 @@ archDecls nm nodes =
     litMap :: Map.Map (Integer, Int) ()
     litMap = Map.fromList [ ((v, bw), ()) | NComb _ (PLit v bw) [] <- nodes ]
 
-    groups = [ n | n@NGroup{} <- nodes ]
+    groups = recordGroups nodes
 
     groupedWires :: Set.Set WireId
     groupedWires = Set.fromList
         [ w | NGroup _ fields <- nodes, (_, w) <- fields ]
 
     -- The record TYPE is declared in the per-file package (see 'packageTypeDecls');
-    -- here we only declare the record SIGNAL, which references that type.
-    groupDecls (NGroup grpName fields) =
-        let initStr = "("
-                ++ intercalate ", "
-                    [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
-                                                   (regInit w nodes))
-                    | (fn, w) <- fields ]
-                ++ ")"
+    -- here we only declare the record SIGNAL, which references that type.  Array
+    -- fields (register files) initialise every entry to 0.
+    groupDecls (grpName, fields, arrays) =
+        let scalarInits =
+                [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
+                                               (regInit w nodes))
+                | (fn, w) <- fields ]
+            arrayInits =
+                [ fn ++ " => (others => " ++ ppLit (SomeBits 0 wdt) ++ ")"
+                | (fn, _, wdt) <- arrays ]
+            initStr = "(" ++ intercalate ", " (scalarInits ++ arrayInits) ++ ")"
         in [ VDSig grpName (grpName ++ "_t") (Just initStr) ]
-    groupDecls _ = []
 
     isInputWire wid ns = wid `elem` [ nOut n | n@NInput{} <- ns ]
     hasDriver w        = any (drivesWire w)
@@ -550,6 +579,7 @@ archDecls nm nodes =
     drivesWire w (NSubInst _ _ _ outs)  = any (\(_, pw, _) -> pw == w) outs
     drivesWire w n@NMem{}               = nOut n == w
     drivesWire w n@NRom{}               = nOut n == w
+    drivesWire w (NRegFileRead out _ _ _ _) = out == w
     drivesWire _ _                      = False
 
 regInit :: WireId -> [NetNode] -> Maybe SomeBits
@@ -568,6 +598,15 @@ toStmt _      _  _  NRepr{}                 = []
 toStmt _      _  _  NGroup{}               = []
 toStmt _      _  _  (NComment txt)          = ["", "  -- " ++ txt]
 toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses
+toStmt _      _  _  NRegFile{}              = []  -- writes handled by clockProcesses
+toStmt _      nm _  (NRegFileRead out g fld rdA cnt) =
+    -- Indexed combinational read of a register-file record field.
+    let addr  = lookupWire nm rdA
+        nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
+        raddr = "resize(" ++ addr ++ ", " ++ show nbits ++ ")"
+    in [ "  " ++ lookupWire nm out ++ " <= "
+             ++ g ++ "." ++ fld ++ "(to_integer(" ++ raddr ++ "))"
+             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
 toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
     -- Truncate addr to the minimum bits that can index sz entries before to_integer
     -- so that out-of-range addresses (e.g. 0xFFFFFE00) don't overflow INTEGER.
@@ -618,14 +657,16 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
   where
     domGroups :: Map.Map String (DomId, [NetNode])
     domGroups = foldr addNode Map.empty (filter isClocked nodes)
-    isClocked NReg{} = True
-    isClocked NMem{} = True
-    isClocked _      = False
+    isClocked NReg{}     = True
+    isClocked NMem{}     = True
+    isClocked NRegFile{} = True
+    isClocked _          = False
     addNode n = Map.insertWith (\(d, xs) (_, ys) -> (d, xs ++ ys))
                                (domName (clockDom n))
                                (clockDom n, [n])
     clockDom (NReg _ _ _ _ dom)         = dom
     clockDom (NMem _ _ _ _ _ _ _ _ dom) = dom
+    clockDom n@NRegFile{}               = nrfDom n
     clockDom _                          = error "clockDom: not a clocked node"
 
     emitProc (_, (dom, domNodes)) =
@@ -666,6 +707,16 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
                      ++ lookupWire nm wrA ++ ")) <= " ++ lookupWire nm wrD ++ ";"
         , "      end if;"
         ]
+    clockedBody (NRegFile g fld cnt _ wr _) =
+        -- One indexed, enabled write per port: group.field(to_integer(addr)) <= data.
+        let nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
+        in concat
+            [ [ "      if " ++ lookupWire nm enW ++ " = '1' then"
+              , "        " ++ g ++ "." ++ fld ++ "(to_integer(resize("
+                           ++ lookupWire nm aW ++ ", " ++ show nbits ++ "))) <= "
+                           ++ lookupWire nm dW ++ ";"
+              , "      end if;" ]
+            | (aW, dW, enW) <- wr ]
     clockedBody _ = []
 
 -- ---------------------------------------------------------------------------
@@ -787,6 +838,7 @@ inferWidth wid nodes = case filter (drives wid) nodes of
             []    -> 1
     (n@NMem{} : _)           -> nMemDatW n
     (n@NRom{} : _)           -> nRomDatW n
+    (NRegFileRead _ _ _ _ _ : _) -> regFileReadWidth wid nodes
     _                        -> 1
   where
     drives w (NInput  out _ _ _)   = out == w
@@ -795,7 +847,19 @@ inferWidth wid nodes = case filter (drives wid) nodes of
     drives w (NSubInst _ _ _ outs) = any (\(_, pw, _) -> pw == w) outs
     drives w n@NMem{}              = nOut n == w
     drives w n@NRom{}              = nOut n == w
+    drives w (NRegFileRead out _ _ _ _) = out == w
     drives _ _                     = False
+
+-- | A register-file read's width is the file's entry width, found via the
+-- matching 'NRegFile' (same group+field).
+regFileReadWidth :: WireId -> [NetNode] -> Int
+regFileReadWidth wid nodes =
+    case [ (nrfrGroup r, nrfrField r) | r@NRegFileRead{} <- nodes, nrfrOut r == wid ] of
+        ((g, fld) : _) ->
+            case [ nrfWidth f | f@NRegFile{} <- nodes, nrfGroup f == g, nrfField f == fld ] of
+                (w : _) -> w
+                []      -> 1
+        [] -> 1
 
 inferOpWidth :: PrimOp -> [WireId] -> [NetNode] -> Int
 inferOpWidth (PLit _ w)     _         _ = w

@@ -100,6 +100,7 @@ runEncoding :: Encoding a -> (a, String)
 runEncoding m =
     let (a, s) = runState m (EncSt "" 'a') in (a, esChars s)
 
--- | Read a field as a width-typed value expression (the decoded field bits).
-fieldVal :: KnownNat (Width t) => Field t -> IExpr (Width t)
+-- | Read a field as a value-typed expression (the decoded field bits, at the
+-- field's declared value type).
+fieldVal :: HdlType t => Field t -> IExpr t
 fieldVal (Field k _) = IField (FieldRef [k])

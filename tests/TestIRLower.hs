@@ -5,6 +5,7 @@ module Main where
 
 import Prelude
 import Hdl.Net
+import Hdl.Bits (Unsigned)
 import Isacle.ISA.IR
 import Isacle.ISA.Backend.Lower
 
@@ -25,10 +26,10 @@ ctx = LowerCtx
 main :: IO ()
 main = do
     -- ret = PC + 1 (named injection), ret - SP (following), + a field operand.
-    let pc  = IReadReg (RegScalar "PC") :: IExpr 16
-        sp  = IReadReg (RegScalar "SP") :: IExpr 16
+    let pc  = IReadReg (RegScalar "PC") :: IExpr (Unsigned 16)
+        sp  = IReadReg (RegScalar "SP") :: IExpr (Unsigned 16)
         ret = INamed "ret" (pc + 1)
-        d   = IField (FieldRef "k") :: IExpr 16
+        d   = IField (FieldRef "k") :: IExpr (Unsigned 16)
         top = (ret - sp) + d
     let (_, nodes, _) = runNetM (lowerExpr_ ctx top)
     putStrLn "== naming injection + following =="

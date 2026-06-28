@@ -21,17 +21,17 @@ module Isacle.ISA.Backend.Sim
 
 import Prelude hiding (Word)
 import Data.List (foldl')
-import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntMap.Strict (IntMap)
 import Data.Bits
-import GHC.TypeLits (natVal, KnownNat)
 
+import Hdl.Types (HdlType)
+import Hdl.Bits (Unsigned)
 import Isacle.ISA.Types
 import Isacle.ISA.Encoding
-import Isacle.ISA.IR
+import Isacle.ISA.IR hiding ((.&.), (.|.), xor, shiftL, shiftR, arithShiftR, add, mul)
 import Isacle.ISA.Build (ISABuild, runISABuild)
 
 -- ---------------------------------------------------------------------------
@@ -65,8 +65,8 @@ data EvalEnv = EvalEnv
     , evToks   :: IntMap Integer
     }
 
-widthOfE :: forall w. KnownNat w => IExpr w -> Int
-widthOfE _ = fromIntegral (natVal (Proxy @w))
+widthOfE :: HdlType a => IExpr a -> Int
+widthOfE = exprWidth
 
 maskTo :: Int -> Integer -> Integer
 maskTo w v = v .&. ((1 `shiftL` w) - 1)
@@ -90,6 +90,9 @@ evalE env = go
         IZeroExt a                          -> maskTo (widthOfE e0) (go a)
         ITrunc a                            -> maskTo (widthOfE e0) (go a)
         ISignExt a                          -> maskTo (widthOfE e0) (signExtend' (widthOfE a) (go a))
+        -- Reinterpret keeps the bits; signedness is consumed by later sign-extend
+        -- (widenTo) or by an explicitly signed op (PArithShiftR / PMulSigned).
+        IReinterpret a                      -> maskTo (widthOfE e0) (go a)
         IIsZero a                           -> if go a == 0 then 1 else 0
         ISlice hi lo a                      -> (go a `shiftR` lo) .&. ((1 `shiftL` (hi - lo + 1)) - 1)
         INamed _ a                          -> go a
@@ -151,7 +154,7 @@ renderInstrSim instrWord mIrqVec ir st0 =
 
     regRefKey :: RegRef w -> String
     regRefKey (RegScalar n)               = n
-    regRefKey (RegFile rf (FieldRef k) o) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr 32) + fromIntegral o)
+    regRefKey (RegFile rf (FieldRef k) o) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr (Unsigned 32)) + fromIntegral o)
 
     putReg n v st = st { ssCPU = (ssCPU st) { scRegs = Map.insert n v (scRegs (ssCPU st)) } }
     putFlag (CPUFlag rn bp) v st =

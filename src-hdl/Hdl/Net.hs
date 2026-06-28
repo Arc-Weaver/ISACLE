@@ -213,6 +213,29 @@ data NetNode
         { nGroupName   :: String
         , nGroupFields :: [(String, WireId)]  -- (fieldName, wireId) ordered
         }
+    -- | A register file: an /array/-valued clocked register that lives as a
+    -- field of a named record group (e.g. @cpu_state.GPR@).  Each write port is
+    -- an indexed, enabled write @group.field(to_integer(addr)) <= data@ in the
+    -- clock process; multiple ports let several entries update in one cycle
+    -- (e.g. MUL writing R0 and R1).  Reads are 'NRegFileRead' (indexed,
+    -- combinational).  A bank of flip-flops, not block RAM.
+    | NRegFile
+        { nrfGroup  :: String       -- ^ record group name (e.g. @cpu_state@)
+        , nrfField  :: String       -- ^ array field name (e.g. @GPR@)
+        , nrfCount  :: Int          -- ^ number of entries
+        , nrfWidth  :: Int          -- ^ entry width in bits
+        , nrfWrites :: [(WireId, WireId, WireId)]  -- ^ (addr, data, en) ports
+        , nrfDom    :: DomId
+        }
+    -- | A combinational, indexed read of a register file field:
+    -- @out <= group.field(to_integer(addr))@.
+    | NRegFileRead
+        { nrfrOut   :: WireId
+        , nrfrGroup :: String
+        , nrfrField :: String
+        , nrfrAddr  :: WireId
+        , nrfrCount :: Int
+        }
     deriving (Show, Eq)
 
 -- ---------------------------------------------------------------------------

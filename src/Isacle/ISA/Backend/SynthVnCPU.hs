@@ -235,19 +235,34 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
     let involvedRfs = Map.keys regWritesByRf
                    ++ filter (`Map.notMember` regWritesByRf) readRfNames
 
+    -- A register file is a register bank as an array field of the cpu_state
+    -- record (e.g. @cpu_state.GPR@): indexed multi-port writes (gated with
+    -- ~stall) and indexed combinational reads.  Independent per entry, so
+    -- multiple writes per instruction commit at once. (Not block RAM.)
     forM_ involvedRfs $ \rfname -> do
-        let writes  = Map.findWithDefault [] rfname regWritesByRf
         let (rfCount, rfWidth) = case Map.lookup rfname rfInfoMap of
                 Just p  -> p
                 Nothing -> (1, wordBits)
+            aBits = addrBitsFor rfCount
 
-        wrEnW   <- buildOrTree (map rwMatchWire writes)
-        wrAddrW <- buildMuxTree
-                      [(rwMatchWire r, rwIdxWire r) | r <- writes]
-                      =<< litWire 0 (addrBitsFor rfCount)
-        wrDatW  <- buildMuxTree
-                      [(rwMatchWire r, rwDataWire r) | r <- writes]
-                      =<< litWire 0 rfWidth
+        let perInstr =
+                [ (m, filter ((== rfname) . rwRfName) (srRegWrites r))
+                | r <- allResults
+                , any ((== rfname) . rwRfName) (srRegWrites r)
+                , Just m <- [srMatchWire r] ]
+            nPorts = maximum (1 : map (length . snd) perInstr)
+
+        ports <- forM [0 .. nPorts - 1] $ \p -> do
+            let contribs = [ (m, ws Prelude.!! p) | (m, ws) <- perInstr, length ws > p ]
+            addrW <- buildMuxTree [(m, rwIdxWire w)  | (m, w) <- contribs]
+                        =<< litWire 0 aBits
+            datW  <- buildMuxTree [(m, rwDataWire w) | (m, w) <- contribs]
+                        =<< litWire 0 rfWidth
+            enRaw <- buildOrTree (map fst contribs)
+            enW   <- freshWire; emit $ NComb enW N.PAnd [enRaw, notStallW]
+            return (addrW, datW, enW)
+
+        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth ports domInfo
 
         let instrSlots :: [(WireId, [RegReadReq])]
             instrSlots =
@@ -256,8 +271,7 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
                 , any ((== rfname) . rrRfName) (srRegReads r)
                 , Just matchW <- [srMatchWire r]
                 ]
-
-        let maxSlots = maximum (0 : map (length . snd) instrSlots)
+            maxSlots = maximum (0 : map (length . snd) instrSlots)
 
         forM_ [0 .. maxSlots - 1] $ \slot -> do
             let slotEntries = [ (matchW, rr)
@@ -266,13 +280,9 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
                               , k == slot ]
             rdAddrW <- buildMuxTree
                            [(matchW, rrIdxWire rr) | (matchW, rr) <- slotEntries]
-                           =<< litWire 0 (addrBitsFor rfCount)
-            rdOutW  <- freshWire
-            -- Gate the register file write enable with ~stall.
-            wrEnGatedW <- freshWire
-            emit $ NComb wrEnGatedW N.PAnd [wrEnW, notStallW]
-            defer $ emit $ NMem rdOutW rdAddrW wrAddrW wrDatW wrEnGatedW
-                                rfCount rfWidth [] domInfo
+                           =<< litWire 0 aBits
+            rdOutW <- freshWire
+            emit $ N.NRegFileRead rdOutW "cpu_state" rfname rdAddrW rfCount
             forM_ slotEntries $ \(_, rr) ->
                 emit $ NComb (rrOutWire rr) N.POr [rdOutW, rdOutW]
 

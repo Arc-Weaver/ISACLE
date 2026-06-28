@@ -284,6 +284,9 @@ mapWires f n = case n of
     NRepr w r                   -> NRepr (f w) r
     NComment t                  -> NComment t
     NGroup nm fs                -> NGroup nm [ (fn, f w) | (fn, w) <- fs ]
+    NRegFile g fld c w wr dom   -> NRegFile g fld c w
+                                       [ (f a, f d, f e) | (a, d, e) <- wr ] dom
+    NRegFileRead o g fld a c    -> NRegFileRead (f o) g fld (f a) c
 
 -- | Every wire id referenced by a node (for computing the offset stride).
 nodeWires :: NetNode -> [WireId]
@@ -299,3 +302,5 @@ nodeWires n = case n of
     NRepr w _                   -> [w]
     NComment _                  -> []
     NGroup _ fs                 -> map snd fs
+    NRegFile _ _ _ _ wr _       -> concat [ [a, d, e] | (a, d, e) <- wr ]
+    NRegFileRead o _ _ a _      -> [o, a]
