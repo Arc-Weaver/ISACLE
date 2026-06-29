@@ -1,7 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 module Hdl.Class
-    ( -- * Circuit typeclass
-      Circuit(..)
+    ( -- * Hdl — the stateful hardware arrow
+      Hdl(..)
       -- * NetBuilder: the synthesis interpreter
     , NetBuilder(..)
       -- * Entity instantiation
@@ -16,9 +16,14 @@ module Hdl.Class
     , outputS
       -- * Optional wire naming
     , named
+      -- * Structured (record) signal grouping
+    , mkGroup
     ) where
 
-import Prelude
+import Prelude hiding ((.), id)
+import Control.Category (Category(..))
+import Control.Arrow (Arrow(..), ArrowChoice(..))
+import Control.Monad ((>=>))
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
@@ -28,23 +33,46 @@ import Hdl.Types
 import Hdl.Entity
 
 -- ---------------------------------------------------------------------------
--- Circuit typeclass
+-- Hdl — the stateful hardware arrow
 -- ---------------------------------------------------------------------------
 
-class Circuit (c :: Type -> Type -> Type) where
-    reg :: forall dom a.
-           (HdlType a, KnownDom dom)
-        => a -> c (Sig dom a) (Sig dom a)
+-- | The class of stateful hardware operations: an arrow @c i o@ from input
+-- signal-bundle @i@ to output @o@.  'register' is the fundamental member; the
+-- 'Category' / 'Arrow' structure (below) gives composition (@>>>@) and
+-- input-space expansion (@first@/@***@/@&&&@) — "monadic, but able to expand its
+-- input space".  'NetBuilder' is the synthesis interpreter; sim / doc are future
+-- instances.
+class Category c => Hdl (c :: Type -> Type -> Type) where
+    -- | A clocked register: @register initVal@ is the arrow from the input
+    -- signal to its registered value.
+    register :: forall dom a.
+                (HdlType a, KnownDom dom)
+             => a -> c (Sig dom a) (Sig dom a)
 
-    regEn :: forall dom a.
-             (HdlType a, KnownDom dom)
-          => a -> c (Sig dom Bool, Sig dom a) (Sig dom a)
+    -- | A register with a write-enable.
+    registerEn :: forall dom a.
+                  (HdlType a, KnownDom dom)
+               => a -> c (Sig dom Bool, Sig dom a) (Sig dom a)
 
+-- | The synthesis interpreter: a Kleisli arrow over 'NetM' (builds the graph).
 newtype NetBuilder i o = NetBuilder { runNetBuilder :: i -> NetM o }
 
-instance Circuit NetBuilder where
-    reg   initVal = NetBuilder $ regS   initVal
-    regEn initVal = NetBuilder $ uncurry (regEnS initVal)
+instance Category NetBuilder where
+    id = NetBuilder pure
+    NetBuilder g . NetBuilder f = NetBuilder (f >=> g)
+
+instance Arrow NetBuilder where
+    arr f = NetBuilder (pure . f)
+    first  (NetBuilder f) = NetBuilder (\(b, d) -> do c <- f b; pure (c, d))
+    second (NetBuilder f) = NetBuilder (\(d, b) -> do c <- f b; pure (d, c))
+
+instance ArrowChoice NetBuilder where
+    left  (NetBuilder f) = NetBuilder (either (fmap Left . f)  (pure . Right))
+    right (NetBuilder f) = NetBuilder (either (pure . Left)    (fmap Right . f))
+
+instance Hdl NetBuilder where
+    register   initVal = NetBuilder $ regS   initVal
+    registerEn initVal = NetBuilder $ uncurry (regEnS initVal)
 
 -- ---------------------------------------------------------------------------
 -- Entity instantiation
@@ -135,6 +163,19 @@ named hint sig = do
     wid <- materialize sig
     hintWire wid hint
     pure (SWire wid)
+
+-- | Group a record of signals into a named VHDL record signal.
+--
+-- @a@ is any @deriving (Generic, HdlPorts)@ record whose fields are 'Sig' (or
+-- other 'HdlPorts' bundles).  The field wires are materialized and emitted as an
+-- 'NGroup', so the emitter declares @\<name\>_t@ as a record type and rewrites
+-- references to those wires as @\<name\>.\<field\>@.  This is the generic form of
+-- the hand-rolled @NGroup "cpu_state"@ in the CPU backend.
+mkGroup :: forall a. HdlPorts a => String -> a -> NetM ()
+mkGroup name a = do
+    wids <- toWireIds a
+    let names = map portName (portSpecs (Proxy @a))
+    emit $ NGroup name (zip names wids)
 
 -- | Synchronous-write / asynchronous-read block RAM.
 -- Emits a single 'NMem' node; all ports are materialized immediately.

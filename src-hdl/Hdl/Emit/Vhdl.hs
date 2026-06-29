@@ -45,6 +45,9 @@ data VType
     | VSigned    Int               -- signed(n-1 downto 0)
     | VArrayOf   Int VType         -- array(0 to n-1) of elem
     | VRecord    [(String, VType)] -- record ... end record
+    | VEnumRef   String            -- reference to a declared enumerated type
+    | VTypeRef   String            -- reference to any declared named type
+    | VEnum      [String]          -- (lit0, lit1, …)  — the enum type body
 
 ppType :: VType -> String
 ppType VStdLogic         = "std_logic"
@@ -54,6 +57,14 @@ ppType (VArrayOf n t)    = "array(0 to " ++ show (n-1) ++ ") of " ++ ppType t
 ppType (VRecord fields)  = "record\n"
     ++ concatMap (\(n, t) -> "    " ++ n ++ " : " ++ ppType t ++ ";\n") fields
     ++ "  end record"
+ppType (VEnumRef name)   = name
+ppType (VTypeRef name)   = name
+ppType (VEnum lits)      = "(" ++ intercalate ", " lits ++ ")"
+
+-- | Stable VHDL type name for an enum, derived from its literals (so the same
+-- enum used on many wires declares one shared type).
+enumTypeName :: [String] -> String
+enumTypeName lits = "enum_" ++ intercalate "_" lits ++ "_t"
 
 -- | Convert a wire bit-width to the appropriate scalar VHDL type.
 wireVType :: Int -> VType
@@ -65,8 +76,9 @@ wireVType n = VUnsigned n
 -- arithmetic\/comparison\/resize for free.  Untagged (the default) and 1-bit
 -- wires keep the plain 'wireVType' behaviour.
 wireVTypeR :: Repr -> Int -> VType
-wireVTypeR RSigned n | n > 1 = VSigned n
-wireVTypeR _       n         = wireVType n
+wireVTypeR (REnum lits) _     = VEnumRef (enumTypeName lits)
+wireVTypeR RSigned      n | n > 1 = VSigned n
+wireVTypeR _            n         = wireVType n
 
 -- | A wire's representation tag.  An explicit 'NRepr' tag wins; otherwise the
 -- tag propagates from the operand a combinational op preserves the numeric
@@ -165,18 +177,31 @@ ppPortLine VOut n t = n ++ " : out " ++ ppType t
 
 -- | Emit one VHDL file for the named entity.
 emitVhdl :: Design -> String -> [NetNode] -> String
-emitVhdl design name nodes = unlines
-    [ "library ieee;"
-    , "use ieee.std_logic_1164.all;"
-    , "use ieee.numeric_std.all;"
-    , ""
-    , entityDecl design name nodes'
-    , ""
-    , architectureDecl design name nm nodes'
-    ]
+emitVhdl design name nodes = unlines (header ++ body)
   where
     nodes' = cse nodes
     nm     = buildNameMap nodes'
+    pkgTypes = packageTypeDecls nodes'
+    pkgName  = name ++ "_types"
+    ieeeCtx  = [ "library ieee;"
+               , "use ieee.std_logic_1164.all;"
+               , "use ieee.numeric_std.all;" ]
+    -- Structured types (records/enums) go in a per-file package so they are
+    -- visible to the entity ports; the entity 'use' clause also covers the
+    -- architecture.  Designs with no structured types emit byte-identically.
+    header
+      | null pkgTypes = ieeeCtx ++ [ "" ]
+      | otherwise     = ieeeCtx ++ [ "" ]
+          ++ [ "package " ++ pkgName ++ " is" ]
+          ++ map ppDecl pkgTypes
+          ++ [ "end package " ++ pkgName ++ ";", "" ]
+          ++ ieeeCtx
+          ++ [ "use work." ++ pkgName ++ ".all;", "" ]
+    body =
+      [ entityDecl design name nodes'
+      , ""
+      , architectureDecl design name nm nodes'
+      ]
 
 emitVhdlFile :: FilePath -> String -> [NetNode] -> IO ()
 emitVhdlFile path name nodes = writeFile path (emitVhdl Map.empty name nodes)
@@ -203,6 +228,7 @@ allClockDomains design nodes = nub (directClocks ++ subClocks)
   where
     directClocks = [ nDom n | n@NReg{} <- nodes ]
                 ++ [ nDom n | n@NMem{} <- nodes ]
+                ++ [ nrfDom n | n@NRegFile{} <- nodes ]
     subClocks    = concatMap lookupChild [ entRef | NSubInst _ entRef _ _ <- nodes ]
     lookupChild entRef = case localEntityName entRef >>= (`Map.lookup` design) of
         Nothing    -> []
@@ -294,6 +320,10 @@ cse nodes = map (rewrite finalSubst) kept
             NRom out (sub subst rdA) sz dw ini
         NGroup name fields ->
             NGroup name [(fn, sub subst w) | (fn, w) <- fields]
+        NRegFile g fld c w wr dom ->
+            NRegFile g fld c w [(sub subst a, sub subst d, sub subst e) | (a, d, e) <- wr] dom
+        NRegFileRead out g fld a c ->
+            NRegFileRead out g fld (sub subst a) c
         _ -> n
 
 -- ---------------------------------------------------------------------------
@@ -350,10 +380,13 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
                                    , let c = base ++ "_" ++ show i
                                    , not (Set.member c used) ]
 
+    -- VHDL identifiers are case-insensitive, so a reserved word must be matched
+    -- regardless of case (e.g. "PORT" is as reserved as "port"); vhdlReserved is
+    -- all-lowercase, so fold the hint before testing.
     safeHint wid h
-        | Set.member h portNames    = h ++ if isReg wid then "_r" else "_s"
-        | Set.member h vhdlReserved = h ++ "_s"
-        | otherwise                 = h
+        | Set.member h portNames               = h ++ if isReg wid then "_r" else "_s"
+        | Set.member (map toLower h) vhdlReserved = h ++ "_s"
+        | otherwise                            = h
     isReg wid = any (\case { NReg out _ _ _ _ -> out == wid; _ -> False }) nodes
 
     litMap = Map.fromList
@@ -379,6 +412,7 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
     drivenWires (NSubInst _ _ _ outs) = [w | (_, w, _) <- outs]
     drivenWires n@NMem{}              = [nOut n]
     drivenWires n@NRom{}              = [nOut n]
+    drivenWires (NRegFileRead out _ _ _ _) = [out]
     drivenWires _                     = []
 
 litConstName :: Integer -> Int -> String
@@ -437,10 +471,44 @@ architectureDecl design name nm nodes = unlines $
     ++ clockProcesses nm nodes
     ++ [ "end architecture rtl;" ]
 
+-- | Structured TYPE declarations that must be package-visible (so they can be
+-- used in entity ports, not just internal signals): record types (from
+-- 'NGroup') and enumerated types (from 'REnum' tags), deduplicated.  Emitted
+-- into a per-file @<entity>_types@ package; the entity's @use@ clause makes them
+-- visible to both the ports and the architecture.
+packageTypeDecls :: [NetNode] -> [VDecl]
+packageTypeDecls nodes =
+    concatMap groupTypes (recordGroups nodes)
+    ++
+    Map.elems (Map.fromList
+        [ (enumTypeName lits, VDType (enumTypeName lits) (VEnum lits))
+        | NRepr _ (REnum lits) <- nodes ])
+  where
+    -- A register file is an array field of its record; declare the named array
+    -- type before the record type that references it.
+    groupTypes (grpName, fields, arrays) =
+        [ VDType (groupArrayTypeName grpName fn) (VArrayOf cnt (wireVType wdt))
+        | (fn, cnt, wdt) <- arrays ]
+        ++
+        [ VDType (grpName ++ "_t")
+                 (VRecord ( [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ]
+                         ++ [ (fn, VTypeRef (groupArrayTypeName grpName fn)) | (fn, _, _) <- arrays ] )) ]
+
+-- | One record per group name: its scalar fields (from 'NGroup') and its array
+-- fields (register files, from 'NRegFile'), in first-seen order.
+recordGroups :: [NetNode] -> [(String, [(String, WireId)], [(String, Int, Int)])]
+recordGroups nodes =
+    [ (nm, [ (fn, w) | NGroup n fs <- nodes, n == nm, (fn, w) <- fs ]
+         , [ (nrfField r, nrfCount r, nrfWidth r) | r@NRegFile{} <- nodes, nrfGroup r == nm ])
+    | nm <- nub ([ n | NGroup n _ <- nodes ] ++ [ nrfGroup r | r@NRegFile{} <- nodes ]) ]
+
+groupArrayTypeName :: String -> String -> String
+groupArrayTypeName grpName fldName = grpName ++ "_" ++ fldName ++ "_t"
+
 -- | All architecture-region declarations: types, constants, signals.
 archDecls :: NameMap -> [NetNode] -> [VDecl]
 archDecls nm nodes =
-    -- NGroup: record type then record signal (one per group).
+    -- NGroup record SIGNALS (the record TYPES are in the package, packageTypeDecls).
     concatMap groupDecls groups
     ++
     -- Named array types for inline RAM and ROM (deduplicated by base name).
@@ -484,25 +552,25 @@ archDecls nm nodes =
     litMap :: Map.Map (Integer, Int) ()
     litMap = Map.fromList [ ((v, bw), ()) | NComb _ (PLit v bw) [] <- nodes ]
 
-    groups = [ n | n@NGroup{} <- nodes ]
+    groups = recordGroups nodes
 
     groupedWires :: Set.Set WireId
     groupedWires = Set.fromList
         [ w | NGroup _ fields <- nodes, (_, w) <- fields ]
 
-    groupDecls (NGroup grpName fields) =
-        let recType = VRecord
-                [ (fn, wireVType (inferWidth w nodes)) | (fn, w) <- fields ]
-            initStr = "("
-                ++ intercalate ", "
-                    [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
-                                                   (regInit w nodes))
-                    | (fn, w) <- fields ]
-                ++ ")"
-        in [ VDType (grpName ++ "_t") recType
-           , VDSig  grpName (grpName ++ "_t") (Just initStr)
-           ]
-    groupDecls _ = []
+    -- The record TYPE is declared in the per-file package (see 'packageTypeDecls');
+    -- here we only declare the record SIGNAL, which references that type.  Array
+    -- fields (register files) initialise every entry to 0.
+    groupDecls (grpName, fields, arrays) =
+        let scalarInits =
+                [ fn ++ " => " ++ ppLit (maybe (SomeBits 0 (inferWidth w nodes)) id
+                                               (regInit w nodes))
+                | (fn, w) <- fields ]
+            arrayInits =
+                [ fn ++ " => (others => " ++ ppLit (SomeBits 0 wdt) ++ ")"
+                | (fn, _, wdt) <- arrays ]
+            initStr = "(" ++ intercalate ", " (scalarInits ++ arrayInits) ++ ")"
+        in [ VDSig grpName (grpName ++ "_t") (Just initStr) ]
 
     isInputWire wid ns = wid `elem` [ nOut n | n@NInput{} <- ns ]
     hasDriver w        = any (drivesWire w)
@@ -511,6 +579,7 @@ archDecls nm nodes =
     drivesWire w (NSubInst _ _ _ outs)  = any (\(_, pw, _) -> pw == w) outs
     drivesWire w n@NMem{}               = nOut n == w
     drivesWire w n@NRom{}               = nOut n == w
+    drivesWire w (NRegFileRead out _ _ _ _) = out == w
     drivesWire _ _                      = False
 
 regInit :: WireId -> [NetNode] -> Maybe SomeBits
@@ -529,6 +598,15 @@ toStmt _      _  _  NRepr{}                 = []
 toStmt _      _  _  NGroup{}               = []
 toStmt _      _  _  (NComment txt)          = ["", "  -- " ++ txt]
 toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses
+toStmt _      _  _  NRegFile{}              = []  -- writes handled by clockProcesses
+toStmt _      nm _  (NRegFileRead out g fld rdA cnt) =
+    -- Indexed combinational read of a register-file record field.
+    let addr  = lookupWire nm rdA
+        nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
+        raddr = "resize(" ++ addr ++ ", " ++ show nbits ++ ")"
+    in [ "  " ++ lookupWire nm out ++ " <= "
+             ++ g ++ "." ++ fld ++ "(to_integer(" ++ raddr ++ "))"
+             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
 toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
     -- Truncate addr to the minimum bits that can index sz entries before to_integer
     -- so that out-of-range addresses (e.g. 0xFFFFFE00) don't overflow INTEGER.
@@ -579,14 +657,16 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
   where
     domGroups :: Map.Map String (DomId, [NetNode])
     domGroups = foldr addNode Map.empty (filter isClocked nodes)
-    isClocked NReg{} = True
-    isClocked NMem{} = True
-    isClocked _      = False
+    isClocked NReg{}     = True
+    isClocked NMem{}     = True
+    isClocked NRegFile{} = True
+    isClocked _          = False
     addNode n = Map.insertWith (\(d, xs) (_, ys) -> (d, xs ++ ys))
                                (domName (clockDom n))
                                (clockDom n, [n])
     clockDom (NReg _ _ _ _ dom)         = dom
     clockDom (NMem _ _ _ _ _ _ _ _ dom) = dom
+    clockDom n@NRegFile{}               = nrfDom n
     clockDom _                          = error "clockDom: not a clocked node"
 
     emitProc (_, (dom, domNodes)) =
@@ -627,6 +707,16 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
                      ++ lookupWire nm wrA ++ ")) <= " ++ lookupWire nm wrD ++ ";"
         , "      end if;"
         ]
+    clockedBody (NRegFile g fld cnt _ wr _) =
+        -- One indexed, enabled write per port: group.field(to_integer(addr)) <= data.
+        let nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
+        in concat
+            [ [ "      if " ++ lookupWire nm enW ++ " = '1' then"
+              , "        " ++ g ++ "." ++ fld ++ "(to_integer(resize("
+                           ++ lookupWire nm aW ++ ", " ++ show nbits ++ "))) <= "
+                           ++ lookupWire nm dW ++ ";"
+              , "      end if;" ]
+            | (aW, dW, enW) <- wr ]
     clockedBody _ = []
 
 -- ---------------------------------------------------------------------------
@@ -700,16 +790,22 @@ combExpr nm ns op ins = case (op, ins) of
     w = lookupWire nm
     reprCast RSigned   = "signed"
     reprCast RUnsigned = "unsigned"
+    reprCast (REnum _) = "unsigned"  -- enums are not numerically reinterpret-cast
     -- The representation a numeric op operates in: a literal operand carries no
     -- representation of its own (it is a shared @unsigned@ bit-pattern constant),
     -- so the op's repr is taken from its first non-literal data operand.  When
     -- that is signed, literal operands must be cast to keep numeric_std types
     -- consistent (and to pick the signed overload).  All-unsigned ops are
     -- unaffected — the output is byte-for-byte identical.
-    dataRepr xs = case [ reprOf x ns | x <- xs, not (isLitWire x ns) ] of
+    -- The op's data representation: the first non-default repr among ALL
+    -- operands (so a signed signal, or a tagged enum literal, drives it).
+    dataRepr xs = case [ r | x <- xs, let r = reprOf x ns, r /= RUnsigned ] of
                     (r:_) -> r
                     []    -> RUnsigned
     castLit r src
+        | REnum lits <- r
+        , (v:_) <- [ vv | NComb o (PLit vv _) [] <- ns, o == src ]
+        , fromInteger v < length lits = lits !! fromInteger v   -- enum literal → its name
         | r == RSigned, isLitWire src ns, inferWidth src ns > 1 = "signed(" ++ w src ++ ")"
         | otherwise                                             = w src
     widthPad r ow sw src
@@ -742,6 +838,7 @@ inferWidth wid nodes = case filter (drives wid) nodes of
             []    -> 1
     (n@NMem{} : _)           -> nMemDatW n
     (n@NRom{} : _)           -> nRomDatW n
+    (NRegFileRead _ _ _ _ _ : _) -> regFileReadWidth wid nodes
     _                        -> 1
   where
     drives w (NInput  out _ _ _)   = out == w
@@ -750,7 +847,19 @@ inferWidth wid nodes = case filter (drives wid) nodes of
     drives w (NSubInst _ _ _ outs) = any (\(_, pw, _) -> pw == w) outs
     drives w n@NMem{}              = nOut n == w
     drives w n@NRom{}              = nOut n == w
+    drives w (NRegFileRead out _ _ _ _) = out == w
     drives _ _                     = False
+
+-- | A register-file read's width is the file's entry width, found via the
+-- matching 'NRegFile' (same group+field).
+regFileReadWidth :: WireId -> [NetNode] -> Int
+regFileReadWidth wid nodes =
+    case [ (nrfrGroup r, nrfrField r) | r@NRegFileRead{} <- nodes, nrfrOut r == wid ] of
+        ((g, fld) : _) ->
+            case [ nrfWidth f | f@NRegFile{} <- nodes, nrfGroup f == g, nrfField f == fld ] of
+                (w : _) -> w
+                []      -> 1
+        [] -> 1
 
 inferOpWidth :: PrimOp -> [WireId] -> [NetNode] -> Int
 inferOpWidth (PLit _ w)     _         _ = w
@@ -782,4 +891,6 @@ ppLitR :: Repr -> SomeBits -> String
 ppLitR RSigned (SomeBits v w)
     | w > 1 = "to_signed(" ++ show signedVal ++ ", " ++ show w ++ ")"
   where signedVal = if v >= 2 ^ (w - 1) then v - 2 ^ w else v
+ppLitR (REnum lits) (SomeBits v _)
+    | fromInteger v < length lits = lits !! fromInteger v   -- enum value → literal
 ppLitR _ sb = ppLit sb

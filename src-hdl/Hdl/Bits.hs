@@ -5,6 +5,9 @@
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE TypeOperators       #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE NoStarIsType        #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 -- | Clash-free bit-vector types for ISA simulation and pure combinational
 -- logic.  A single @import Hdl.Bits@ provides everything needed:
 -- bit types, numeric instances, bit-vector operations, and the 'Bits'
@@ -17,6 +20,9 @@ module Hdl.Bits
     , BitVector
       -- * Signed two's-complement integer
     , Signed(..)
+      -- * Width-adapting arithmetic (carry-correct add, widening multiply)
+    , Arith(..)
+    , Max
       -- * Fixed-length vector
     , Vec(..)
     , Index
@@ -46,8 +52,10 @@ module Hdl.Bits
 import Prelude hiding (repeat, (!!))
 import qualified Prelude as P
 import Data.Bits (Bits(..), FiniteBits(..))
+import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
+import Data.Type.Bool (If)
+import GHC.TypeLits (KnownNat, Nat, natVal, type (+), type (*), type (<=?))
 
 import Hdl.Prim (Unsigned(..), Bit(..))
 import Hdl.Types (HdlType(..))
@@ -108,6 +116,46 @@ instance KnownNat n => HdlType (Signed n) where
     hdlRepr _         = RSigned
 
 -- ---------------------------------------------------------------------------
+-- Width-adapting arithmetic
+--
+-- Arithmetic on HDL value types whose /result type is sized to hold the whole
+-- result/ — and whose operands may be different widths — so nothing is silently
+-- lost the way fixed-width @(+)@/@(*)@ do. The single definition the 'Signal'
+-- and ISA layers lift, rather than re-deriving carry/sign handling in each.
+-- ---------------------------------------------------------------------------
+
+-- | Type-level maximum of two naturals.
+type Max (n :: Nat) (m :: Nat) = If (n <=? m) m n
+
+-- | Width-adapting arithmetic between (possibly different-width) value types of
+-- the same signedness. The result type is sized to hold the whole result:
+--
+--   * @add :: Unsigned n -> Unsigned m -> Unsigned (Max n m + 1)@ — the extra
+--     bit above the wider operand IS the carry.
+--   * @mul :: Unsigned n -> Unsigned m -> Unsigned (n + m)@ — the full product.
+--
+-- Signedness is preserved, and the arithmetic is the value type's own '+'/'*'
+-- at the result width, so it is correct for that signedness.
+class (HdlType a, HdlType b) => Arith (a :: Type) (b :: Type) where
+    type AddR a b :: Type   -- ^ result type of 'add' (one bit above @Max@ width)
+    type MulR a b :: Type   -- ^ result type of 'mul' (@n + m@ width)
+    add :: a -> b -> AddR a b
+    mul :: a -> b -> MulR a b
+
+instance (KnownNat n, KnownNat m) => Arith (Unsigned n) (Unsigned m) where
+    type AddR (Unsigned n) (Unsigned m) = Unsigned (Max n m + 1)
+    type MulR (Unsigned n) (Unsigned m) = Unsigned (n + m)
+    -- a < 2^n, b < 2^m ⇒ a+b < 2^(max+1) and a*b < 2^(n+m): the result holds them.
+    add (Unsigned a) (Unsigned b) = Unsigned (a + b)
+    mul (Unsigned a) (Unsigned b) = Unsigned (a * b)
+
+instance (KnownNat n, KnownNat m) => Arith (Signed n) (Signed m) where
+    type AddR (Signed n) (Signed m) = Signed (Max n m + 1)
+    type MulR (Signed n) (Signed m) = Signed (n + m)
+    add (Signed a) (Signed b) = Signed (a + b)
+    mul (Signed a) (Signed b) = Signed (a * b)
+
+-- ---------------------------------------------------------------------------
 -- Vec n a
 -- ---------------------------------------------------------------------------
 
@@ -118,6 +166,24 @@ newtype Vec (n :: Nat) a = Vec [a]
 
 instance Show a => Show (Vec n a) where
     show (Vec xs) = show xs
+
+-- | A 'Vec' of 'HdlType' elements is itself an 'HdlType' (H4): its width is the
+-- element width times the count, and it packs MSB-first — element 0 occupies
+-- the highest bits, mirroring the record packing ('genericToBits') so an array
+-- field of a core/peripheral record behaves like any other field. The value
+-- representation is flat (the elements' bits concatenated); structure-preserving
+-- VHDL-array emission is a separate signal-layer concern.
+instance (HdlType a, KnownNat n, KnownNat (n * Width a))
+      => HdlType (Vec n a) where
+    type Width (Vec n a) = n * Width a
+    toBits (Vec xs) = foldl (\acc x -> (acc `shiftL` w) .|. toBits x) 0 xs
+      where w = fromIntegral (natVal (Proxy @(Width a)))
+    fromBits packed = Vec
+        [ fromBits ((packed `shiftR` (w * (cnt - 1 - i))) .&. mask) | i <- [0 .. cnt - 1] ]
+      where
+        w    = fromIntegral (natVal (Proxy @(Width a)))
+        cnt  = fromIntegral (natVal (Proxy @n))
+        mask = (1 `shiftL` w) - 1
 
 (!!) :: Vec n a -> Index n -> a
 Vec xs !! i = xs P.!! i

@@ -22,7 +22,8 @@ import Numeric (showHex)
 
 import Isacle.System.Spec
 import Isacle.System.SystemDSL  (SysDoc(..), BusSection(..), PeriphEntry(..))
-import Isacle.System.Periph  (PeriphSpec(..), FieldSpec(..), RegAccess(..), specSize)
+import Isacle.System.Periph  (PeriphSpec(..), FieldSpec(..), RegAccess(..), RegWidth(..), BitField(..), specSize)
+import Hdl.Net                (Repr(..))
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -362,14 +363,26 @@ sysGenCHeader guardName doc = unlines $
 
     renderEntry _busName pe =
         let prefix = up (peName pe)
-            regs   = [ "#define " ++ prefix ++ "_" ++ up (fieldName f)
-                        ++ "  " ++ hexUL (fromIntegral (fieldOffset f) :: Word32)
-                     | f <- psFields (peSpec pe)
-                     ]
+            regs   = concatMap (renderReg prefix) (psFields (peSpec pe))
         in [ "#define " ++ prefix ++ "_BASE  " ++ hexUL (peBase pe)
            , "#define " ++ prefix ++ "_SIZE  " ++ hexUL (specSize (peSpec pe))
            ]
            ++ regs
+
+    -- A register's offset macro (annotated with the C type the bits should be
+    -- read as, from its 'Repr'), followed by one _BIT macro per bit-field.
+    renderReg prefix f =
+        let rname = prefix ++ "_" ++ up (fieldName f)
+        in ( "#define " ++ rname ++ "  " ++ hexUL (fromIntegral (fieldOffset f) :: Word32)
+                 ++ "  /* " ++ cType (fieldRepr f) (fieldWidth f) ++ " */" )
+           : [ "#define " ++ rname ++ "_" ++ up (bfName b) ++ "_BIT  " ++ show (bfLoBit b)
+             | b <- fieldBitFields f ]
+
+    -- Map representation + width to a stdint C type.
+    cType repr rw =
+        let signed = case repr of { RSigned -> "int"; _ -> "uint" }
+            bits   = case rw of { RW8 -> "8"; RW16 -> "16"; RW32 -> "32" }
+        in signed ++ bits ++ "_t"
 
 -- ---------------------------------------------------------------------------
 -- sysGenLinkerScript

@@ -4,6 +4,7 @@ module Isacle.ISA.Def where
 
 import Prelude
 import Hdl.Bits
+import Hdl.Types (HdlType, Width)
 import Isacle.ISA.Types
 import Isacle.ISA.ALU
 
@@ -29,7 +30,7 @@ instance Monad (ResetDef alu) where
     m >>= f = ResetDef $ \alu ->
         runResetDef m alu <> runResetDef (f undefined) alu
 
-resetReg :: (alu -> CPURegister w) -> Unsigned w -> ResetDef alu ()
+resetReg :: HdlType t => (alu -> CPURegister t) -> Unsigned (Width t) -> ResetDef alu ()
 resetReg sel val = ResetDef $ \alu ->
     let CPURegister name = sel alu
     in [ResetRegEntry name val]

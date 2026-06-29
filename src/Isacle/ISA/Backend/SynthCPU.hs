@@ -3,13 +3,14 @@
 -- | CPU-level synthesis: adjoins a 'CPUDef' with a 'ISADef' to produce a
 -- complete Harvard-architecture decode-execute circuit in the 'NetM' IR.
 --
--- = Circuit structure
+-- = Hdl structure
 --
 -- * Scalar registers (PC, SP, …) become 'NReg' nodes, initialised from
 --   'isaReset'.
 -- * Flags become 1-bit 'NReg' nodes.
--- * Register files become 'NMem' nodes (one node per read port, shared
---   write side — synthesis tools merge them into a multi-port BRAM/LUTRAM).
+-- * Register files become register banks: one 'NReg' flip-flop per entry, with
+--   combinational read muxes and one decoded write port per simultaneous-write
+--   slot (so e.g. MUL writes R0 and R1 in the same cycle).  Not block RAM.
 -- * Each instruction body in 'isaInstrs' is elaborated by 'runSynthM'; the
 --   resulting write requests are combined into write arbiters.
 -- * The PC is always updated: by a jump ('ScalarWriteReq' to PC) or by the
@@ -268,24 +269,45 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     let involvedRfs = Map.keys regWritesByRf
                    ++ filter (`Map.notMember` regWritesByRf) readRfNames
 
+    -- A register file is a register bank that lives as an array field of the
+    -- cpu_state record (e.g. @cpu_state.GPR@): one indexed write port per
+    -- simultaneous-write slot, and indexed combinational reads.  An instruction's
+    -- writes go to distinct ports (and distinct indices), so they all commit in
+    -- the same cycle — e.g. MUL writes R0 and R1 at once.  Not block RAM.
     forM_ involvedRfs $ \rfname -> do
-        let writes  = Map.findWithDefault [] rfname regWritesByRf
         let (rfCount, rfWidth) = case Map.lookup rfname rfInfoMap of
                 Just p  -> p
                 Nothing -> (1, wordBits)
+            aBits = addrBitsFor rfCount
 
-        -- Register-file writes commit on the instruction's final cycle.
-        wrEnRaw <- buildOrTree (map rwMatchWire writes)
-        wrEnW   <- andGate wrEnRaw (esCommit sq)
-        wrAddrW <- buildMuxTree
-                      [(rwMatchWire r, rwIdxWire r) | r <- writes]
-                      =<< litWire 0 (addrBitsFor rfCount)
-        wrDatW  <- buildMuxTree
-                      [(rwMatchWire r, rwDataWire r) | r <- writes]
-                      =<< litWire 0 rfWidth
+        -- Writes grouped per instruction; write j of an instruction is driven by
+        -- write port j.  nPorts = the most writes any one instruction makes to
+        -- this file (1 normally, 2 for MUL/MULS).
+        let perInstr =
+                [ (m, filter ((== rfname) . rwRfName) (srRegWrites r))
+                | r <- allResults
+                , any ((== rfname) . rwRfName) (srRegWrites r)
+                , Just m <- [srMatchWire r] ]
+            nPorts = maximum (1 : map (length . snd) perInstr)
 
-        -- Per-instruction reads for this rf, preserving slot order within
-        -- each instruction.  Slot k = the k-th readReg call on rfname.
+        -- One muxed write port per slot: (address, data, enable@commit).
+        ports <- forM [0 .. nPorts - 1] $ \p -> do
+            let contribs = [ (m, ws Prelude.!! p) | (m, ws) <- perInstr, length ws > p ]
+            addrW <- buildMuxTree [(m, rwIdxWire w)  | (m, w) <- contribs]
+                        =<< litWire 0 aBits
+            datW  <- buildMuxTree [(m, rwDataWire w) | (m, w) <- contribs]
+                        =<< litWire 0 rfWidth
+            enRaw <- buildOrTree (map fst contribs)
+            enW   <- andGate enRaw (esCommit sq)
+            return (addrW, datW, enW)
+
+        -- The register file: an array field of cpu_state, written by indexed
+        -- multi-port writes in the clock process.
+        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth ports domInfo
+
+        -- Per-instruction reads for this rf, preserving slot order within each
+        -- instruction.  Slot k = the k-th readReg call on rfname; each slot is an
+        -- indexed combinational read @cpu_state.<rfname>(addr)@.
         let instrSlots :: [(WireId, [RegReadReq])]
             instrSlots =
                 [ (matchW, filter ((== rfname) . rrRfName) (srRegReads r))
@@ -293,11 +315,8 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                 , any ((== rfname) . rrRfName) (srRegReads r)
                 , Just matchW <- [srMatchWire r]
                 ]
+            maxSlots = maximum (0 : map (length . snd) instrSlots)
 
-        let maxSlots = maximum (0 : map (length . snd) instrSlots)
-
-        -- One NMem per read slot — one physical read port per simultaneous
-        -- register read.  For a 2-operand ISA this is exactly 2 instances.
         forM_ [0 .. maxSlots - 1] $ \slot -> do
             let slotEntries = [ (matchW, rr)
                               | (matchW, rrs) <- instrSlots
@@ -305,11 +324,10 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                               , k == slot ]
             rdAddrW <- buildMuxTree
                            [(matchW, rrIdxWire rr) | (matchW, rr) <- slotEntries]
-                           =<< litWire 0 (addrBitsFor rfCount)
+                           =<< litWire 0 aBits
             hintWire rdAddrW (rfname ++ "_rd" ++ show slot ++ "_addr")
-            rdOutW  <- freshWire
-            defer $ emit $ NMem rdOutW rdAddrW wrAddrW wrDatW wrEnW
-                                rfCount rfWidth [] domInfo
+            rdOutW <- freshWire
+            emit $ N.NRegFileRead rdOutW "cpu_state" rfname rdAddrW rfCount
             hintWire rdOutW (rfname ++ "_rd" ++ show slot)
             -- Forward shared output to each instruction's pre-allocated wire.
             forM_ slotEntries $ \(_, rr) ->
@@ -608,6 +626,14 @@ addrBitsFor n
 -- Execution sequencer
 -- ---------------------------------------------------------------------------
 
+-- | Cycles an instruction needs on its busiest single-ported resource: the max
+-- of (data reads, data writes).  Register files are register banks with
+-- independent per-entry writes (see the bank lowering in 'synthHarvardCPU'), so
+-- multiple register-file writes in one instruction (MUL → R0 and R1) commit in
+-- the same cycle and do not extend the instruction.
+seqNAcc :: SynthResult -> Int
+seqNAcc r = max (length (srMemReads r)) (length (srMemWrites r))
+
 -- | Per-instruction multi-cycle execution sequencer.
 --
 -- An instruction takes one cycle per access to a contended port: with a single
@@ -648,10 +674,13 @@ buildExecSequencer
     -> [SynthResult]
     -> NetM ExecSeq
 buildExecSequencer domInfo dataW stallW results = do
-    let nReadsOf  r = length (srMemReads  r)
-        nWritesOf r = length (srMemWrites r)
-        nAccOf    r = max (nReadsOf r) (nWritesOf r)
-        memMatches  = [ m | r <- results, nAccOf r >= 1, Just m <- [srMatchWire r] ]
+    let nAccOf      = seqNAcc
+        -- An instruction is "active" on the shared transaction sequencer if it
+        -- touches data memory; pure register-file multi-writes (MUL) advance the
+        -- exec cycle but never stall, so they are excluded from mem_active.
+        memMatches  = [ m | r <- results
+                          , max (length (srMemReads r)) (length (srMemWrites r)) >= 1
+                          , Just m <- [srMatchWire r] ]
         maxAcc      = maximum (1 : map nAccOf results)
 
     comment "execution sequencer: stall + multi-cycle memory transactions"
@@ -686,7 +715,7 @@ buildExecSequencer domInfo dataW stallW results = do
         emit $ NComb isLastW N.PEq [execW, cyclesNeededW]
         hintWire isLastW "is_last_cycle"
         waitW    <- andGate memActiveW stallW;  hintWire waitW "mem_wait"
-        notWaitW <- notGate waitW
+        notWaitW <- notGate waitW;              hintWire notWaitW "not_stall"
         commitW  <- andGate isLastW notWaitW;   hintWire commitW "commit"
         -- exec_cycle_nxt = wait ? exec_cycle : (is_last ? 0 : exec_cycle + 1)
         oneW   <- litWire 1 cw

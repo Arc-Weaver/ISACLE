@@ -309,6 +309,7 @@ collectE e = case e of
     IIrqVector                              -> mempty
     IBin _ a b                              -> collectE a <> collectE b
     IUn _ a                                 -> collectE a
+    IReinterpret a                          -> collectE a
     IResize a                               -> collectE a
     ISignExt a                              -> collectE a
     IZeroExt a                              -> collectE a

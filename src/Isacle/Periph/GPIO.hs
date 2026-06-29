@@ -37,17 +37,11 @@ gpioDef
     => sig dat                                    -- ^ physical pin inputs
     -> PeriphDef GPIO sig dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
 gpioDef pinsIn = do
-    field8 ReadOnly  0 "PIN"  "Sampled physical inputs"
-    onRead 0 pinsIn
-
-    field8 ReadWrite 1 "DDR"  "Data direction (1 = output)"
-    ddr <- onWrite "ddr" 1 0
-    onRead 1 ddr
-
-    field8 ReadWrite 2 "PORT" "Output latch"
-    port <- onWrite "port" 2 0
-    onRead 2 port
-
+    -- Typed PE2 combinators: each register's name, offset and type are
+    -- single-sourced, and its read/write logic is wired in the same call.
+    roField  @(Unsigned 8) 0 "PIN"  "Sampled physical inputs"      pinsIn
+    ddr  <- regField @(Unsigned 8) 1 "DDR"  "Data direction (1 = output)" 0
+    port <- regField @(Unsigned 8) 2 "PORT" "Output latch"               0
     return (port, ddr)
 
 -- ---------------------------------------------------------------------------

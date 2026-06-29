@@ -15,10 +15,14 @@ module Isacle.System.Periph
     , onWrite
     , onWriteStrobe
     , onRead
+      -- * Typed field + logic in one (PE2)
+    , regField
+    , roField
       -- * Register / field declarations (metadata)
     , field
     , field8
     , fieldOf
+    , fieldRec
     , register
       -- * Spec types
     , PeriphSpec(..)
@@ -50,7 +54,9 @@ import GHC.TypeLits (natVal)
 
 import Hdl.Net (Repr(..))
 import Hdl.Prim (Unsigned)
-import Hdl.Types (HdlType, hdlRepr, Width)
+import Hdl.Types (HdlType, hdlRepr, Width, GFields)
+import Isacle.Layout (bitLayout, layoutSize, layoutPlacements, plPos, plHi, plName)
+import GHC.Generics (Generic, Rep)
 import Isacle.System.Spec (NullSig(..))
 
 -- ---------------------------------------------------------------------------
@@ -258,6 +264,32 @@ onRead off sig = PeriphDef $ do
         let prev = paRdData acc
         in acc { paRdData = sigMux ops (biRdEqAddr bus off) sig prev }
 
+-- | PE2: declare a /typed/ read-write register AND wire its write register and
+-- read-back mux in one call. The field's name, byte offset, width and
+-- representation are single-sourced — the metadata ('fieldOf') and the logic
+-- ('onWrite'/'onRead') agree by construction, instead of repeating the offset
+-- across a separate metadata/logic pair. Returns the register's value signal.
+--
+-- > setpoint <- regField @(Signed 8) 0 "SETPOINT" "target value" 0
+regField :: forall a p sig dat. HdlType a
+         => Word8 -> String -> String -> dat
+         -> PeriphDef p sig dat (sig dat)
+regField off name desc initVal = do
+    fieldOf @a ReadWrite off name desc
+    val <- onWrite name (fromIntegral off) initVal
+    onRead (fromIntegral off) val
+    pure val
+
+-- | PE2: declare a /typed/ read-only register AND wire its read mux from a
+-- peripheral-supplied signal, single-sourcing the field metadata and the read
+-- logic. For status/input registers the hardware drives.
+roField :: forall a p sig dat. HdlType a
+        => Word8 -> String -> String -> sig dat
+        -> PeriphDef p sig dat ()
+roField off name desc sig = do
+    fieldOf @a ReadOnly off name desc
+    onRead (fromIntegral off) sig
+
 -- ---------------------------------------------------------------------------
 -- Structural metadata declarations
 -- ---------------------------------------------------------------------------
@@ -294,6 +326,30 @@ fieldOf = fieldFull (regWidthBits (fromIntegral (natVal (Proxy @(Width a)))))
     regWidthBits 32 = RW32
     regWidthBits n  = error ("fieldOf: unsupported register width "
                              ++ show n ++ " bits (expected 8, 16, or 32)")
+
+-- | Typed register declaration whose **bit-fields are derived from a record
+-- 'HdlType'** — so a CPU flag register and a peripheral control register share
+-- the same mechanism (define the record once; the bit-field layout, width, and
+-- representation all come from it).  Bits are MSB-first in field order (matching
+-- the 'Hdl.Types.genericToBits' packing).
+--
+-- > data Ctrl = Ctrl { enable :: Bit, mode :: Unsigned 2, irq :: Bit }
+-- >   deriving (Generic, HdlType)
+-- > fieldRec @Ctrl ReadWrite 0 "CTRL" "control register"
+fieldRec :: forall a p sig dat. (HdlType a, Generic a, GFields (Rep a))
+         => RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+fieldRec acc off name desc = PeriphDef $ lift $ modify $ \st ->
+    st { paFields = paFields st
+                 ++ [FieldSpec off width acc name desc (hdlRepr (Proxy @a)) bfs] }
+  where
+    -- The bit-field layout is the record's bit-position layout (C5/C2),
+    -- single-sourced through the shared address-mapping helper.
+    layout = bitLayout (Proxy @a)
+    width  = case layoutSize layout of
+        8  -> RW8; 16 -> RW16; 32 -> RW32
+        n  -> error ("fieldRec: unsupported register width " ++ show n)
+    bfs = [ BitField (fromIntegral (plPos p)) (fromIntegral (plHi p)) acc (plName p) ""
+          | p <- layoutPlacements layout ]
 
 register :: RegWidth -> Word8 -> String -> String -> [BitField]
          -> PeriphDef p sig dat ()

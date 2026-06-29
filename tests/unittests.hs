@@ -3,12 +3,17 @@ module Main where
 import Prelude
 
 import qualified Tests.Isacle.Harvard.ISA      as ISA
+import qualified Tests.Isacle.ISA.WidthCheck   as WidthCheck
 import qualified Tests.Isacle.Harvard.Pipeline as Pipeline
 import qualified Tests.Isacle.GPIO             as GPIO
 import qualified Tests.Isacle.Periph.Timer     as Timer
 import qualified Tests.Isacle.Periph.UART      as UART
 import qualified Tests.Isacle.Periph.DMA       as DMA
+import qualified Tests.Isacle.Periph.PE2       as PE2
 import qualified Tests.Isacle.System.Bus       as Bus
+import qualified Tests.Isacle.Layout    as Layout
+import qualified Tests.Isacle.HdlTypes         as HdlTypes
+import qualified Tests.Isacle.Sim              as Sim
 
 main :: IO ()
 main = do
@@ -25,6 +30,16 @@ main = do
     UART.runUartTests
     putStrLn "\n=== DMA engine ==="
     DMA.runDmaTests
+    putStrLn "\n=== Peripheral PE2 typed fields ==="
+    PE2.runPE2Tests
     putStrLn "\n=== System Bus DSL ==="
     Bus.runBusTests
+    putStrLn "\n=== Address-mapping layout ==="
+    Layout.runLayoutTests
+    putStrLn "\n=== ISA width check ==="
+    WidthCheck.runWidthCheckTests
+    putStrLn "\n=== Simulation interpreter ==="
+    putStrLn "\n=== HdlType instances ==="
+    HdlTypes.runHdlTypesTests
+    Sim.runSimTests
     putStrLn "\n=== all tests passed ==="

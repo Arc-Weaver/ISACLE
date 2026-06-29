@@ -29,7 +29,7 @@ module Isacle.ISA.Example.TinyVN
     ) where
 
 import Prelude hiding (Word)
-import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce)
+import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce, add, mul)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -37,8 +37,8 @@ import Isacle.ISA
 -- ---------------------------------------------------------------------------
 
 data TinyVnAlu = TinyVnAlu
-    { tvGpr  :: CPURegFile 8 32
-    , tvPc   :: CPURegister 32
+    { tvGpr  :: CPURegFile 8 (Unsigned 32)
+    , tvPc   :: CPURegister (Unsigned 32)
     , tvZero :: CPUFlag
     }
 
@@ -49,8 +49,8 @@ data TinyVnAlu = TinyVnAlu
 tinyVnCPUDef :: CPUDef TinyVnAlu
 tinyVnCPUDef = do
     endianness LittleEndian
-    g          <- regFile "GPR" (width @8) w32
-    p          <- reg     "PC"  w32
+    g          <- newRegFile "GPR"
+    p          <- newReg "PC"
     (_, zs)    <- flagPack @1 "FLAGS" ["Z"]
     let z       = head zs
     pure TinyVnAlu { tvGpr = g, tvPc = p, tvZero = z }
@@ -77,13 +77,13 @@ tvAdd = do
     zf <- cpuFlag tvZero
     a  <- readReg rd
     b  <- readReg rs
-    r  <- aluOp PAdd a b
+    let r = a + b
     writeReg rd r
     z  <- isZero r
     setFlag zf z
 
 -- | LD rd, ra: load rd from mem[ra]
-tvLd :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr 32, Word m ~ IExpr 32) => m ()
+tvLd :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr (Unsigned 32), Word m ~ IExpr (Unsigned 32)) => m ()
 tvLd = do
     mnemonic "LD"
     doc      "Load: rd = mem[ra]"
@@ -95,7 +95,7 @@ tvLd = do
     writeReg rd val
 
 -- | ST ra, rs: store rs to mem[ra]
-tvSt :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr 32, Word m ~ IExpr 32) => m ()
+tvSt :: (MonadALU m, AluDef m ~ TinyVnAlu, DataAddr m ~ IExpr (Unsigned 32), Word m ~ IExpr (Unsigned 32)) => m ()
 tvSt = do
     mnemonic "ST"
     doc      "Store: mem[ra] = rs"
@@ -107,7 +107,7 @@ tvSt = do
     writeMem addr val
 
 -- | ADDI rd, #imm8: rd = rd + zero-extended 8-bit immediate
-tvAddi :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
+tvAddi :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr (Unsigned 32)) => m ()
 tvAddi = do
     mnemonic "ADDI"
     doc      "Add immediate: rd = rd + imm8"
@@ -115,11 +115,11 @@ tvAddi = do
     rd  <- register tvGpr "ddd"
     imm <- immediate "iiiiiiii"
     a   <- readReg rd
-    r   <- aluOp PAdd a imm
+    let r = a + imm
     writeReg rd r
 
 -- | BEQ k: if Z then PC = k (24-bit absolute target)
-tvBeq :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
+tvBeq :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr (Unsigned 32)) => m ()
 tvBeq = do
     mnemonic "BEQ"
     doc      "Branch if zero: if Z then PC = k"
@@ -131,7 +131,7 @@ tvBeq = do
     absJumpIf p z k
 
 -- | JMP k: PC = k (24-bit absolute target)
-tvJmp :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr 32) => m ()
+tvJmp :: (MonadALU m, AluDef m ~ TinyVnAlu, Word m ~ IExpr (Unsigned 32)) => m ()
 tvJmp = do
     mnemonic "JMP"
     doc      "Absolute jump: PC = k"
@@ -146,8 +146,8 @@ tvJmp = do
 
 tinyVnISA :: ( MonadALU m
              , AluDef m ~ TinyVnAlu
-             , Word m ~ IExpr 32
-             , DataAddr m ~ IExpr 32
+             , Word m ~ IExpr (Unsigned 32)
+             , DataAddr m ~ IExpr (Unsigned 32)
              ) => ISADef m
 tinyVnISA = defineISA ISADef
     { isaPc            = SomeCPURegister <$> cpu tvPc

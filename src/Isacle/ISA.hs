@@ -23,20 +23,44 @@ module Isacle.ISA
     , CPURegFile
       -- * CPU definition monad
     , CPUDef
+    , ISACoreDefinition
     , CPUSchema
     , runCPUDef
     , endianness
-    , regFile
+    , newRegFile
+    , newReg
     , reg
+    , newFlag
+    , regsFromRecord
     , flagPack
+    , flagRec
     , aliasReg
     , aliasFile
+    , (!)
       -- * Endianness
     , Endianness(..)
       -- * ALU primitives
     , ALUPrim(..)
       -- * MonadALU
     , MonadALU(..)
+      -- * Register access by field projection
+    , readField
+    , writeField
+    , readRegFile
+    , writeRegFile
+    , readRegFileOffset
+    , writeRegFileOffset
+      -- * Encoding DSL (typed field placeholders)
+    , module Isacle.ISA.EncodingDSL
+    , defineInstruction
+    , readRegFileF
+    , writeRegFileF
+    , readRegFileFOffset
+    , writeRegFileFOffset
+    , readRegFileAt
+    , writeRegFileAt
+    , immediateF
+    , absJumpIfF
       -- * MonadHarvardALU
     , MonadHarvardALU(..)
       -- * MonadIRQ
@@ -95,6 +119,7 @@ module Isacle.ISA
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.ALU
+import Isacle.ISA.EncodingDSL
 import Isacle.ISA.Def
 import Isacle.ISA.Encoding
 import Isacle.ISA.IR

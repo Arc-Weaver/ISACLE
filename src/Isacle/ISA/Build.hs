@@ -27,6 +27,7 @@ import GHC.TypeLits (KnownNat)
 import Control.Monad.Reader
 import Control.Monad.State.Strict
 
+import Hdl.Bits (Unsigned)
 import Isacle.ISA.Types
 import Isacle.ISA.Encoding (fieldKey)
 import Isacle.ISA.ALU
@@ -40,7 +41,7 @@ data BuildSt = BuildSt
     { bsMnemonic :: Maybe String
     , bsDoc      :: Maybe String
     , bsEncoding :: Maybe String
-    , bsGate     :: Maybe (IExpr 1)
+    , bsGate     :: Maybe (IExpr Bool)
     , bsStmts    :: [IStmt]   -- ^ reverse program order
     , bsReadCtr  :: Int
     }
@@ -102,8 +103,8 @@ toRegRef key = case break (== ':') key of
 instance (KnownNat wordW, KnownNat addrW)
       => MonadALU (ISABuild alu wordW addrW cwW caW) where
     type AluDef   (ISABuild alu wordW addrW cwW caW) = alu
-    type Word     (ISABuild alu wordW addrW cwW caW) = IExpr wordW
-    type DataAddr (ISABuild alu wordW addrW cwW caW) = IExpr addrW
+    type Word     (ISABuild alu wordW addrW cwW caW) = IExpr (Unsigned wordW)
+    type DataAddr (ISABuild alu wordW addrW cwW caW) = IExpr (Unsigned addrW)
 
     cpu sel     = ISABuild (asks sel)
     cpuFlag sel = ISABuild (asks sel)
@@ -140,18 +141,18 @@ instance (KnownNat wordW, KnownNat addrW)
 
 instance (KnownNat wordW, KnownNat addrW, KnownNat cwW, KnownNat caW)
       => MonadHarvardALU (ISABuild alu wordW addrW cwW caW) where
-    type CodeAddr (ISABuild alu wordW addrW cwW caW) = IExpr caW
-    type CodeWord (ISABuild alu wordW addrW cwW caW) = IExpr cwW
+    type CodeAddr (ISABuild alu wordW addrW cwW caW) = IExpr (Unsigned caW)
+    type CodeWord (ISABuild alu wordW addrW cwW caW) = IExpr (Unsigned cwW)
 
     readCode addr = do { tok <- freshRead; emitStmt (SReadCode tok addr); pure (IReadRes tok) }
 
 instance (KnownNat wordW, KnownNat addrW, KnownNat caW)
       => MonadIRQ (ISABuild alu wordW addrW cwW caW) where
-    type IrqAddrW (ISABuild alu wordW addrW cwW caW) = caW
+    type IrqAddr (ISABuild alu wordW addrW cwW caW) = Unsigned caW
 
     irqVector = pure IIrqVector
 
     irqGate condAction = do
         cond <- condAction
         ISABuild $ modify $ \s ->
-            s { bsGate = Just (maybe cond (\g -> tBin PAnd g cond) (bsGate s)) }
+            s { bsGate = Just (maybe cond (\g -> IBin PAnd g cond) (bsGate s)) }

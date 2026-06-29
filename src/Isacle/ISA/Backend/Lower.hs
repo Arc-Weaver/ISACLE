@@ -28,8 +28,6 @@ module Isacle.ISA.Backend.Lower
 
 import Prelude
 import Control.Monad (foldM)
-import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net (WireId, NetM, NetNode(..), PrimOp, freshWire, emit, hintWire)
 import qualified Hdl.Net as N
@@ -40,7 +38,7 @@ import Isacle.ISA.IR
 -- the CPU synthesis pass (which owns the register file, the field decoder and
 -- the per-cycle read-result wires).
 data LowerCtx = LowerCtx
-    { lcReadReg   :: forall w. RegRef w -> NetM WireId
+    { lcReadReg   :: forall a. RegRef a -> NetM WireId
     , lcField     :: FieldRef -> NetM WireId
     , lcReadRes   :: ReadTok -> NetM WireId
     , lcReadFlag  :: CPUFlag -> NetM WireId
@@ -56,7 +54,7 @@ data Named = Named
     }
 
 -- | Lower an expression, returning the wire and its propagated name.
-lowerExpr :: forall w. LowerCtx -> IExpr w -> NetM Named
+lowerExpr :: forall a. LowerCtx -> IExpr a -> NetM Named
 lowerExpr ctx = go
   where
     go :: forall k. IExpr k -> NetM Named
@@ -66,7 +64,7 @@ lowerExpr ctx = go
         pure (Named w (Just nm))
 
     go e@(ILit v) = do
-        let bw = widthOf e
+        let bw = exprWidth e
         w <- freshWire
         emit $ NComb w (N.PLit v bw) []
         pure (Named w Nothing)               -- literals carry no propagated name
@@ -106,22 +104,29 @@ lowerExpr ctx = go
         maybe (pure ()) (hintWire w) nm
         pure (Named w nm)
 
-    go e@(IResize a)  = resizeLike (widthOf e) a
-    go e@(IZeroExt a) = resizeLike (widthOf e) a
+    go e@(IResize a)  = resizeLike (exprWidth e) a
+    go e@(IZeroExt a) = resizeLike (exprWidth e) a
     go e@(ITrunc a)   = do
-        let dst = widthOf e
+        let dst = exprWidth e
         Named wa na <- go a
         w <- freshWire
         emit $ NComb w (N.PSlice (dst - 1) 0) [wa]
         propagate w na
     go e@(ISignExt a) = do
-        let dst = widthOf e
+        let dst = exprWidth e
         Named wa na <- go a
         w <- freshWire
         emit $ NComb w (N.PSignedResize dst) [wa]
         propagate w na
+    -- | Same-width reinterpretation: a real signed()/unsigned() cast carrying
+    -- the *target* representation, recovered from the result value type.
+    go e@(IReinterpret a) = do
+        Named wa na <- go a
+        w <- freshWire
+        emit $ NComb w (N.PReinterpret (exprRepr e)) [wa]
+        propagate w na
     go (IIsZero a) = do
-        let bw = widthOf a
+        let bw = exprWidth a
         Named wa na <- go a
         zw <- freshWire
         emit $ NComb zw (N.PLit 0 bw) []
@@ -146,7 +151,7 @@ lowerExpr ctx = go
         hintWire w "irq_vector"
         pure (Named w (Just "irq_vector"))
 
-    resizeLike :: forall k. Int -> IExpr k -> NetM Named
+    resizeLike :: forall j. Int -> IExpr j -> NetM Named
     resizeLike dst a = do
         Named wa na <- go a
         w <- freshWire
@@ -205,11 +210,6 @@ toPrim PShiftR      = N.PShiftR
 toPrim PArithShiftR = N.PShiftR
 toPrim PMul         = N.PMul
 toPrim PMulSigned   = N.PMul
-
--- | The bit width of an expression, recovered from the @KnownNat@ dictionary
--- each constructor carries.
-widthOf :: forall w. KnownNat w => IExpr w -> Int
-widthOf _ = fromIntegral (natVal (Proxy @w))
 
 -- ---------------------------------------------------------------------------
 -- Statement-level rendering: InstrIR -> lowered write/read requests

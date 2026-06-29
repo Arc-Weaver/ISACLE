@@ -72,6 +72,7 @@ library isacle-hdl
     Hdl.Net
     Hdl.Prim
     Hdl.Reduce
+    Hdl.Sim
     Hdl.Types
   build-depends:
     base >= 4.12 && < 4.22,
@@ -108,6 +109,7 @@ library
     Isacle.ISA.CPUDef
     Isacle.ISA.Def
     Isacle.ISA.Encoding
+    Isacle.ISA.EncodingDSL
     Isacle.ISA.IR
     Isacle.ISA.Build
     Isacle.ISA.Example.AVR
@@ -115,6 +117,7 @@ library
     Isacle.ISA.Example.TinyVN
     Isacle.ISA.Types
     Isacle.ISA.VonNeumann
+    Isacle.ISA.WidthCheck
     Isacle.Cache.Config
     Isacle.Cache.L1
     Isacle.Memory
@@ -126,11 +129,14 @@ library
     Isacle.Periph.UART
     Isacle.System
     Isacle.System.BusArch
+    Isacle.System.BusCap
     Isacle.System.BusDef
     Isacle.System.BusHandle
     Isacle.System.Generate
     Isacle.System.HdlCircuit
+    Isacle.Layout
     Isacle.System.Periph
+    Isacle.System.Reduce
     Isacle.System.Spec
     Isacle.System.SystemDSL
     Isacle.TH
@@ -225,7 +231,12 @@ test-suite test-library
     Tests.Isacle.Periph.Timer
     Tests.Isacle.Periph.UART
     Tests.Isacle.Periph.DMA
+    Tests.Isacle.Periph.PE2
+    Tests.Isacle.ISA.WidthCheck
     Tests.Isacle.System.Bus
+    Tests.Isacle.Layout
+    Tests.Isacle.HdlTypes
+    Tests.Isacle.Sim
   build-depends:
     base >= 4.12 && < 4.22,
     containers >= 0.6,
