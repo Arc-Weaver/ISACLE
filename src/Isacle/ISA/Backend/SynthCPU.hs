@@ -301,7 +301,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     -- Execution sequencer: drives read-result wires, supplies the per-access
     -- cycle gate ('esGate') and the architectural-commit enable ('esCommit').
     sq <- buildExecSequencer domInfo wordBits stallWireId allResults
-    let nAccOf r = max (length (srMemReads r)) (length (srMemWrites r))
+    let nAccOf = seqNAcc   -- total reads+writes: reads then writes on distinct cycles
 
     -- -----------------------------------------------------------------------
     -- Register files — a block of registers in cpu_state
@@ -518,10 +518,12 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     -- Data memory write arbiter (each write gated by its cycle)
     -- -----------------------------------------------------------------------
 
-    let writesIndexed = [ (nAccOf r, idx, mw)
+    -- Writes are sequenced after the instruction's reads: write j runs on exec
+    -- cycle @nReads + j@ (so an SBI/CBI write follows its read, never coincides).
+    let writesIndexed = [ (nAccOf r, length (srMemReads r) + idx, mw)
                         | r <- allResults, (idx, mw) <- zip [0 ..] (srMemWrites r) ]
-    gatedWrites <- forM writesIndexed $ \(nAcc, idx, mw) -> do
-        sel <- esGate sq nAcc (mwMatchWire mw) idx
+    gatedWrites <- forM writesIndexed $ \(nAcc, cyc, mw) -> do
+        sel <- esGate sq nAcc (mwMatchWire mw) cyc
         return (sel, mw)
     (dmemWrEnW, dmemWrAddrW, dmemWrDatW) <- case gatedWrites of
         [] -> (,,) <$> litWire 0 1
@@ -675,8 +677,14 @@ addrBitsFor n
 -- independent per-entry writes (see the bank lowering in 'synthHarvardCPU'), so
 -- multiple register-file writes in one instruction (MUL → R0 and R1) commit in
 -- the same cycle and do not extend the instruction.
+-- An instruction's reads and writes are sequenced onto distinct cycles —
+-- reads on cycles @0 .. nReads-1@, writes on @nReads .. nReads+nWrites-1@ — so
+-- a read-modify-write of one address (AVR SBI/CBI) reads on an earlier cycle
+-- than it writes, never both at once (which would loop the bus combinationally).
+-- When an instruction only reads or only writes this equals @max@, so pure-read
+-- / pure-write instructions are unaffected.
 seqNAcc :: SynthResult -> Int
-seqNAcc r = max (length (srMemReads r)) (length (srMemWrites r))
+seqNAcc r = length (srMemReads r) + length (srMemWrites r)
 
 -- | Per-instruction multi-cycle execution sequencer.
 --
@@ -777,14 +785,19 @@ buildExecSequencer domInfo dataW stallW results = do
                     andGate m eqW
 
         -- Drive read result wires (latch reads whose value outlives their cycle).
+        -- A read on cycle @i@ may be consumed by a later access of the same
+        -- instruction (a subsequent read, or — for SBI/CBI — the write that
+        -- follows it).  It can be taken straight off the bus only when it is the
+        -- instruction's final access (@i == nAcc - 1@); otherwise it is latched
+        -- and replayed on later cycles.  Gating uses the total access count.
         forM_ results $ \r -> do
             let rds  = srMemReads r
-                nRds = length rds
+                nAcc = nAccOf r
             forM_ (zip [0 ..] rds) $ \(i, rr) ->
-                if nRds < 2 || i == nRds - 1
+                if i == nAcc - 1
                     then driveWire (mrResultWire rr) (mrBusWire rr)
                     else do
-                        sel    <- gate nRds (mrMatchWire rr) i
+                        sel    <- gate nAcc (mrMatchWire rr) i
                         capEnW <- andGate sel notWaitW
                         latchW <- freshWire
                         defer $ emit $ NReg latchW (mrBusWire rr) (Just capEnW)
