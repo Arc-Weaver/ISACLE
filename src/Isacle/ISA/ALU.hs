@@ -50,6 +50,15 @@ class Monad m => MonadALU m where
                        -> String -> Int -> m (CPURegister t)
     registerWithOffset sel field _ = register sel field
 
+    -- | Like 'registerWithOffset', but also scales the field value before adding
+    -- the offset: the index is @scale * field + offset@.  Used for register-/pair/
+    -- encodings where a small field selects a strided slot — e.g. AVR ADIW where
+    -- the 2-bit @d@ selects pair base @24 + 2·d@.
+    -- Default: ignores scale and offset (suitable for documentation backends).
+    registerScaled :: (AluDef m -> CPURegFile count t)
+                   -> String -> Int -> Int -> m (CPURegister t)
+    registerScaled sel field _ _ = register sel field
+
     -- | Get a flag reference from the ALU definition
     cpuFlag  :: (AluDef m -> CPUFlag) -> m CPUFlag
 
@@ -235,6 +244,18 @@ readRegFileFOffset sel f off = registerWithOffset sel [fldKey f] off >>= readReg
 writeRegFileFOffset :: (MonadALU m, HdlType t)
                     => (AluDef m -> CPURegFile count t) -> Field idx -> Int -> IExpr t -> m ()
 writeRegFileFOffset sel f off e = registerWithOffset sel [fldKey f] off >>= \r -> writeReg r e
+
+-- | 'readRegFileF' at the affine index @scale * field + offset@ — for
+-- register-/pair/ encodings where a small field selects a strided slot (e.g.
+-- AVR ADIW: pair base @24 + 2·d@ is @readRegFileFScaled avrGPR d 2 24@).
+readRegFileFScaled :: (MonadALU m, HdlType t)
+                   => (AluDef m -> CPURegFile count t) -> Field idx -> Int -> Int -> m (IExpr t)
+readRegFileFScaled sel f scale off = registerScaled sel [fldKey f] scale off >>= readReg
+
+-- | 'writeRegFileF' at the affine index @scale * field + offset@.
+writeRegFileFScaled :: (MonadALU m, HdlType t)
+                    => (AluDef m -> CPURegFile count t) -> Field idx -> Int -> Int -> IExpr t -> m ()
+writeRegFileFScaled sel f scale off e = registerScaled sel [fldKey f] scale off >>= \r -> writeReg r e
 
 -- | Read a field placeholder as a value-typed expression (re-exported convenience).
 immediateF :: HdlType t => Field t -> IExpr t

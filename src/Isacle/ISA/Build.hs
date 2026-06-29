@@ -82,6 +82,8 @@ freshRead = ISABuild $ do
 --   * @"rf:field"@        — register-file slot indexed by an instruction field.
 --   * @"rf:field@off"@    — same, plus a constant @off@ added to the index
 --                           (sub-range encodings, e.g. AVR R16–R31 → @+16@).
+--   * @"rf:field*s@off"@  — affine index @s*field + off@ (register-/pair/
+--                           encodings, e.g. ADIW @24 + 2·d@ → @field*2\@24@).
 --   * @"rf:N"@ (N digits) — a /constant/ register-file index (e.g. @"GPR:0"@ for
 --                           R0).  Represented as an empty field key with the
 --                           index carried in the offset slot, so no field is
@@ -91,11 +93,16 @@ toRegRef :: String -> RegRef w
 toRegRef key
     | Just (file, ew, idxs) <- decodeRegView key = RegEntries file ew idxs
     | otherwise = case break (== ':') key of
-        (rf, ':':rest) -> case break (== '@') rest of
-            (fk, '@':offStr)                    -> RegFile rf (FieldRef fk) (read offStr)
-            (fk, _) | not (null fk), all isDigit fk
-                                                -> RegFile rf (FieldRef "") (read fk)
-                    | otherwise                 -> RegFile rf (FieldRef fk) 0
+        (rf, ':':rest) ->
+            let (idxPart, off) = case break (== '@') rest of
+                    (a, '@':offStr) -> (a, read offStr)
+                    (a, _)          -> (a, 0)
+                (fk, scale) = case break (== '*') idxPart of
+                    (a, '*':sStr) -> (a, read sStr)
+                    (a, _)        -> (a, 1)
+            in if not (null fk) && all isDigit fk && scale == 1 && off == 0
+                   then RegFile rf (FieldRef "") 1 (read fk)   -- constant index Rn
+                   else RegFile rf (FieldRef fk) scale off
         _ -> RegScalar key
 
 -- ---------------------------------------------------------------------------
@@ -120,6 +127,12 @@ instance (KnownNat wordW, KnownNat addrW)
         alu <- ask
         let CPURegFile rfname = sel alu
         pure (CPURegister (rfname ++ ":" ++ fieldKey field ++ "@" ++ show offset))
+
+    registerScaled sel field scale offset = ISABuild $ do
+        alu <- ask
+        let CPURegFile rfname = sel alu
+        pure (CPURegister
+                (rfname ++ ":" ++ fieldKey field ++ "*" ++ show scale ++ "@" ++ show offset))
 
     immediate field = pure (IField (FieldRef (fieldKey field)))
 

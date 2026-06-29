@@ -58,6 +58,8 @@ module Isacle.ISA
     , writeRegFileF
     , readRegFileFOffset
     , writeRegFileFOffset
+    , readRegFileFScaled
+    , writeRegFileFScaled
     , readRegFileAt
     , writeRegFileAt
     , immediateF

@@ -153,31 +153,37 @@ renderSynth ctx mBase ir = do
     -- Register-file index wires.  Offset 0 is the raw field; a non-zero offset
     -- (sub-range encoding, e.g. AVR @ldi@ → R16..R31) adds a constant, producing
     -- a real adder so the index reaches the high half of the file.
-    idxPairs <- mapM (\(k, off) ->
+    idxPairs <- mapM (\(k, sc, off) ->
                     if null k
                         then do  -- constant index: a literal, no field
                             w <- litW (fromIntegral off) (rcWordW ctx)
                             hintWire w (mnemPrefix (iirMnemonic ir) ("r" ++ show off ++ "_idx"))
-                            pure ((k, off), w)
+                            pure ((k, sc, off), w)
                         else do
                             let fw = Map.findWithDefault base k fieldMap
-                            if off == 0
-                                then pure ((k, off), fw)
+                            if sc == 1 && off == 0
+                                then pure ((k, sc, off), fw)
                                 else do
-                                    ext  <- freshWire; emit $ NComb ext (N.PResize (rcWordW ctx)) [fw]
-                                    offW <- litW (fromIntegral off) (rcWordW ctx)
-                                    s    <- freshWire; emit $ NComb s N.PAdd [ext, offW]
+                                    ext    <- freshWire; emit $ NComb ext (N.PResize (rcWordW ctx)) [fw]
+                                    scaled <- if sc == 1 then pure ext
+                                              else do scW <- litW (fromIntegral sc) (rcWordW ctx)
+                                                      m   <- freshWire; emit $ NComb m N.PMul [ext, scW]
+                                                      pure m
+                                    s <- if off == 0 then pure scaled
+                                         else do offW <- litW (fromIntegral off) (rcWordW ctx)
+                                                 a    <- freshWire; emit $ NComb a N.PAdd [scaled, offW]
+                                                 pure a
                                     hintWire s (mnemPrefix (iirMnemonic ir) (k ++ "_idx"))
-                                    pure ((k, off), s))
+                                    pure ((k, sc, off), s))
                    idxKeys
     let idxMap = Map.fromList idxPairs
-        idxWire k off = Map.findWithDefault base (k, off) idxMap
+        idxWire k sc off = Map.findWithDefault base (k, sc, off) idxMap
 
-    -- One read port per distinct (register file, index field, offset).
-    regTriples <- mapM (\(rf, k, off) -> do
+    -- One read port per distinct (register file, index field, scale, offset).
+    regTriples <- mapM (\(rf, k, sc, off) -> do
                             outW <- freshWire
                             hintWire outW (rf ++ "_" ++ slotTag k off)
-                            pure ((rf, k, off), outW, RegReadReq rf (idxWire k off) outW))
+                            pure ((rf, k, sc, off), outW, RegReadReq rf (idxWire k sc off) outW))
                        regReads
     let regOutMap   = Map.fromList [ (key, o) | (key, o, _) <- regTriples ]
         regReadReqs = [ r | (_, _, r) <- regTriples ]
@@ -194,7 +200,7 @@ renderSynth ctx mBase ir = do
         -- first (low) entry least significant.
         readView file ew idxs = do
             let total = ew * length idxs
-                entryWire idx = Map.findWithDefault base (file, "", idx) regOutMap
+                entryWire idx = Map.findWithDefault base (file, "", 1, idx) regOutMap
             parts <- mapM (\(p, idx) -> do
                 rz <- freshWire; emit $ NComb rz (N.PResize total) [entryWire idx]
                 if p == 0 then pure rz
@@ -207,7 +213,7 @@ renderSynth ctx mBase ir = do
     let lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
                   RegScalar n                 -> rcReadScalar ctx n
-                  RegFile rf (FieldRef k) off -> pure (Map.findWithDefault base (rf, k, off) regOutMap)
+                  RegFile rf (FieldRef k) sc off -> pure (Map.findWithDefault base (rf, k, sc, off) regOutMap)
                   RegEntries file ew idxs     -> readView file ew idxs
             , lcField     = \(FieldRef k) -> pure (Map.findWithDefault base k fieldMap)
             , lcReadRes   = \(ReadTok t)  -> pure (Map.findWithDefault (rcDataBus ctx) t tokMap)
@@ -227,8 +233,8 @@ renderSynth ctx mBase ir = do
 
     -- Map the lowered Rendered into request structures.
     let splitW (RegWrite (RegScalar n) w)                 = Left  (ScalarWriteReq matchW n w)
-        splitW (RegWrite (RegFile rf (FieldRef k) off) w) =
-            Right (RegWriteReq matchW rf (idxWire k off) w)
+        splitW (RegWrite (RegFile rf (FieldRef k) sc off) w) =
+            Right (RegWriteReq matchW rf (idxWire k sc off) w)
         splitW (RegWrite (RegEntries{}) _) =
             error "view-register write should have been fanned out in renderInstr"
         (scalarWs, regWs) = partitionEithers (map splitW (rRegWrites r))
@@ -259,7 +265,7 @@ renderSynth ctx mBase ir = do
 
 regRefName :: RegRef w -> String
 regRefName (RegScalar n)      = n
-regRefName (RegFile  n _ _)   = n
+regRefName (RegFile  n _ _ _) = n
 regRefName (RegEntries n _ _) = n
 
 -- | Name a register-file slot: a field key (with optional @_pN@ offset) or, for
@@ -295,9 +301,9 @@ litW v w = do { o <- freshWire; emit $ NComb o (N.PLit v w) []; pure o }
 -- ---------------------------------------------------------------------------
 
 data Collected = Collected
-    { colRegReads :: [(String, String, Int)]  -- (register file, index field, offset)
-    , colFields   :: [String]                 -- field keys (immediates + indices)
-    , colIdx      :: [(String, Int)]          -- (index field, offset) used as a regfile index
+    { colRegReads :: [(String, String, Int, Int)] -- (register file, index field, scale, offset)
+    , colFields   :: [String]                     -- field keys (immediates + indices)
+    , colIdx      :: [(String, Int, Int)]         -- (index field, scale, offset) used as a regfile index
     }
 
 instance Semigroup Collected where
@@ -316,17 +322,17 @@ fieldsOf k = [ k | not (null k) ]
 collectRef :: RegRef w -> Collected
 collectRef (RegScalar _)               = mempty
 collectRef (RegEntries _ _ _)          = mempty  -- view writes fan out to file slots in renderInstr
-collectRef (RegFile _ (FieldRef k) o)  = Collected [] (fieldsOf k) [(k, o)]
+collectRef (RegFile _ (FieldRef k) s o)  = Collected [] (fieldsOf k) [(k, s, o)]
 
 collectE :: IExpr w -> Collected
 collectE e = case e of
     ILit _                                  -> mempty
     IField (FieldRef k)                     -> Collected [] [k] []
     IReadReg (RegScalar _)                  -> mempty
-    IReadReg (RegFile rf (FieldRef k) o)    -> Collected [(rf, k, o)] (fieldsOf k) [(k, o)]
+    IReadReg (RegFile rf (FieldRef k) s o)  -> Collected [(rf, k, s, o)] (fieldsOf k) [(k, s, o)]
     -- A view read needs each constituent entry as a constant-index file read.
     IReadReg (RegEntries file _ idxs)       ->
-        mconcat [ Collected [(file, "", i)] [] [("", i)] | i <- idxs ]
+        mconcat [ Collected [(file, "", 1, i)] [] [("", 1, i)] | i <- idxs ]
     IReadRes _                              -> mempty
     IFlagRead _                             -> mempty
     IIrqVector                              -> mempty

@@ -184,10 +184,12 @@ lowerExpr_ ctx e = nWire <$> lowerExpr ctx e
 regName :: RegRef w -> String
 regName (RegScalar n)              = n
 regName (RegEntries f _ idxs)      = f ++ "_" ++ intercalate "_" (map show idxs)
-regName (RegFile f (FieldRef k) o)
+regName (RegFile f (FieldRef k) s o)
     | null k    = f ++ "_r" ++ show o          -- constant index Rn
-    | o /= 0    = f ++ "_" ++ k ++ "_p" ++ show o
-    | otherwise = f ++ "_" ++ k
+    | otherwise = f ++ "_" ++ k ++ sTag ++ oTag
+  where
+    sTag = if s /= 1 then "_x" ++ show s else ""
+    oTag = if o /= 0 then "_p" ++ show o else ""
 
 -- | Name a binary result after its operands, e.g. @sp \"sub\" => sp_sub@.
 -- Only names when at least one operand carries a name, to avoid noise.
@@ -277,7 +279,7 @@ renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
         sliceEntry w (p, idx) = do
             sw <- freshWire
             emit $ NComb sw (N.PSlice ((p + 1) * ew - 1) (p * ew)) [w]
-            pure (RegWrite (RegFile file (FieldRef "") idx) sw)
+            pure (RegWrite (RegFile file (FieldRef "") 1 idx) sw)
     step r (SWriteReg ref e) = do
         w <- lowerExpr_ ctx e
         pure r { rRegWrites = RegWrite ref w : rRegWrites r }

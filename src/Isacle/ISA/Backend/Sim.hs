@@ -79,7 +79,7 @@ evalE env = go
         ILit v                              -> maskTo (widthOfE e0) v
         IField (FieldRef k)                 -> field k
         IReadReg (RegScalar n)              -> maskTo (widthOfE e0) (reg n)
-        IReadReg (RegFile rf (FieldRef k) o) -> maskTo (widthOfE e0) (reg (rf ++ ":" ++ show (field k + fromIntegral o)))
+        IReadReg (RegFile rf (FieldRef k) s o) -> maskTo (widthOfE e0) (reg (rf ++ ":" ++ show (fromIntegral s * field k + fromIntegral o)))
         -- A view register: concatenate its entries, low (first) entry least significant.
         IReadReg (RegEntries file ew idxs)  -> maskTo (widthOfE e0)
             (foldr (.|.) 0 [ reg (file ++ ":" ++ show idx) `shiftL` (p * ew)
@@ -167,7 +167,7 @@ renderInstrSim instrWord mIrqVec ir st0 =
     regRefKey :: RegRef w -> String
     regRefKey (RegScalar n)               = n
     regRefKey (RegEntries file _ idxs)    = file ++ ":" ++ show (head idxs)  -- views write via fan-out
-    regRefKey (RegFile rf (FieldRef k) o) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr (Unsigned 32)) + fromIntegral o)
+    regRefKey (RegFile rf (FieldRef k) s o) = rf ++ ":" ++ show (fromIntegral s * evalE (env toks) (IField (FieldRef k) :: IExpr (Unsigned 32)) + fromIntegral o)
 
     putReg n v st = st { ssCPU = (ssCPU st) { scRegs = Map.insert n v (scRegs (ssCPU st)) } }
     putFlag (CPUFlag rn bp) v st =

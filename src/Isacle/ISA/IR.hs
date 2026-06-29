@@ -113,9 +113,13 @@ newtype FieldRef = FieldRef { frKey :: String }
 -- for signal naming.  Indexed by the register's value type @a@.
 data RegRef (a :: Type)
     = RegScalar String              -- ^ scalar register (e.g. @"SP"@, @"PC"@)
-    | RegFile   String FieldRef Int -- ^ register-file slot: file name, index field,
-                                    --   and a constant added to the index (for
-                                    --   sub-range encodings, e.g. AVR R16–R31 → +16)
+    | RegFile   String FieldRef Int Int
+                                    -- ^ register-file slot: file name, index field,
+                                    --   index /scale/ and /offset/ — the runtime index
+                                    --   is @scale * field + offset@.  Scale 1 is the
+                                    --   plain case; sub-range encodings add an offset
+                                    --   (e.g. AVR R16–R31 → +16) and register-/pair/
+                                    --   encodings use scale 2 (e.g. ADIW 24+2·d).
     | RegEntries String Int [Int]   -- ^ a /view/ register: a value spanning several
                                     --   register-file entries (file name, element
                                     --   width, indices low entry first), e.g. AVR
