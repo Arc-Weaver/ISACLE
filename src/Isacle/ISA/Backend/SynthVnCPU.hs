@@ -235,34 +235,21 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
     let involvedRfs = Map.keys regWritesByRf
                    ++ filter (`Map.notMember` regWritesByRf) readRfNames
 
-    -- A register file is a register bank as an array field of the cpu_state
-    -- record (e.g. @cpu_state.GPR@): indexed multi-port writes (gated with
-    -- ~stall) and indexed combinational reads.  Independent per entry, so
-    -- multiple writes per instruction commit at once. (Not block RAM.)
+    -- A register file is just a block of registers (an array field of cpu_state):
+    -- every write is an independent enable-gated indexed assignment GPR(idx)<=data
+    -- (gated with ~stall), no bank/port arbiter; VHDL applies distinct indices
+    -- independently and matches are exclusive.
     forM_ involvedRfs $ \rfname -> do
         let (rfCount, rfWidth) = case Map.lookup rfname rfInfoMap of
                 Just p  -> p
                 Nothing -> (1, wordBits)
             aBits = addrBitsFor rfCount
 
-        let perInstr =
-                [ (m, filter ((== rfname) . rwRfName) (srRegWrites r))
-                | r <- allResults
-                , any ((== rfname) . rwRfName) (srRegWrites r)
-                , Just m <- [srMatchWire r] ]
-            nPorts = maximum (1 : map (length . snd) perInstr)
+        writes <- forM [ w | w <- allRegWrites, rwRfName w == rfname ] $ \w -> do
+            enW <- freshWire; emit $ NComb enW N.PAnd [rwMatchWire w, notStallW]
+            return (rwIdxWire w, rwDataWire w, enW)
 
-        ports <- forM [0 .. nPorts - 1] $ \p -> do
-            let contribs = [ (m, ws Prelude.!! p) | (m, ws) <- perInstr, length ws > p ]
-            addrW <- buildMuxTree [(m, rwIdxWire w)  | (m, w) <- contribs]
-                        =<< litWire 0 aBits
-            datW  <- buildMuxTree [(m, rwDataWire w) | (m, w) <- contribs]
-                        =<< litWire 0 rfWidth
-            enRaw <- buildOrTree (map fst contribs)
-            enW   <- freshWire; emit $ NComb enW N.PAnd [enRaw, notStallW]
-            return (addrW, datW, enW)
-
-        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth ports domInfo
+        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth writes domInfo
 
         let instrSlots :: [(WireId, [RegReadReq])]
             instrSlots =

@@ -80,12 +80,17 @@ evalE env = go
         IField (FieldRef k)                 -> field k
         IReadReg (RegScalar n)              -> maskTo (widthOfE e0) (reg n)
         IReadReg (RegFile rf (FieldRef k) o) -> maskTo (widthOfE e0) (reg (rf ++ ":" ++ show (field k + fromIntegral o)))
+        -- A view register: concatenate its entries, low (first) entry least significant.
+        IReadReg (RegEntries file ew idxs)  -> maskTo (widthOfE e0)
+            (foldr (.|.) 0 [ reg (file ++ ":" ++ show idx) `shiftL` (p * ew)
+                           | (p, idx) <- zip [0 ..] idxs ])
         IReadRes (ReadTok t)                -> IntMap.findWithDefault 0 t (evToks env)
         IFlagRead (CPUFlag rn bp)           -> (reg rn `shiftR` bp) .&. 1
         IIrqVector                          -> maybe 0 id (evIrqVec env)
         IBin op a b                         -> maskTo (widthOfE e0) (binOp op (go a) (go b) (widthOfE e0))
         IUn PNot a                          -> maskTo (widthOfE e0) (complement (go a))
         IUn _ a                             -> maskTo (widthOfE e0) (go a)
+        IMux c t f                          -> maskTo (widthOfE e0) (if go c /= 0 then go t else go f)
         IResize a                           -> maskTo (widthOfE e0) (go a)
         IZeroExt a                          -> maskTo (widthOfE e0) (go a)
         ITrunc a                            -> maskTo (widthOfE e0) (go a)
@@ -146,6 +151,13 @@ renderInstrSim instrWord mIrqVec ir st0 =
     ev :: IExpr w -> Integer
     ev e = evalE (env toks) e
 
+    -- A view-register write fans out across its entries (low entry first).
+    apply st (SWriteReg (RegEntries file ew idxs) e) =
+        let v = ev e
+        in foldl' (\s (p, idx) ->
+                      putReg (file ++ ":" ++ show idx)
+                             ((v `shiftR` (p * ew)) .&. ((1 `shiftL` ew) - 1)) s)
+                  st (zip [0 ..] idxs)
     apply st (SWriteReg ref e)  = putReg (regRefKey ref) (ev e) st
     apply st (SWriteMem a d)    = st { ssDataMem = IntMap.insert (fromIntegral (ev a)) (ev d) (ssDataMem st) }
     apply st (SWriteFlag f e)   = putFlag f (ev e) st
@@ -154,6 +166,7 @@ renderInstrSim instrWord mIrqVec ir st0 =
 
     regRefKey :: RegRef w -> String
     regRefKey (RegScalar n)               = n
+    regRefKey (RegEntries file _ idxs)    = file ++ ":" ++ show (head idxs)  -- views write via fan-out
     regRefKey (RegFile rf (FieldRef k) o) = rf ++ ":" ++ show (evalE (env toks) (IField (FieldRef k) :: IExpr (Unsigned 32)) + fromIntegral o)
 
     putReg n v st = st { ssCPU = (ssCPU st) { scRegs = Map.insert n v (scRegs (ssCPU st)) } }

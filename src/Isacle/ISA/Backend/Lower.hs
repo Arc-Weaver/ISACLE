@@ -28,6 +28,7 @@ module Isacle.ISA.Backend.Lower
 
 import Prelude
 import Control.Monad (foldM)
+import Data.List (intercalate)
 
 import Hdl.Net (WireId, NetM, NetNode(..), PrimOp, freshWire, emit, hintWire)
 import qualified Hdl.Net as N
@@ -104,6 +105,16 @@ lowerExpr ctx = go
         maybe (pure ()) (hintWire w) nm
         pure (Named w nm)
 
+    go (IMux c t f) = do
+        Named wc _  <- go c
+        Named wt nt <- go t
+        Named wf nf <- go f
+        w <- freshWire
+        emit $ NComb w N.PMux [wc, wt, wf]
+        let nm = followName "sel" nt nf
+        maybe (pure ()) (hintWire w) nm
+        pure (Named w nm)
+
     go e@(IResize a)  = resizeLike (exprWidth e) a
     go e@(IZeroExt a) = resizeLike (exprWidth e) a
     go e@(ITrunc a)   = do
@@ -172,6 +183,7 @@ lowerExpr_ ctx e = nWire <$> lowerExpr ctx e
 
 regName :: RegRef w -> String
 regName (RegScalar n)              = n
+regName (RegEntries f _ idxs)      = f ++ "_" ++ intercalate "_" (map show idxs)
 regName (RegFile f (FieldRef k) o)
     | null k    = f ++ "_r" ++ show o          -- constant index Rn
     | o /= 0    = f ++ "_" ++ k ++ "_p" ++ show o
@@ -255,6 +267,17 @@ renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
         , rJumps      = reverse (rJumps r)
         }
 
+    step r (SWriteReg (RegEntries file ew idxs) e) = do
+        -- A view-register write fans out to one register-file write per entry:
+        -- entry p (low first) gets bits [p*ew .. p*ew+ew-1] of the value.
+        w <- lowerExpr_ ctx e
+        ws <- mapM (sliceEntry w) (zip [0 ..] idxs)
+        pure r { rRegWrites = reverse ws ++ rRegWrites r }
+      where
+        sliceEntry w (p, idx) = do
+            sw <- freshWire
+            emit $ NComb sw (N.PSlice ((p + 1) * ew - 1) (p * ew)) [w]
+            pure (RegWrite (RegFile file (FieldRef "") idx) sw)
     step r (SWriteReg ref e) = do
         w <- lowerExpr_ ctx e
         pure r { rRegWrites = RegWrite ref w : rRegWrites r }

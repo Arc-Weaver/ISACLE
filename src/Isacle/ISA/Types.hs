@@ -6,6 +6,7 @@ module Isacle.ISA.Types where
 
 import Prelude
 import Data.Kind (Type)
+import Data.List (intercalate)
 import GHC.OverloadedLabels (IsLabel(..))
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Data.Proxy (Proxy(..))
@@ -62,6 +63,29 @@ type RegisterFile = CPURegFile
 (!) :: CPURegister t -> Int -> CPUFlag
 CPURegister name ! bit = CPUFlag name bit
 infixl 9 !
+
+-- | A /view/ register (e.g. AVR X = GPR[26]:GPR[27]) encodes its backing file,
+-- the file's element width, and entry indices in its handle name:
+-- @"&GPR:8:26,27"@ — entries low byte first.  'encodeRegView' builds it; the IR
+-- builder decodes it with 'decodeRegView'.
+encodeRegView :: String -> Int -> [Int] -> String
+encodeRegView file elemW idxs =
+    "&" ++ file ++ ":" ++ show elemW ++ ":" ++ intercalate "," (map show idxs)
+
+-- | Decode a view-register handle into @(file, elementWidth, indices)@;
+-- 'Nothing' for an ordinary register name.
+decodeRegView :: String -> Maybe (String, Int, [Int])
+decodeRegView ('&':rest) = case break (== ':') rest of
+    (file, ':':rest') -> case break (== ':') rest' of
+        (ewStr, ':':idxs) -> Just (file, read ewStr, map read (commaSplit idxs))
+        _                 -> Nothing
+    _ -> Nothing
+decodeRegView _ = Nothing
+
+commaSplit :: String -> [String]
+commaSplit s = case break (== ',') s of
+    (h, ',':t) -> h : commaSplit t
+    (h, _)     -> [h]
 
 -- ---------------------------------------------------------------------------
 -- Endianness

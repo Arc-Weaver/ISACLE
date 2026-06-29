@@ -88,13 +88,15 @@ freshRead = ISABuild $ do
 --                           extracted and the index lowers to a literal.
 --   * anything else       — a scalar register.
 toRegRef :: String -> RegRef w
-toRegRef key = case break (== ':') key of
-    (rf, ':':rest) -> case break (== '@') rest of
-        (fk, '@':offStr)                    -> RegFile rf (FieldRef fk) (read offStr)
-        (fk, _) | not (null fk), all isDigit fk
-                                            -> RegFile rf (FieldRef "") (read fk)
-                | otherwise                 -> RegFile rf (FieldRef fk) 0
-    _ -> RegScalar key
+toRegRef key
+    | Just (file, ew, idxs) <- decodeRegView key = RegEntries file ew idxs
+    | otherwise = case break (== ':') key of
+        (rf, ':':rest) -> case break (== '@') rest of
+            (fk, '@':offStr)                    -> RegFile rf (FieldRef fk) (read offStr)
+            (fk, _) | not (null fk), all isDigit fk
+                                                -> RegFile rf (FieldRef "") (read fk)
+                    | otherwise                 -> RegFile rf (FieldRef fk) 0
+        _ -> RegScalar key
 
 -- ---------------------------------------------------------------------------
 -- The one MonadALU instance

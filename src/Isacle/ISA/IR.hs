@@ -79,6 +79,7 @@ module Isacle.ISA.IR
     , (.|.)
     , xor
     , inv
+    , ifexp
     , shiftL
     , shiftR
     , arithShiftR
@@ -115,6 +116,11 @@ data RegRef (a :: Type)
     | RegFile   String FieldRef Int -- ^ register-file slot: file name, index field,
                                     --   and a constant added to the index (for
                                     --   sub-range encodings, e.g. AVR R16–R31 → +16)
+    | RegEntries String Int [Int]   -- ^ a /view/ register: a value spanning several
+                                    --   register-file entries (file name, element
+                                    --   width, indices low entry first), e.g. AVR
+                                    --   X = GPR[26]:GPR[27].  Reads concatenate the
+                                    --   entries; writes split across them.
     deriving (Eq, Show)
 
 -- | Identifies one ordered memory/code read so its result expression
@@ -140,6 +146,9 @@ data IExpr (a :: Type) where
     IIrqVector :: HdlType a => IExpr a             -- ^ external interrupt-vector input
     IBin      :: HdlType a => ALUPrim -> IExpr a -> IExpr a -> IExpr a
     IUn       :: HdlType a => ALUPrim -> IExpr a -> IExpr a
+    -- | Multiplexer: @IMux c t f@ is @t@ when the 1-bit @c@ is set, else @f@.
+    -- Lowers to a real mux (@… when … else …@), not a bit-mask.
+    IMux      :: HdlType a => IExpr Bool -> IExpr a -> IExpr a -> IExpr a
     -- | Same-width reinterpretation: keep the bits, change the representation
     -- (e.g. @Unsigned 8 → Signed 8@).  Lowers to a real VHDL @signed()@\/
     -- @unsigned()@ cast (the HDL layer's @PReinterpret@).
@@ -279,6 +288,11 @@ xor a b = IBin PXor a b
 -- | Bitwise complement (NOT).  Named 'inv' to avoid the Data.Bits clash.
 inv :: HdlType a => IExpr a -> IExpr a
 inv = IUn PNot
+
+-- | @ifexp c t f@ — a value-typed conditional expression (multiplexer): @t@ when
+-- the 1-bit @c@ is set, else @f@.  A first-class mux in the expression system.
+ifexp :: HdlType a => IExpr Bool -> IExpr a -> IExpr a -> IExpr a
+ifexp = IMux
 
 shiftL :: HdlType a => IExpr a -> IExpr a -> IExpr a
 shiftL a n = IBin PShiftL a n

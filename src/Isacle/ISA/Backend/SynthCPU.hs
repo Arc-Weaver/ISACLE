@@ -44,7 +44,7 @@ import Data.List (foldl', nub)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, foldM)
 import GHC.TypeLits (natVal)
 
 import Hdl.Bits
@@ -182,31 +182,82 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     -- the alias address return the register value instead of SRAM data.
     -- -----------------------------------------------------------------------
 
+    -- A multi-byte register aliased at @base@ occupies @ceil(width/8)@ consecutive
+    -- data addresses; which byte each address carries follows the ISA endianness
+    -- (little-endian: low byte at @base@; big-endian: high byte at @base@).
+    let nBytesOf bits = (bits + wordBits - 1) `div` wordBits
+        -- the register byte index addressed by data-offset @off@ from the base
+        byteAtOffset nBytes off = case schEndianness schema of
+            LittleEndian -> off
+            BigEndian    -> nBytes - 1 - off
+        -- byte @b@ of a register wire, as a wordBits-wide value
+        regByteWire srcW srcBits b = do
+            let lo     = wordBits * b
+                hiExcl = min (wordBits * (b + 1)) srcBits
+            sl <- freshWire; emit $ NComb sl (N.PSlice (hiExcl - 1) lo) [srcW]
+            w  <- freshWire; emit $ NComb w  (N.PResize wordBits) [sl]
+            return w
+        -- replace byte @b@ of @regOutW@ with @dataW@ (keeping the other bytes)
+        replaceByteWire regOutW regW b dataW = do
+            let lo       = wordBits * b
+                hiExcl   = min (wordBits * (b + 1)) regW
+                clearVal = (2 :: Integer) ^ hiExcl - 2 ^ lo
+                maskVal  = (2 ^ regW - 1) - clearVal
+            maskW   <- litWire maskVal regW
+            cleared <- freshWire; emit $ NComb cleared N.PAnd [regOutW, maskW]
+            dExt    <- freshWire; emit $ NComb dExt (N.PResize regW) [dataW]
+            shW     <- litWire (fromIntegral lo) regW
+            shifted <- freshWire; emit $ NComb shifted N.PShiftL [dExt, shW]
+            fullW   <- freshWire; emit $ NComb fullW N.POr [cleared, shifted]
+            return fullW
+
     let scReadMemFnAlias :: WireId -> NetM WireId
         scReadMemFnAlias addrW =
             foldl' (\accM (regName, aliasAddr) -> do
-                acc <- accM
-                let mSrc = fmap (\(rw, rout, _, _) -> (rout, rw))
-                                (Map.lookup regName scalarRegMap)
-                case mSrc of
-                    Nothing -> return acc
+                acc0 <- accM
+                case fmap (\(rw, rout, _, _) -> (rout, rw)) (Map.lookup regName scalarRegMap) of
+                    Nothing -> return acc0
                     Just (srcW, srcBits) -> do
-                        addrLitW <- litWire aliasAddr addrBits
-                        cmpW <- freshWire
-                        emit $ NComb cmpW N.PEq [addrW, addrLitW]
-                        dataW <- case compare srcBits wordBits of
-                            EQ -> return srcW
-                            LT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PResize wordBits) [srcW]
-                                     ; return w }
-                            GT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PSlice (wordBits - 1) 0) [srcW]
-                                     ; return w }
-                        muxW <- freshWire
-                        emit $ NComb muxW N.PMux [cmpW, dataW, acc]
-                        return muxW)
-                (return dmemRdDataW)
+                        let nBytes = nBytesOf srcBits
+                        foldM (\acc off -> do
+                            addrLitW <- litWire (aliasAddr + fromIntegral off) addrBits
+                            cmpW  <- freshWire; emit $ NComb cmpW N.PEq [addrW, addrLitW]
+                            byteW <- regByteWire srcW srcBits (byteAtOffset nBytes off)
+                            muxW  <- freshWire; emit $ NComb muxW N.PMux [cmpW, byteW, acc]
+                            return muxW)
+                          acc0 [0 .. nBytes - 1])
+                -- Register-file aliases first: a read in [base, base+count) returns
+                -- GPR[addr-base] (the file mapped into the data address space).
+                (foldl' (\accM (fileName, base) -> do
+                    acc <- accM
+                    case Map.lookup fileName rfInfoMap of
+                        Nothing -> return acc
+                        Just (count, _) -> do
+                            inRangeW <- inFileRange addrW base count
+                            idxW     <- fileIndexW addrW base count
+                            rdW <- freshWire
+                            emit $ N.NRegFileRead rdW "cpu_state" fileName idxW count
+                            muxW <- freshWire
+                            emit $ NComb muxW N.PMux [inRangeW, rdW, acc]
+                            return muxW)
+                  (return dmemRdDataW)
+                  (schAliasFiles schema))
                 (schAliasRegs schema)
+        -- @addr@ in @[base, base+count)@ ?
+        inFileRange addrW base count = do
+            loW  <- litWire base addrBits
+            hiW  <- litWire (base + fromIntegral count) addrBits
+            ltLo <- freshWire; emit $ NComb ltLo N.PLt  [addrW, loW]
+            geLo <- freshWire; emit $ NComb geLo N.PNot [ltLo]
+            ltHi <- freshWire; emit $ NComb ltHi N.PLt  [addrW, hiW]
+            o    <- freshWire; emit $ NComb o    N.PAnd [geLo, ltHi]
+            return o
+        -- @addr - base@, narrowed to the file's index width.
+        fileIndexW addrW base count = do
+            baseW <- litWire base addrBits
+            diffW <- freshWire; emit $ NComb diffW N.PSub [addrW, baseW]
+            idxW  <- freshWire; emit $ NComb idxW (N.PResize (addrBitsFor count)) [diffW]
+            return idxW
 
     let renderCtx = RenderCtx
             { rcInstrWire  = instrWireId
@@ -253,10 +304,11 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     let nAccOf r = max (length (srMemReads r)) (length (srMemWrites r))
 
     -- -----------------------------------------------------------------------
-    -- Write arbiters — register files
+    -- Register files — a block of registers in cpu_state
     -- -----------------------------------------------------------------------
 
     let allRegWrites = concatMap srRegWrites allResults
+    let allMemWrites = concatMap srMemWrites allResults
 
     let regWritesByRf :: Map String [RegWriteReq]
         regWritesByRf = foldl' (\m r -> Map.insertWith (++) (rwRfName r) [r] m)
@@ -269,41 +321,38 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     let involvedRfs = Map.keys regWritesByRf
                    ++ filter (`Map.notMember` regWritesByRf) readRfNames
 
-    -- A register file is a register bank that lives as an array field of the
-    -- cpu_state record (e.g. @cpu_state.GPR@): one indexed write port per
-    -- simultaneous-write slot, and indexed combinational reads.  An instruction's
-    -- writes go to distinct ports (and distinct indices), so they all commit in
-    -- the same cycle — e.g. MUL writes R0 and R1 at once.  Not block RAM.
+    -- A register file is just a block of registers (an array field of cpu_state,
+    -- e.g. @cpu_state.GPR@) — the "file" is userspace convenience.  EVERY write
+    -- to it is an independent, enable-gated indexed assignment
+    -- @GPR(idx) <= data@; there is no bank/port arbiter.  VHDL applies distinct
+    -- indices independently, and since instruction matches are exclusive at most
+    -- one instruction's writes fire per cycle (MUL's two hit distinct entries).
+    -- Data-space stores in the file's alias window are simply more writers.
     forM_ involvedRfs $ \rfname -> do
         let (rfCount, rfWidth) = case Map.lookup rfname rfInfoMap of
                 Just p  -> p
                 Nothing -> (1, wordBits)
             aBits = addrBitsFor rfCount
 
-        -- Writes grouped per instruction; write j of an instruction is driven by
-        -- write port j.  nPorts = the most writes any one instruction makes to
-        -- this file (1 normally, 2 for MUL/MULS).
-        let perInstr =
-                [ (m, filter ((== rfname) . rwRfName) (srRegWrites r))
-                | r <- allResults
-                , any ((== rfname) . rwRfName) (srRegWrites r)
-                , Just m <- [srMatchWire r] ]
-            nPorts = maximum (1 : map (length . snd) perInstr)
+        -- Instruction writes: one indexed write per RegWriteReq, gated by its
+        -- match AND the architectural commit.
+        instrWrites <- forM [ w | w <- allRegWrites, rwRfName w == rfname ] $ \w -> do
+            enW <- andGate (rwMatchWire w) (esCommit sq)
+            return (rwIdxWire w, rwDataWire w, enW)
 
-        -- One muxed write port per slot: (address, data, enable@commit).
-        ports <- forM [0 .. nPorts - 1] $ \p -> do
-            let contribs = [ (m, ws Prelude.!! p) | (m, ws) <- perInstr, length ws > p ]
-            addrW <- buildMuxTree [(m, rwIdxWire w)  | (m, w) <- contribs]
-                        =<< litWire 0 aBits
-            datW  <- buildMuxTree [(m, rwDataWire w) | (m, w) <- contribs]
-                        =<< litWire 0 rfWidth
-            enRaw <- buildOrTree (map fst contribs)
-            enW   <- andGate enRaw (esCommit sq)
-            return (addrW, datW, enW)
+        -- Data-space alias writes: a store whose address falls in [base,base+count)
+        -- writes GPR[addr-base].
+        let fileBases = [ base | (fn, base) <- schAliasFiles schema, fn == rfname ]
+        aliasWrites <- fmap concat $ forM fileBases $ \base ->
+            forM allMemWrites $ \mw -> do
+                inR  <- inFileRange (mwAddrWire mw) base rfCount
+                idxW <- fileIndexW  (mwAddrWire mw) base rfCount
+                en0  <- andGate (mwMatchWire mw) inR
+                enW  <- andGate en0 (esCommit sq)
+                return (idxW, mwDataWire mw, enW)
 
-        -- The register file: an array field of cpu_state, written by indexed
-        -- multi-port writes in the clock process.
-        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth ports domInfo
+        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth
+                          (instrWrites ++ aliasWrites) domInfo
 
         -- Per-instruction reads for this rf, preserving slot order within each
         -- instruction.  Slot k = the k-th readReg call on rfname; each slot is an
@@ -342,25 +391,20 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
     -- merges whole-register writes with individual flag writes.
     -- -----------------------------------------------------------------------
 
-    let allMemWrites = concatMap srMemWrites allResults
-
+    -- A data write to an aliased register byte updates just that byte (the other
+    -- bytes keep their value); which byte each address writes follows endianness.
     aliasScalarWriteReqs <- fmap concat $ forM (schAliasRegs schema) $
         \(regName, aliasAddr) ->
             case Map.lookup regName scalarRegMap of
                 Nothing -> return []
-                Just (regW, regOutW, _, _) -> forM allMemWrites $ \mw -> do
-                    addrLitW <- litWire aliasAddr addrBits
-                    cmpW  <- freshWire
-                    emit  $ NComb cmpW N.PEq [mwAddrWire mw, addrLitW]
-                    gated <- freshWire
-                    emit  $ NComb gated N.PAnd [mwMatchWire mw, cmpW]
-                    if regW == wordBits
-                        then return (ScalarWriteReq gated regName (mwDataWire mw))
-                        else do
-                            hiW   <- freshWire
-                            emit  $ NComb hiW (N.PSlice (regW - 1) wordBits) [regOutW]
-                            fullW <- freshWire
-                            emit  $ NComb fullW N.PConcat [hiW, mwDataWire mw]
+                Just (regW, regOutW, _, _) -> do
+                    let nBytes = nBytesOf regW
+                    fmap concat $ forM allMemWrites $ \mw ->
+                        forM [0 .. nBytes - 1] $ \off -> do
+                            addrLitW <- litWire (aliasAddr + fromIntegral off) addrBits
+                            cmpW  <- freshWire; emit $ NComb cmpW N.PEq [mwAddrWire mw, addrLitW]
+                            gated <- freshWire; emit $ NComb gated N.PAnd [mwMatchWire mw, cmpW]
+                            fullW <- replaceByteWire regOutW regW (byteAtOffset nBytes off) (mwDataWire mw)
                             return (ScalarWriteReq gated regName fullW)
 
     -- -----------------------------------------------------------------------

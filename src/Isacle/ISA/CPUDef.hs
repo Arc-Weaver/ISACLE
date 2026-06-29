@@ -32,8 +32,9 @@ data CPUSchema = CPUSchema
     , schRegisters  :: [(String, Int)]               -- name, width (includes status registers)
     , schStatusRegs :: [(String, Int, [String])]     -- name, width, flag names MSB-first
     , schAliasRegs  :: [(String, Integer)]           -- reg name, data address
-    , schAliasFiles :: [(String, String)]            -- regfile name, address function desc
+    , schAliasFiles :: [(String, Integer)]           -- regfile name, data base address (entry i → base+i)
     , schFlags      :: [(String, Int, String)]       -- individual flags: reg, bit, flag name
+    , schRegViews   :: [(String, String, [Int])]     -- view name, file, entry indices (low→high)
     }
 
 instance Semigroup CPUSchema where
@@ -45,10 +46,11 @@ instance Semigroup CPUSchema where
         , schAliasRegs  = schAliasRegs  a <> schAliasRegs  b
         , schAliasFiles = schAliasFiles a <> schAliasFiles b
         , schFlags      = schFlags      a <> schFlags      b
+        , schRegViews   = schRegViews   a <> schRegViews   b
         }
 
 instance Monoid CPUSchema where
-    mempty = CPUSchema LittleEndian [] [] [] [] [] []
+    mempty = CPUSchema LittleEndian [] [] [] [] [] [] []
 
 -- | Run a core definition, folding any individually-declared flags ('newFlag')
 -- into the status-register bit maps ('schStatusRegs') so the synthesis backend
@@ -169,6 +171,25 @@ aliasReg :: CPURegister w -> Integer -> CPUDef ()
 aliasReg (CPURegister name) addr = CPUDef $
     tell mempty { schAliasRegs = [(name, addr)] }
 
-aliasFile :: CPURegFile count w -> String -> CPUDef ()
-aliasFile (CPURegFile name) addrDesc = CPUDef $
-    tell mempty { schAliasFiles = [(name, addrDesc)] }
+-- | Map a register file into the data address space at an explicit base
+-- address: entry @i@ is at data address @base + i@ (the file is assumed
+-- sequentially addressed).  The synthesis backend consumes this to route data
+-- reads/writes in @[base, base+count)@ to the register file — so e.g. a read of
+-- data address @base+5@ reaches @GPR[5]@.
+aliasFile :: CPURegFile count w -> Integer -> CPUDef ()
+aliasFile (CPURegFile name) base = CPUDef $
+    tell mempty { schAliasFiles = [(name, base)] }
+
+-- | A register that is a /view/ over consecutive register-file entries, low byte
+-- first — the register-file analogue of 'newFlag' projecting a bit.  E.g.
+-- @regView "X" gpr [26, 27]@ makes X the 16-bit pair @GPR[26]:GPR[27]@ (R27:R26),
+-- with no storage of its own: reads concatenate the entries (first index = least
+-- significant), writes split the value back across them.  The composite width
+-- @w@ must equal @length idxs * elementWidth@.
+regView :: forall w count t. (KnownNat w, HdlType t)
+        => String -> CPURegFile count t -> [Int] -> CPUDef (CPURegister (Unsigned w))
+regView name (CPURegFile fileName) idxs = CPUDef $ do
+    tell mempty { schRegViews = [(name, fileName, idxs)] }
+    pure (CPURegister (encodeRegView fileName elemW idxs))
+  where
+    elemW = fromIntegral (natVal (Proxy @(Width t)))

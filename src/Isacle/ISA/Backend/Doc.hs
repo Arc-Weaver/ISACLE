@@ -63,18 +63,21 @@ operandsS s = case s of
 regOperand :: RegRef w -> [OperandSpec]
 regOperand (RegFile rf (FieldRef k) o) = [OpRegister (if null k then show o else k) rf]
 regOperand (RegScalar _)               = []
+regOperand (RegEntries rf _ idxs)      = [OpRegister (show idxs) rf]
 
 operandsE :: IExpr w -> [OperandSpec]
 operandsE e = case e of
     IField (FieldRef k)                -> [OpImmediate k]
     IReadReg (RegFile rf (FieldRef k) o) -> [OpRegister (if null k then show o else k) rf]
     IReadReg (RegScalar _)             -> []
+    IReadReg (RegEntries rf _ idxs)    -> [OpRegister (show idxs) rf]
     IReadRes _                         -> []
     IFlagRead _                        -> []
     IIrqVector                         -> []
     ILit _                             -> []
     IBin _ a b                         -> operandsE a ++ operandsE b
     IUn _ a                            -> operandsE a
+    IMux c t f                         -> operandsE c ++ operandsE t ++ operandsE f
     IResize a                          -> operandsE a
     ISignExt a                         -> operandsE a
     IZeroExt a                         -> operandsE a

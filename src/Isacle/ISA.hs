@@ -36,6 +36,7 @@ module Isacle.ISA
     , flagRec
     , aliasReg
     , aliasFile
+    , regView
     , (!)
       -- * Endianness
     , Endianness(..)

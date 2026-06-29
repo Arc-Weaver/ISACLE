@@ -27,6 +27,7 @@ module Isacle.ISA.Backend.Synth
     ) where
 
 import Prelude hiding (Word)
+import Control.Monad (foldM)
 import Data.Either (partitionEithers)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
@@ -189,10 +190,25 @@ renderSynth ctx mBase ir = do
                     _                       -> pure []) (iirStmts ir)
     let tokMap = Map.fromList tokPairs
 
+    let -- Read a view register: concatenate its constant-index entry reads, the
+        -- first (low) entry least significant.
+        readView file ew idxs = do
+            let total = ew * length idxs
+                entryWire idx = Map.findWithDefault base (file, "", idx) regOutMap
+            parts <- mapM (\(p, idx) -> do
+                rz <- freshWire; emit $ NComb rz (N.PResize total) [entryWire idx]
+                if p == 0 then pure rz
+                          else do sh <- litW (fromIntegral (p * ew)) total
+                                  o  <- freshWire; emit $ NComb o N.PShiftL [rz, sh]; pure o)
+                (zip [0 :: Int ..] idxs)
+            case parts of
+                []       -> litW 0 (max total 1)
+                (x : xs) -> foldM (\a b -> do o <- freshWire; emit $ NComb o N.POr [a, b]; pure o) x xs
     let lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
                   RegScalar n                 -> rcReadScalar ctx n
                   RegFile rf (FieldRef k) off -> pure (Map.findWithDefault base (rf, k, off) regOutMap)
+                  RegEntries file ew idxs     -> readView file ew idxs
             , lcField     = \(FieldRef k) -> pure (Map.findWithDefault base k fieldMap)
             , lcReadRes   = \(ReadTok t)  -> pure (Map.findWithDefault (rcDataBus ctx) t tokMap)
             , lcReadFlag  = \f -> rcGetFlag ctx (cpuFlagReg f) (cpuFlagBit f)
@@ -213,6 +229,8 @@ renderSynth ctx mBase ir = do
     let splitW (RegWrite (RegScalar n) w)                 = Left  (ScalarWriteReq matchW n w)
         splitW (RegWrite (RegFile rf (FieldRef k) off) w) =
             Right (RegWriteReq matchW rf (idxWire k off) w)
+        splitW (RegWrite (RegEntries{}) _) =
+            error "view-register write should have been fanned out in renderInstr"
         (scalarWs, regWs) = partitionEithers (map splitW (rRegWrites r))
 
     memWrites <- mapM (\(a, d) -> do
@@ -240,8 +258,9 @@ renderSynth ctx mBase ir = do
         }
 
 regRefName :: RegRef w -> String
-regRefName (RegScalar n)    = n
-regRefName (RegFile  n _ _) = n
+regRefName (RegScalar n)      = n
+regRefName (RegFile  n _ _)   = n
+regRefName (RegEntries n _ _) = n
 
 -- | Name a register-file slot: a field key (with optional @_pN@ offset) or, for
 -- a constant index (empty key), the index number @rN@.
@@ -296,6 +315,7 @@ fieldsOf k = [ k | not (null k) ]
 
 collectRef :: RegRef w -> Collected
 collectRef (RegScalar _)               = mempty
+collectRef (RegEntries _ _ _)          = mempty  -- view writes fan out to file slots in renderInstr
 collectRef (RegFile _ (FieldRef k) o)  = Collected [] (fieldsOf k) [(k, o)]
 
 collectE :: IExpr w -> Collected
@@ -304,11 +324,15 @@ collectE e = case e of
     IField (FieldRef k)                     -> Collected [] [k] []
     IReadReg (RegScalar _)                  -> mempty
     IReadReg (RegFile rf (FieldRef k) o)    -> Collected [(rf, k, o)] (fieldsOf k) [(k, o)]
+    -- A view read needs each constituent entry as a constant-index file read.
+    IReadReg (RegEntries file _ idxs)       ->
+        mconcat [ Collected [(file, "", i)] [] [("", i)] | i <- idxs ]
     IReadRes _                              -> mempty
     IFlagRead _                             -> mempty
     IIrqVector                              -> mempty
     IBin _ a b                              -> collectE a <> collectE b
     IUn _ a                                 -> collectE a
+    IMux c t f                              -> collectE c <> collectE t <> collectE f
     IReinterpret a                          -> collectE a
     IResize a                               -> collectE a
     ISignExt a                              -> collectE a
