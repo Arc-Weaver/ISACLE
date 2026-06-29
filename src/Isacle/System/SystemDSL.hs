@@ -7,10 +7,11 @@
 --     uart0 <- createUart "uart0" uart0Rx
 --     gpio0 <- createGpio "gpio0" gpio0In
 --
---     ((uart0Tx, gpio0Port, gpio0Ddr), _rdData) <- createBus "databus" $ do
---         (tx, _rxIrq, _txIrq) <- attachPeripheral 0x100 uart0
---         (port, ddr)           <- attachPeripheral 0x300 gpio0
---         return (tx, port, ddr)
+--     bh <- createHarvardCPU \@16 \@16 \@16 "cpu" myCPUDef myISA romWords
+--     (uart0Tx, gpio0Port, gpio0Ddr) <- createBus "databus" bh $ do
+--         uart0' <- attachPeripheral 0x100 uart0
+--         gpio0' <- attachPeripheral 0x300 gpio0
+--         return (uartTxLine uart0', gpioPort gpio0', gpioDdr gpio0')
 --
 --     return (uart0Tx, gpio0Port, gpio0Ddr)
 -- @
@@ -31,6 +32,7 @@ module Isacle.System.SystemDSL
     , attachPeripheral
       -- * System-level operations
     , createBus
+    , orphanBusMaster
     , createSimpleVectorIrq
     , createHarvardCPU
     , createL1Cache
@@ -270,34 +272,31 @@ attachPeripheral base token = BusDSL $ do
 -- createBus
 -- ---------------------------------------------------------------------------
 
--- | Build a named bus.
+-- | Build a named bus interconnect, driven by the master wires in @bh@.
 --
--- Allocates four internal wires for the bus master interface (write address,
--- write data, write enable, read address) and threads them through the
--- 'BusDSL' sub-block.  Returns the user result and a 'BusHandle' carrying
--- the raw wire IDs.  Pass the handle to 'createHarvardCPU' to connect the
--- CPU to this bus.
+-- Wire the 'BusDSL' peripherals to the bus and connect the aggregated
+-- read-data and stall signals back into the 'BusHandle'.  Obtain @bh@ from
+-- 'createHarvardCPU' (or 'orphanBusMaster' for test-only systems).
 --
 -- @
--- ((tx, port), bh) <- createBus "databus" $ do
---     (tx, _, _) <- attachPeripheral 0x100 uartTok
---     (port, _)  <- attachPeripheral 0x300 gpioTok
---     return (tx, port)
--- createHarvardCPU ... bh romContents
+-- bh <- createHarvardCPU \@16 \@16 \@16 "cpu" myCPUDef myISA romWords
+-- (tx, port) <- createBus "databus" bh $ do
+--     tx'   <- attachPeripheral 0x100 uartTok
+--     port' <- attachPeripheral 0x300 gpioTok
+--     return (tx', port')
 -- @
 createBus
     :: forall dom dat a.
        (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
+    -> BusHandle 32 (Width dat)
     -> BusDSL dom dat a
-    -> SysDSL dom dat (a, BusHandle 32 (Width dat))
-createBus busName (BusDSL busSt) = SysDSL $ do
-    -- System-level master wires the CPU drives.  These remain the BusHandle
-    -- master interface for now; the CPU-side unified port arrives with the
-    -- execution sequencer.
-    (wrAddr, wrData, wrEn, rdAddr) <- lift $ do
-        wa <- freshWire; wd <- freshWire; we <- freshWire; ra <- freshWire
-        pure (wa, wd, we, ra)
+    -> SysDSL dom dat a
+createBus busName bh (BusDSL busSt) = SysDSL $ do
+    let wrAddr = bhWrAddr bh
+        wrData = bhWrData bh
+        wrEn   = bhWrEn   bh
+        rdAddr = bhRdAddr bh
 
     -- Run the BusDSL: attachPeripheral pre-allocates rd_data/phys wires and
     -- builds psRun closures; no peripheral IR is emitted yet.
@@ -366,25 +365,18 @@ createBus busName (BusDSL busSt) = SysDSL $ do
     lift $ zipWithM_ psRun slots childPortParWires
     lift $ mapM_ promotePhysOuts slots
 
-    -- SimpleBus never stalls its master: tie the master-facing stall low.
-    stallW <- lift $ do
+    -- SimpleBus never stalls its master: drive the handle's stall wire low.
+    busStallW <- lift $ do
         w <- freshWire
         emit $ NComb w (PLit 0 1) []
         hintWire w (busName ++ "_stall")
         pure w
 
-    let bh = BusHandle
-                { bhWrAddr = wrAddr
-                , bhWrData = wrData
-                , bhWrEn   = wrEn
-                , bhRdAddr = rdAddr
-                , bhRdData = rdParentWire
-                , bhStall  = stallW
-                , bhAddrW  = addrW
-                , bhDataW  = datW
-                }
+    -- Feed the aggregated read data and stall back into the master handle.
+    lift $ alias (bhRdData bh) rdParentWire
+    lift $ alias (bhStall  bh) busStallW
     modify $ \doc -> doc { sdBuses = sdBuses doc ++ [BusSection busName periph] }
-    pure (userA, bh)
+    pure userA
   where
     domInfo = domId (Proxy @dom)
     datW    = fromIntegral (natVal (Proxy @(Width dat)))
@@ -400,6 +392,28 @@ createBus busName (BusDSL busSt) = SysDSL $ do
         zipWithM_ (\wid ps ->
             emit $ NOutput wid (psName slot ++ "_" ++ portName ps) (portWidth ps) (portDom ps)
         ) (psPhysWires slot) (psPhysMeta slot)
+
+-- | Allocate a 'BusHandle' with fresh, undriven master wires.
+--
+-- Use in test-only systems and spec passes that have no CPU:
+--
+-- @
+-- bh <- orphanBusMaster \@32 \@8
+-- _ <- createBus "databus" bh $ attachPeripheral 0x60 gpio
+-- @
+orphanBusMaster
+    :: forall addrW dataW dom dat.
+       (KnownNat addrW, KnownNat dataW)
+    => SysDSL dom dat (BusHandle addrW dataW)
+orphanBusMaster = SysDSL $ lift $ do
+    wa <- freshWire; wd <- freshWire; we <- freshWire; ra <- freshWire
+    rd <- freshWire; st <- freshWire
+    pure BusHandle
+        { bhWrAddr = wa, bhWrData = wd, bhWrEn = we, bhRdAddr = ra
+        , bhRdData = rd, bhStall  = st
+        , bhAddrW  = fromIntegral (natVal (Proxy @addrW))
+        , bhDataW  = fromIntegral (natVal (Proxy @dataW))
+        }
 
 -- ---------------------------------------------------------------------------
 -- IRQ controller
@@ -432,19 +446,18 @@ createSimpleVectorIrq _sources = pure $
 --
 -- The CPU address width (@addrW@) may differ from the bus address width
 -- (always 32-bit); a zero-extend resize is inserted automatically.
-createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat busAddrW alu.
+createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
               ( KnownDom dom
               , KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW
-              , KnownNat busAddrW, addrW <= busAddrW
+              , addrW <= 32
               , HdlType dat
               )
            => String
            -> CPUDef alu
            -> ISADef (ISABuild alu (Width dat) addrW codeWordW codeAddrW)
-           -> BusHandle busAddrW (Width dat)
            -> [Integer]
-           -> SysDSL dom dat ()
-createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
+           -> SysDSL dom dat (BusHandle 32 (Width dat))
+createHarvardCPU instName cpuDef isaDef romWords = SysDSL $ do
     let codeWordB    = fromIntegral (natVal (Proxy @codeWordW))  :: Int
     let wordBits     = fromIntegral (natVal (Proxy @(Width dat))) :: Int
     let addrBits     = fromIntegral (natVal (Proxy @addrW))       :: Int
@@ -519,19 +532,18 @@ createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
         emit $ NComb pcPlus1W PAdd [codeAddrParW, lit1W]
         emit $ NRom cmemRdDataParW pcPlus1W romCapacity codeWordB romData
 
-    -- Wire CPU data outputs → bus master wires, resizing addresses if needed.
-    lift $ do
-        wrAddrR <- resizeTo addrBits (bhAddrW dataBus) dataWrAddrParW
-        rdAddrR <- resizeTo addrBits (bhAddrW dataBus) dataRdAddrParW
-        alias (bhWrAddr dataBus) wrAddrR
-        alias (bhWrData dataBus) dataWrDataParW
-        alias (bhWrEn   dataBus) dataWrEnParW
-        alias (bhRdAddr dataBus) rdAddrR
-        -- Bus read data → CPU data input (drives the parent-side input wire)
-        alias dmemRdDataParW (bhRdData dataBus)
-        -- Bus stall → CPU stall input (held while a data txn is outstanding)
-        alias stallParW (bhStall dataBus)
-        -- Tie off the interrupt inputs (no interrupt controller in this SoC).
+    -- Allocate wires the bus will drive back into the CPU (filled by createBus).
+    rdDataFromBus <- lift freshWire
+    stallFromBus  <- lift freshWire
+
+    -- Resize CPU address outputs to 32-bit bus width and build the BusHandle.
+    (wrAddrR, rdAddrR) <- lift $ do
+        wr <- resizeTo addrBits 32 dataWrAddrParW
+        rd <- resizeTo addrBits 32 dataRdAddrParW
+        -- Bus response wires → CPU input wires.
+        alias dmemRdDataParW rdDataFromBus
+        alias stallParW      stallFromBus
+        -- Tie off interrupt inputs (no IRQ controller wired yet).
         if hasIrq
             then do
                 z1 <- do { w <- freshWire; emit $ NComb w (PLit 0 1) []; pure w }
@@ -539,8 +551,20 @@ createHarvardCPU instName cpuDef isaDef dataBus romWords = SysDSL $ do
                 alias irqPendParW z1
                 alias irqVecParW  zv
             else pure ()
+        pure (wr, rd)
 
+    let dataBus = BusHandle
+                    { bhWrAddr = wrAddrR
+                    , bhWrData = dataWrDataParW
+                    , bhWrEn   = dataWrEnParW
+                    , bhRdAddr = rdAddrR
+                    , bhRdData = rdDataFromBus
+                    , bhStall  = stallFromBus
+                    , bhAddrW  = 32
+                    , bhDataW  = wordBits
+                    }
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
+    pure dataBus
 
 -- | Synthesise an L1 cache that bridges the CPU two-port interface to the
 -- system bus.

@@ -39,7 +39,8 @@ gpioBusSys
     -> SysDSL Clk (Unsigned 8) (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 gpioBusSys gpioIn = do
     gpio <- createGpio "gpio" gpioIn
-    ((port, ddr), _rdData) <- createBus "databus" $ do
+    bh <- orphanBusMaster @32 @8
+    (port, ddr) <- createBus "databus" bh $ do
         gpio' <- attachPeripheral gpioBase gpio
         return (gpioPort gpio', gpioDdr gpio')
     return (port, ddr)
@@ -121,8 +122,9 @@ runBusTests = do
     putStrLn "\n-- signed peripheral C header --"
     let rampSys :: SysDSL Clk (Unsigned 8) ()
         rampSys = do
-            r <- createRamp "ramp0" (SExpr (pure 1))
-            _ <- createBus "rbus" (attachPeripheral 0x40 r >> return ())
+            r  <- createRamp "ramp0" (SExpr (pure 1))
+            bh <- orphanBusMaster @32 @8
+            _  <- createBus "rbus" bh (attachPeripheral 0x40 r >> return ())
             return ()
         rampHdr = reduceToCHeader "ramphdr" rampSys
     assert "ramp SETPOINT is int8_t in the C header"

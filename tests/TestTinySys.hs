@@ -38,10 +38,11 @@ prog = [ 0x46   -- 0: LDI r0, 6    -- r0 = 6
 mySystem :: SysDSL Sys (Unsigned 8) ()
 mySystem = do
     gpio <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8))
-    (_, bh) <- createBus "databus" $ do
+    bh <- createHarvardCPU @8 @8 @8 "cpu0" tinyCPUDef tinyISA prog
+    _ <- createBus "databus" bh $ do
         _ <- attachPeripheral 0x60 gpio
         return ()
-    createHarvardCPU @8 @8 @8 "cpu0" tinyCPUDef tinyISA bh prog
+    return ()
 
 assert :: String -> Bool -> IO ()
 assert msg False = putStrLn ("FAIL: " ++ msg)
