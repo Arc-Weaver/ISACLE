@@ -173,10 +173,14 @@ instance Hdl Sig NetM where
         outW  <- freshWire
         emit $ NRegFileRead outW group field addrW count
         pure (SWire outW)
-    named nm s = do
+    -- Deferred: the hint rides inside the returned signal and fires when it is
+    -- materialised, so 'named' does NOT force its argument.  (An eager
+    -- materialise here would break @mdo@ feedback — naming a signal that
+    -- transitively depends on a not-yet-tied value would loop.)
+    named nm s = pure $ SExpr $ do
         w <- materialize s
         hintWire w nm
-        pure (SWire w)
+        pure w
 
 -- | Register-bank emission (deferred 'NRegFile' so feedback is safe): each port
 -- materialises its (index, data, enable) wires inside the deferred action.

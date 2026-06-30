@@ -59,7 +59,7 @@ import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import System.Mem.StableName (makeStableName, hashStableName)
+import System.Mem.StableName (makeStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
     ( Generic, Rep, from, to
@@ -82,8 +82,8 @@ data Sig (dom :: k) (a :: Type)
 
 materialize :: Sig dom a -> NetM WireId
 materialize (SWire wid) = pure wid
-materialize (SExpr m)   = memoSExpr m key
-  where key = unsafePerformIO (hashStableName <$> makeStableName m)
+materialize (SExpr m)   = memoSExpr m sn
+  where sn = unsafePerformIO (makeStableName m)
 
 -- ---------------------------------------------------------------------------
 -- Num instance — combinational arithmetic

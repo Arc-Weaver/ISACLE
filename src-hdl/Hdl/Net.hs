@@ -46,6 +46,7 @@ import Control.Monad.Fix (MonadFix)
 import Control.Monad.State.Strict
 import qualified Data.Map.Strict as Map
 import Numeric.Natural (Natural)
+import System.Mem.StableName (StableName, hashStableName)
 
 -- ---------------------------------------------------------------------------
 -- Wire identifiers
@@ -257,7 +258,10 @@ data NetSt = NetSt
     , netDeferred   :: [NetM ()]
     , netDesign     :: Design      -- sub-entity definitions accumulated here
     , netMemo       :: Map.Map (PrimOp, [WireId]) WireId
-    , netSExprMemo  :: Map.Map Int WireId  -- StableName hash → wire (prevents SExpr re-alloc)
+    , netSExprMemo  :: Map.Map Int [(StableName (NetM WireId), WireId)]
+      -- StableName-hash bucket → (exact name, wire); prevents SExpr re-alloc.
+      -- Bucketed by hash but disambiguated by the real 'StableName' so distinct
+      -- signals that share a hash are never merged.
     }
 
 instance Show NetSt where
@@ -360,14 +364,16 @@ lookupOrEmit op ins = NetM $ do
 -- When the same action thunk is materialized more than once (e.g. in deferred
 -- rounds), the second call returns the wire allocated on the first call rather
 -- than running the action again and creating an orphaned fresh wire.
-memoSExpr :: NetM WireId -> Int -> NetM WireId
-memoSExpr m key = NetM $ do
+memoSExpr :: NetM WireId -> StableName (NetM WireId) -> NetM WireId
+memoSExpr m sn = NetM $ do
+    let key = hashStableName sn
     memo <- gets netSExprMemo
-    case Map.lookup key memo of
+    case lookup sn =<< Map.lookup key memo of
         Just wid -> pure wid
         Nothing  -> do
             wid <- _unNetM m
-            modify $ \s -> s { netSExprMemo = Map.insert key wid (netSExprMemo s) }
+            modify $ \s -> s { netSExprMemo =
+                Map.insertWith (++) key [(sn, wid)] (netSExprMemo s) }
             pure wid
 
 -- | Schedule an action for after the main body (used by registers for

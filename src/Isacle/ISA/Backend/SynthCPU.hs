@@ -63,9 +63,9 @@ ltS  = sigPrim2 N.PLt
 notS :: Signal s => s dom x -> s dom Bool
 notS = sigPrim1 N.PNot
 
--- | Reinterpret a 1-bit signal as a Bool condition (no-op resize + retype).
+-- | A 1-bit signal as a Bool condition: @x = '1'@.
 toBool :: Signal s => s dom x -> s dom Bool
-toBool = sigPrim1 (N.PResize 1)
+toBool x = sigPrim2 N.PEq x (sigLitW 1 1)
 
 -- Data ops — yield a (type-erased) data signal.
 addS, bwAndS, bwOrS :: Signal s => s dom x -> s dom y -> s dom ()
@@ -240,8 +240,13 @@ synthHarvardCPU' cpuDef isaDef instrSig dmemRdData cmemRdData stallSig irqPendSi
             pure r { srMemReads = mrs }
 
         -- Execution sequencer: commit enable, per-access cycle gate, and the
-        -- per-(instruction,read) result signal the bodies consumed.
-        ExecSeq commit gate seqReadResOf <- buildExecSequencer wordBits stallSig allResults
+        -- per-(instruction,read) result signal the bodies consumed.  Bound via
+        -- lazy field accessors — a strict @ExecSeq _ _ _@ pattern would force the
+        -- result before @mdo@'s mfix ties it (the bodies reference @seqReadResOf@).
+        execSeq <- buildExecSequencer wordBits stallSig allResults
+        let commit       = esCommit execSeq
+            gate         = esGate execSeq
+            seqReadResOf = esReadRes execSeq
 
         -- Register files: one indexed write port per RegWriteReq (gated by match
         -- AND commit), plus data-space alias-window stores.
