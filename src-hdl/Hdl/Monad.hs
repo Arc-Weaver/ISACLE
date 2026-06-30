@@ -121,6 +121,12 @@ class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -
     -- | Combinational indexed read of a 'regBank' field: @bank(idx)@.
     regBankRead  :: KnownDom dom
                  => String -> String -> Int -> s dom idx -> m (s dom a)
+    -- | Capture a (combinational) signal under a name: the monadic point at
+    -- which a fresh, named wire is bound, so the emitter declares it as a named
+    -- signal instead of @wN@.  Naming a derived 'Signal' expression names the
+    -- whole expression's result.  This is how design code in the 'Hdl' monad
+    -- attaches readable names without reaching for the netlist's @hintWire@.
+    named        :: String -> s dom a -> m (s dom a)
 
 -- ---------------------------------------------------------------------------
 -- Netlist instance — NetM (builds a NetNode netlist) is the netlist backend's
@@ -155,6 +161,10 @@ instance Hdl Sig NetM where
         outW  <- freshWire
         emit $ NRegFileRead outW group field addrW count
         pure (SWire outW)
+    named nm s = do
+        w <- materialize s
+        hintWire w nm
+        pure (SWire w)
 
 -- | Register-bank emission (deferred 'NRegFile' so feedback is safe): each port
 -- materialises its (index, data, enable) wires inside the deferred action.
