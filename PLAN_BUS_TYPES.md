@@ -353,3 +353,48 @@ logic (`emit NComb op` → `sigPrim*`), `buildMuxTree`/`buildOrTree` → `mux`/`
 folds, and `Synth.hs`/`Lower.hs` (`SynthResult`/`RenderCtx` `WireId -> Sig`) all
 ride along. That rippling `WireId -> Sig` conversion is the large atomic piece
 still to do (then `SynthVnCPU`, then un-export `NetM`).
+
+---
+
+## UPDATE (2026-06-30): ISA compiler → real Hdl/Signal (NetM-free). In progress.
+
+Correcting course: the `Backend.Wire` pass (commits 42ea7ed/09ba99d/7d2d710)
+shrank the `freshWire/emit/NComb` boilerplate but kept the *wrong layer*
+(WireId/NetM). Per the user, `SynthCPU` must be `(Hdl s m, Signal s) => … -> m
+(…)` — combinational logic is pure `Signal` ops, state is `register`/`regBank`,
+**no NetM/WireId/emit/materialize**. Signal *expressions stay monadic* only so
+each new signal can be bound + named; **naming is an Hdl-layer op**, the new
+`named :: String -> s dom a -> m (s dom a)` (committed). `Backend.Wire` deletes
+itself — its combinators are the `Signal` operators (`comb2 PAnd` = `sigPrim2
+PAnd`, `litW` = `sigLitW`, `sliceW`/`resizeW` = `sigPrim1 (PSlice/PResize)`,
+`muxW` = `mux`).
+
+**Done & validated:** `named` Hdl method (green). `Lower.hs` rewritten against
+`(Hdl s m, Signal s)` — `LowerCtx s dom` with pure `s dom ()` leaf callbacks,
+`Named s dom = {nSig, nName}`, `lowerExpr`/`renderInstr` monadic only for `named`;
+`Rendered`/`RegWrite`/`Jump` carry `s dom ()`. Compiles clean standalone.
+(Tree is RED until Synth/SynthCPU follow — they share these types.)
+
+**Remaining (the intricate core) — confirmed design:**
+- `Synth.hs`: parameterise `SynthResult`/req-records + `RenderCtx` over `s dom`.
+  `renderSynth :: (Hdl s m, Signal s) => …  -> m (SynthResult s dom)`. Field
+  decode/match/index = pure `Signal` + `named`. **Register-file reads inline via
+  `regBankRead`** (drops the shared-read-port optimisation; one combinational
+  port per read — correct, more VHDL) so there's no read forward-ref. Add
+  `rcRegCount :: String -> Int` and `rcReadRes :: ReadTok -> s dom ()` to the ctx.
+- `SynthCPU.hs`: the forward-refs resolve **two-pass + a small `rec`**:
+  * Mem-read results: pass 1 renders with `rcReadRes = const rcDataBus` (discover
+    read addresses); build the sequencer (exec_cycle `register`, latches
+    `registerEn`) from them; pass 2 renders with `rcReadRes` = the sequencer's
+    per-(instr,read) result signal. (Same two-pass shape as `createBus`.)
+  * Scalar registers: `rec { out <- registerEn init en nxt; (en,nxt) <- arbiter
+    out … }` (MonadFix). Reg outputs feed the arbiters which feed next/enable.
+  * Decode/arbiters/alias-muxes: `mux` folds / `caseOf`. Reg file: `regBank`
+    (already wired) for writes.
+  * `synthHarvardCPU' :: (Hdl s m, Signal s) => CpuInputs s dom -> m
+    (CpuMemIface s dom)`; inputs are signal args, outputs the returned record.
+- `SynthVnCPU.hs`: same shape.
+- Boundary: `createHarvardCPU`/`createCachedCPU` run it at `m = NetM`, `s = Sig`
+  (the entity body), feeding `SWire` port inputs and `materialize`-ing outputs
+  for `NOutput`. `NInput`/`NOutput`/ROM stay here (entity construction).
+- Then delete `Backend.Wire`; un-export `NetM`/`emit`/`freshWire`.
