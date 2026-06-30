@@ -414,11 +414,13 @@ buildExecSequencer dataW stallW results = do
                 Map.findWithDefault (busOfReadTok i tok) (i, tokIndex tok) latched
         pure (ExecSeq commit gate readRes)
   where
-    -- the (alias-decoded) bus value the i-th instruction's read @tok@ sees
+    -- the (alias-decoded) bus value the i-th instruction's read @tok@ sees.
+    -- Resolved by the read's 'ReadTok' (NOT its position — code reads also
+    -- consume tokens, so a data read's token need not equal its index).
     busOfReadTok i tok =
-        case drop (tokIndex tok) (srMemReads (results !! i)) of
-            (rr : _) -> mrBusWire rr
-            []       -> litS 0 dataW
+        case [ mrBusWire rr | rr <- srMemReads (results !! i), mrTok rr == tokIndex tok ] of
+            (b : _) -> b
+            []      -> litS 0 dataW
     tokIndex (ReadTok t) = t
 
 -- | Holding latches for reads whose value outlives their cycle: returns a map
@@ -440,7 +442,7 @@ buildReadLatches dataW cw execCyc notWait gate results =
                     latch <- registerW dataW 0 capEn (mrBusWire rr)
                     let onCyc  = eqS execCyc (litS (fromIntegral j) cw)
                         replay = muxS onCyc (mrBusWire rr) latch
-                    pure [((i, j), replay)]
+                    pure [((i, mrTok rr), replay)]
 
 -- ---------------------------------------------------------------------------
 -- Helpers

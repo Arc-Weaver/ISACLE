@@ -78,9 +78,10 @@ data MemWriteReq s dom = MemWriteReq
 -- directly for a single read, or via a per-cycle select + holding latch).
 data MemReadReq s dom = MemReadReq
     { mrMatchWire  :: s dom Bool
+    , mrTok        :: Int          -- ^ the read's 'ReadTok' (NOT its position —
+                                   --   code reads also consume tokens)
     , mrAddrWire   :: s dom ()
     , mrBusWire    :: s dom ()
-    , mrResultWire :: s dom ()
     }
 
 -- | Flag write: set one status-register bit when the instruction fires.
@@ -237,7 +238,7 @@ renderSynth ctx mBase ir = do
 
         memWrites = [ MemWriteReq matchW a (sigPrim1 (N.PResize (rcWordW ctx)) d)
                     | (a, d) <- rMemWrites r ]
-        memReads  = [ MemReadReq matchW a (rcDataBus ctx) (readResSig (ReadTok t))
+        memReads  = [ MemReadReq matchW t a (rcDataBus ctx)
                     | (ReadTok t, a) <- rMemReads r ]
         flagWrites = [ FlagWriteReq matchW (cpuFlagReg f) (cpuFlagBit f) w
                      | (f, w) <- rFlagWrites r ]
