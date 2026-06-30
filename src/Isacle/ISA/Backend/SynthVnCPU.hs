@@ -26,7 +26,7 @@ import Data.List (foldl', nub)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, foldM)
 import GHC.TypeLits (natVal)
 
 import Hdl.Bits
@@ -40,6 +40,8 @@ import Isacle.ISA.Build (ISABuild, runISABuild, evalISABuild)
 import Isacle.ISA.Backend.Synth
 import Isacle.ISA.Backend.SynthCPU
     ( extractPcName, litWire, driveWire, buildOrTree, buildMuxTree, addrBitsFor )
+import Isacle.ISA.Backend.Wire
+    ( comb2, litW, sliceW, resizeW, andW, notW, eqW, muxW )
 
 -- ---------------------------------------------------------------------------
 -- VN memory interface
@@ -104,8 +106,7 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
             | ResetFlagEntry rn bp b <- resetEntries ]
 
     -- ~stall: gates all register enables so no state advances during a miss.
-    notStallW <- freshWire
-    emit $ NComb notStallW N.PNot [stallWireId]
+    notStallW <- notW stallWireId
 
     -- -----------------------------------------------------------------------
     -- Scalar registers
@@ -167,20 +168,12 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
                 case mSrc of
                     Nothing -> return acc
                     Just (srcW, srcBits) -> do
-                        addrLitW <- litWire aliasAddr addrBits
-                        cmpW <- freshWire
-                        emit $ NComb cmpW N.PEq [addrW, addrLitW]
-                        dataW <- case compare srcBits wordBits of
+                        cmpW  <- eqW addrW =<< litW aliasAddr addrBits
+                        dataV <- case compare srcBits wordBits of
                             EQ -> return srcW
-                            LT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PResize wordBits) [srcW]
-                                     ; return w }
-                            GT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PSlice (wordBits - 1) 0) [srcW]
-                                     ; return w }
-                        muxW <- freshWire
-                        emit $ NComb muxW N.PMux [cmpW, dataW, acc]
-                        return muxW)
+                            LT -> resizeW wordBits srcW
+                            GT -> sliceW (wordBits - 1) 0 srcW
+                        muxW cmpW dataV acc)
                 (return dmemRdDataW)
                 (schAliasRegs schema)
 
@@ -246,7 +239,7 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
             aBits = addrBitsFor rfCount
 
         writes <- forM [ w | w <- allRegWrites, rwRfName w == rfname ] $ \w -> do
-            enW <- freshWire; emit $ NComb enW N.PAnd [rwMatchWire w, notStallW]
+            enW <- andW (rwMatchWire w) notStallW
             return (rwIdxWire w, rwDataWire w, enW)
 
         defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth writes domInfo
@@ -270,8 +263,7 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
                            =<< litWire 0 aBits
             rdOutW <- freshWire
             emit $ N.NRegFileRead rdOutW "cpu_state" rfname rdAddrW rfCount
-            forM_ slotEntries $ \(_, rr) ->
-                emit $ NComb (rrOutWire rr) N.POr [rdOutW, rdOutW]
+            forM_ slotEntries $ \(_, rr) -> driveWire (rrOutWire rr) rdOutW
 
     -- -----------------------------------------------------------------------
     -- Alias register write decode
@@ -284,18 +276,13 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
             case Map.lookup regName scalarRegMap of
                 Nothing -> return []
                 Just (regW, regOutW, _, _) -> forM allMemWrites $ \mw -> do
-                    addrLitW <- litWire aliasAddr addrBits
-                    cmpW  <- freshWire
-                    emit  $ NComb cmpW N.PEq [mwAddrWire mw, addrLitW]
-                    gated <- freshWire
-                    emit  $ NComb gated N.PAnd [mwMatchWire mw, cmpW]
+                    cmpW  <- eqW (mwAddrWire mw) =<< litW aliasAddr addrBits
+                    gated <- andW (mwMatchWire mw) cmpW
                     if regW == wordBits
                         then return (ScalarWriteReq gated regName (mwDataWire mw))
                         else do
-                            hiW   <- freshWire
-                            emit  $ NComb hiW (N.PSlice (regW - 1) wordBits) [regOutW]
-                            fullW <- freshWire
-                            emit  $ NComb fullW N.PConcat [hiW, mwDataWire mw]
+                            hiW   <- sliceW (regW - 1) wordBits regOutW
+                            fullW <- comb2 N.PConcat hiW (mwDataWire mw)
                             return (ScalarWriteReq gated regName fullW)
 
     -- -----------------------------------------------------------------------
@@ -314,69 +301,40 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
     forM_ scalarRegs $ \(name, w, regOutW, nxtW, enW) -> do
         let scWrites = Map.findWithDefault [] name scalarWritesByReg
 
+        let writePairs = [(swMatchWire r, swDataWire r) | r <- scWrites]
         if name == pcName
             then do
-                -- PC always advances (or jumps) unless stalled.
-                litOneW  <- litWire 1 w
-                pcIncW   <- do { o <- freshWire
-                               ; emit $ NComb o N.PAdd [regOutW, litOneW]
-                               ; return o }
-                pcNxtW   <- buildMuxTree
-                                [(swMatchWire r, swDataWire r) | r <- scWrites]
-                                pcIncW
-                -- Enable = ~stall (PC freezes on miss).
-                driveWire nxtW pcNxtW
+                -- PC always advances (or jumps) unless stalled (enable = ~stall).
+                pcIncW <- comb2 N.PAdd regOutW =<< litW 1 w
+                driveWire nxtW =<< buildMuxTree writePairs pcIncW
                 driveWire enW  notStallW
 
         else case Map.lookup name statusRegMap of
             Just (_, flagNames) -> do
                 let bitAssigns = zip (reverse [0 .. w - 1]) flagNames
                 bitNextWires <- forM bitAssigns $ \(bitPos, _) -> do
-                    curBitW <- freshWire
-                    emit $ NComb curBitW (N.PSlice bitPos bitPos) [regOutW]
+                    curBitW <- sliceW bitPos bitPos regOutW
                     let fwPairs = [ (fwMatchWire fw, fwValueWire fw)
                                   | fw <- allFlagWrites
-                                  , fwRegName fw == name
-                                  , fwBitPos  fw == bitPos ]
-                    scPairs <- forM scWrites $ \sw -> do
-                        bitExtW <- freshWire
-                        emit $ NComb bitExtW (N.PSlice bitPos bitPos) [swDataWire sw]
-                        return (swMatchWire sw, bitExtW)
+                                  , fwRegName fw == name, fwBitPos fw == bitPos ]
+                    scPairs <- forM scWrites $ \sw ->
+                        (,) (swMatchWire sw) <$> sliceW bitPos bitPos (swDataWire sw)
                     buildMuxTree (fwPairs ++ scPairs) curBitW
                 sregNextW <- case bitNextWires of
-                    [] -> litWire 0 w
-                    (msbW : restBits) -> foldl' (\accM bw -> do
-                        acc <- accM
-                        out <- freshWire
-                        emit $ NComb out N.PConcat [acc, bw]
-                        return out) (return msbW) restBits
+                    []                -> litW 0 w
+                    (msbW : restBits) -> foldM (comb2 N.PConcat) msbW restBits
                 let allMatchWires = map fwMatchWire (filter ((== name) . fwRegName) allFlagWrites)
                                  ++ map swMatchWire scWrites
-                enOrW    <- buildOrTree allMatchWires
-                -- Gate with ~stall before driving the register enable.
-                enGatedW <- freshWire
-                emit $ NComb enGatedW N.PAnd [enOrW, notStallW]
-                driveWire enW  enGatedW
+                driveWire enW  =<< andW notStallW =<< buildOrTree allMatchWires
                 driveWire nxtW sregNextW
 
-            Nothing -> do
-                case scWrites of
-                    [] -> do
-                        litZeroEn <- litWire 0 1
-                        litZeroD  <- litWire 0 w
-                        driveWire enW  litZeroEn
-                        driveWire nxtW litZeroD
-                    ws -> do
-                        enOrW  <- buildOrTree (map swMatchWire ws)
-                        defW   <- litWire 0 w
-                        nxtMux <- buildMuxTree
-                                      [(swMatchWire r, swDataWire r) | r <- ws]
-                                      defW
-                        -- Gate with ~stall.
-                        enGatedW <- freshWire
-                        emit $ NComb enGatedW N.PAnd [enOrW, notStallW]
-                        driveWire enW  enGatedW
-                        driveWire nxtW nxtMux
+            Nothing -> case scWrites of
+                [] -> do
+                    driveWire enW  =<< litW 0 1
+                    driveWire nxtW =<< litW 0 w
+                ws -> do
+                    driveWire enW  =<< andW notStallW =<< buildOrTree (map swMatchWire ws)
+                    driveWire nxtW =<< buildMuxTree writePairs =<< litW 0 w
 
     -- -----------------------------------------------------------------------
     -- Data memory read address mux
@@ -417,10 +375,7 @@ synthVonNeumannCPU' cpuDef isaDef instrWireId dmemRdDataW stallWireId = do
             Nothing            -> 0
     fetchAddrW <- if addrBits == pcRegWidth
         then return pcOutWire
-        else do
-            w <- freshWire
-            emit $ NComb w (N.PSlice 0 (addrBits - 1)) [pcOutWire]
-            return w
+        else sliceW (addrBits - 1) 0 pcOutWire
 
     return VnMemIface
         { vniFetchAddr  = fetchAddrW

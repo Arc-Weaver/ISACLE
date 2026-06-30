@@ -32,8 +32,9 @@ import Data.Either (partitionEithers)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 
-import Hdl.Net (NetM, WireId, NetNode(..), freshWire, emit, hintWire)
+import Hdl.Net (NetM, WireId, freshWire, hintWire)
 import qualified Hdl.Net as N
+import Isacle.ISA.Backend.Wire (comb2, litW, sliceW, resizeW, andW, eqW)
 import Isacle.ISA.Types (CPUFlag(..))
 import Isacle.ISA.Encoding
 import Isacle.ISA.IR
@@ -164,15 +165,11 @@ renderSynth ctx mBase ir = do
                             if sc == 1 && off == 0
                                 then pure ((k, sc, off), fw)
                                 else do
-                                    ext    <- freshWire; emit $ NComb ext (N.PResize (rcWordW ctx)) [fw]
+                                    ext    <- resizeW (rcWordW ctx) fw
                                     scaled <- if sc == 1 then pure ext
-                                              else do scW <- litW (fromIntegral sc) (rcWordW ctx)
-                                                      m   <- freshWire; emit $ NComb m N.PMul [ext, scW]
-                                                      pure m
+                                              else comb2 N.PMul ext =<< litW (fromIntegral sc) (rcWordW ctx)
                                     s <- if off == 0 then pure scaled
-                                         else do offW <- litW (fromIntegral off) (rcWordW ctx)
-                                                 a    <- freshWire; emit $ NComb a N.PAdd [scaled, offW]
-                                                 pure a
+                                         else comb2 N.PAdd scaled =<< litW (fromIntegral off) (rcWordW ctx)
                                     hintWire s (mnemPrefix (iirMnemonic ir) (k ++ "_idx"))
                                     pure ((k, sc, off), s))
                    idxKeys
@@ -202,14 +199,13 @@ renderSynth ctx mBase ir = do
             let total = ew * length idxs
                 entryWire idx = Map.findWithDefault base (file, "", 1, idx) regOutMap
             parts <- mapM (\(p, idx) -> do
-                rz <- freshWire; emit $ NComb rz (N.PResize total) [entryWire idx]
+                rz <- resizeW total (entryWire idx)
                 if p == 0 then pure rz
-                          else do sh <- litW (fromIntegral (p * ew)) total
-                                  o  <- freshWire; emit $ NComb o N.PShiftL [rz, sh]; pure o)
+                          else comb2 N.PShiftL rz =<< litW (fromIntegral (p * ew)) total)
                 (zip [0 :: Int ..] idxs)
             case parts of
                 []       -> litW 0 (max total 1)
-                (x : xs) -> foldM (\a b -> do o <- freshWire; emit $ NComb o N.POr [a, b]; pure o) x xs
+                (x : xs) -> foldM (comb2 N.POr) x xs
     let lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
                   RegScalar n                 -> rcReadScalar ctx n
@@ -225,9 +221,7 @@ renderSynth ctx mBase ir = do
     -- irqGate refines the match condition.
     matchW <- case iirGate ir of
         Nothing -> pure base
-        Just g  -> do
-            gw <- lowerExpr_ lctx g
-            o  <- freshWire; emit $ NComb o N.PAnd [base, gw]; pure o
+        Just g  -> andW base =<< lowerExpr_ lctx g
 
     r <- renderInstr lctx ir
 
@@ -250,7 +244,7 @@ renderSynth ctx mBase ir = do
                      | (f, w) <- rFlagWrites r ]
 
     jumpWs <- mapM (\(Jump rr condW tgtW) -> do
-                       g <- freshWire; emit $ NComb g N.PAnd [matchW, condW]
+                       g <- andW matchW condW
                        pure (ScalarWriteReq g (regRefName rr) tgtW)) (rJumps r)
 
     pure SynthResult
@@ -291,10 +285,7 @@ extractFieldNamed mEnc instrW mnem k = do
     pure w
 
 clampW :: Int -> WireId -> NetM WireId
-clampW w d = do { o <- freshWire; emit $ NComb o (N.PResize w) [d]; pure o }
-
-litW :: Integer -> Int -> NetM WireId
-litW v w = do { o <- freshWire; emit $ NComb o (N.PLit v w) []; pure o }
+clampW = resizeW
 
 -- ---------------------------------------------------------------------------
 -- Pre-pass: collect field keys and register-file reads from the IR
@@ -364,20 +355,15 @@ collectS s = case s of
 -- | Build the combinational instruction-match signal: @(instr AND mask) == value@.
 buildMatchWire :: EncodingInfo -> WireId -> NetM WireId
 buildMatchWire enc instrW = do
-    maskW <- freshWire; emit $ NComb maskW (N.PLit (encMask enc) (encTotalBits enc)) []
-    andW  <- freshWire; emit $ NComb andW  N.PAnd [instrW, maskW]
-    valW  <- freshWire; emit $ NComb valW  (N.PLit (encValue enc) (encTotalBits enc)) []
-    out   <- freshWire; emit $ NComb out   N.PEq  [andW, valW]
-    pure out
+    anded <- comb2 N.PAnd instrW =<< litW (encMask enc) (encTotalBits enc)
+    eqW anded =<< litW (encValue enc) (encTotalBits enc)
 
 -- | Extract non-contiguous field bits, reassembling MSB-first via PSlice/PConcat.
 extractFieldNetM :: [Int] -> WireId -> NetM WireId
-extractFieldNetM []  _      = do { o <- freshWire; emit $ NComb o (N.PLit 0 1) []; pure o }
-extractFieldNetM [bp] instrW = do { o <- freshWire; emit $ NComb o (N.PSlice bp bp) [instrW]; pure o }
-extractFieldNetM bps instrW = do
-    bits <- mapM (\bp -> do { o <- freshWire; emit $ NComb o (N.PSlice bp bp) [instrW]; pure o }) bps
-    foldBits bits
+extractFieldNetM []   _      = litW 0 1
+extractFieldNetM [bp] instrW = sliceW bp bp instrW
+extractFieldNetM bps  instrW = mapM (\bp -> sliceW bp bp instrW) bps >>= foldBits
   where
     foldBits [w]    = pure w
-    foldBits (w:ws) = do { rest <- foldBits ws; o <- freshWire; emit $ NComb o N.PConcat [w, rest]; pure o }
-    foldBits []     = do { o <- freshWire; emit $ NComb o (N.PLit 0 1) []; pure o }
+    foldBits (w:ws) = foldBits ws >>= comb2 N.PConcat w
+    foldBits []     = litW 0 1
