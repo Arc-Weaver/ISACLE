@@ -11,7 +11,7 @@ module Hdl.Entity
       -- * Behavioral description
     , HDL
     , hdl
-    , runHDL
+    , runHdl
       -- * Entity construction
     , Entity
     , entity
@@ -45,6 +45,7 @@ import GHC.Generics
 
 import Hdl.Net
 import Hdl.Types
+import Hdl.Monad (HDL(..), runHdl)
 
 -- ---------------------------------------------------------------------------
 -- PortRef
@@ -126,14 +127,6 @@ instance (PortRef a, PortRef b, PortRef c) => PortRef (a, b, c) where
 class (PortRef i, PortRef vi) => PortMap i vi
 
 -- ---------------------------------------------------------------------------
--- HDL
--- ---------------------------------------------------------------------------
-
--- | A behavioral HDL description: the architecture body of an 'Entity'.
--- Given typed input signals it produces typed output signals in 'NetM'.
-newtype HDL i o = HDL { runHDL :: i -> NetM o }
-
--- ---------------------------------------------------------------------------
 -- Port declarations
 -- ---------------------------------------------------------------------------
 
@@ -169,7 +162,7 @@ data ElabEntity = ElabEntity
 -- the port mapping is expressed as type-safe functions between bundles.
 data Entity i o = Entity
     { entityName  :: String
-    , entityBody  :: HDL i o
+    , entityBody  :: i -> HDL i o o
     , entitySynth :: Maybe (SynthTarget i o)
     }
 
@@ -186,12 +179,12 @@ data SynthTarget i o = forall vi vo.
 -- Smart constructors
 -- ---------------------------------------------------------------------------
 
--- | Lift a function into an 'HDL' description.
-hdl :: (i -> NetM o) -> HDL i o
-hdl = HDL
+-- | Lift a @NetM@-valued body into the entity body monad.
+hdl :: (i -> NetM o) -> (i -> HDL i o o)
+hdl go = HDL . go
 
 -- | Build an entity from a name and its behavioral description.
-entity :: String -> HDL i o -> Entity i o
+entity :: String -> (i -> HDL i o o) -> Entity i o
 entity name body = Entity name body Nothing
 
 -- | Attach a vendor synthesis target to an entity.
@@ -212,7 +205,7 @@ elaborate Entity{..} = ElabEntity entityName portDecls nodes
     portDecls = map (toDecl In) iSpecs ++ map (toDecl Out) oSpecs
     nodes     = execNetM $ do
         inWires  <- mapM allocInput iSpecs
-        outputs  <- runHDL entityBody (fromWireIds inWires)
+        outputs  <- runHdl (entityBody (fromWireIds inWires))
         outWires <- toWireIds outputs
         mapM_ (uncurry emitOutput) (zip oSpecs outWires)
 
@@ -235,7 +228,7 @@ elaborateDesign Entity{..} = (ElabEntity entityName portDecls topNodes, fullDesi
     portDecls = map (toDecl In) iSpecs ++ map (toDecl Out) oSpecs
     (_, topNodes, subDesign) = runNetM $ do
         inWires  <- mapM allocInput iSpecs
-        outputs  <- runHDL entityBody (fromWireIds inWires)
+        outputs  <- runHdl (entityBody (fromWireIds inWires))
         outWires <- toWireIds outputs
         mapM_ (uncurry emitOutput) (zip oSpecs outWires)
     fullDesign = Map.insert entityName topNodes subDesign

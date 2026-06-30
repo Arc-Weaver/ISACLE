@@ -40,7 +40,7 @@ instEntity ent instLabel inputs = do
         oSpecs = zipWith setN (portNames (Proxy @o)) (portSpecs (Proxy @o))
         body   = do
             subIns  <- mapM allocIn iSpecs
-            outputs <- runHDL (entityBody ent) (fromWireIds subIns)
+            outputs <- runHdl (entityBody ent (fromWireIds subIns))
             subOuts <- toWireIds outputs
             mapM_ (uncurry emitOut) (zip oSpecs subOuts)
     (_, outPorts) <- inBlock instLabel (entityName ent) inWids body
