@@ -148,12 +148,13 @@ instance Hdl Sig NetM where
             let inRange = sigNot (sel .<. litOf lo) .&&. sigNot (litOf hi .<. sel)
             pure (mux inRange b acc)
     regBank = regBankNet
-    regBankRead group field count addr =
-        pure $ SExpr $ do
-            addrW <- materialize addr
-            outW  <- freshWire
-            emit $ NRegFileRead outW group field addrW count
-            pure outW
+    -- Eager (fresh wire per call, no SExpr memoisation): two distinct indexed
+    -- reads must never be merged into one wire by 'materialize's CSE.
+    regBankRead group field count addr = do
+        addrW <- materialize addr
+        outW  <- freshWire
+        emit $ NRegFileRead outW group field addrW count
+        pure (SWire outW)
 
 -- | Register-bank emission (deferred 'NRegFile' so feedback is safe): each port
 -- materialises its (index, data, enable) wires inside the deferred action.

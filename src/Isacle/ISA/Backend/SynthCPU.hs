@@ -52,8 +52,8 @@ import GHC.TypeLits (natVal)
 import Hdl.Bits
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..), Sig(..))
-import Hdl.Monad (regBank)
+import Hdl.Types (KnownDom(..), Sig(..), materialize)
+import Hdl.Monad (regBank, regBankRead)
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.Def
@@ -238,8 +238,9 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                         Just (count, _) -> do
                             inRangeW <- inFileRange addrW base count
                             idxW     <- fileIndexW addrW base count
-                            rdW <- freshWire
-                            emit $ N.NRegFileRead rdW "cpu_state" fileName idxW count
+                            rdW <- materialize =<<
+                                (regBankRead "cpu_state" fileName count (SWire idxW)
+                                   :: NetM (Sig dom ()))
                             muxW <- freshWire
                             emit $ NComb muxW N.PMux [inRangeW, rdW, acc]
                             return muxW)
@@ -382,8 +383,9 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                            [(matchW, rrIdxWire rr) | (matchW, rr) <- slotEntries]
                            =<< litWire 0 aBits
             hintWire rdAddrW (rfname ++ "_rd" ++ show slot ++ "_addr")
-            rdOutW <- freshWire
-            emit $ N.NRegFileRead rdOutW "cpu_state" rfname rdAddrW rfCount
+            rdOutW <- materialize =<<
+                (regBankRead "cpu_state" rfname rfCount (SWire rdAddrW)
+                   :: NetM (Sig dom ()))
             hintWire rdOutW (rfname ++ "_rd" ++ show slot)
             -- Forward shared output to each instruction's pre-allocated wire.
             forM_ slotEntries $ \(_, rr) ->
