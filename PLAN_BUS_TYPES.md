@@ -323,3 +323,33 @@ is the remaining bulk (todo #5). Also still internal-`NetM`: `HdlCircuit.hdlOps`
 + `emitPhysOuts` (materialize/emit), and `createHarvardCPU`'s ROM/entity wiring
 (`inBlock`/`NRom`). Final step after the retarget: un-export
 `NetM`/`emit`/`freshWire`/`inBlock`.
+
+---
+
+## UPDATE (2026-06-30 cont.): ISA-compiler retarget started — register file on Hdl
+
+First slice of the `InstrIR -> Hdl` retarget landed & green (commits 90c4a28,
+3859861, 3142336):
+- **`regBank` / `regBankRead`** added to the `Hdl` class (Monad.hs). `regBank`
+  takes a runtime `Int` entry width (the bank is structural, type-erased bits —
+  like `sigLitW`); netlist instance defers `NRegFile` emission for feedback
+  safety. `regBankRead` is **eager** (fresh wire + emit per call) — an `SExpr`
+  version gets memoised by `materialize`'s CSE and wrongly merges distinct
+  indexed reads (caught as a cov_io GPIO regression).
+- **SynthCPU** now emits the register file (write bank + both read sites) via
+  `regBank`/`regBankRead` instead of constructing `NRegFile`/`NRegFileRead`
+  nodes directly. `dom` pinned to `Type` (the `Hdl` class fixes
+  `s :: Type -> Type -> Type`), propagated to `synthHarvardCPU'`/
+  `synthHarvardCPU`/`createHarvardCPU`.
+- Verified: clavr 658/658 + ghdl-sim full instruction coverage green.
+
+**Remaining retarget bulk (the hard core):** scalar registers (`NReg` →
+`register`/`registerEn`) require the **register-feedback restructure** — the
+register output feeds the write arbiters which feed its next/enable, so the
+scalar-register + arbiter section must become a `rec`/`MonadFix` block, and the
+register outputs change `WireId -> Sig`, rippling through every reader
+(`scReadRegFn`, `getFlagFn`, pc/code-addr, the exec sequencer). Combinational
+logic (`emit NComb op` → `sigPrim*`), `buildMuxTree`/`buildOrTree` → `mux`/`.||.`
+folds, and `Synth.hs`/`Lower.hs` (`SynthResult`/`RenderCtx` `WireId -> Sig`) all
+ride along. That rippling `WireId -> Sig` conversion is the large atomic piece
+still to do (then `SynthVnCPU`, then un-export `NetM`).

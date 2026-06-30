@@ -1,7 +1,6 @@
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE TypeApplications    #-}
 -- | The synthesis renderer's expression lowering: 'IExpr' → netlist wire.
 --
 -- This is where 'Hdl.Net.WireId's are born — never in the IR itself.  Because
@@ -30,8 +29,9 @@ import Prelude
 import Control.Monad (foldM)
 import Data.List (intercalate)
 
-import Hdl.Net (WireId, NetM, NetNode(..), PrimOp, freshWire, emit, hintWire)
+import Hdl.Net (WireId, NetM, PrimOp, hintWire)
 import qualified Hdl.Net as N
+import Isacle.ISA.Backend.Wire (comb1, comb2, comb3, litW)
 import Isacle.ISA.Types (ALUPrim(..), CPUFlag)
 import Isacle.ISA.IR
 
@@ -59,119 +59,56 @@ lowerExpr :: forall a. LowerCtx -> IExpr a -> NetM Named
 lowerExpr ctx = go
   where
     go :: forall k. IExpr k -> NetM Named
-    go (INamed nm e) = do
-        Named w _ <- go e
-        hintWire w nm
-        pure (Named w (Just nm))
+    go (INamed nm e)   = do { Named w _ <- go e; named (Just nm) w }
+    go (IReadReg ref)  = leaf (Just (regName ref))                 (lcReadReg ctx ref)
+    go (IField fr)     = leaf (Just (mnem (frKey fr)))             (lcField ctx fr)
+    go (IReadRes t@(ReadTok i)) = leaf (Just ("rd" ++ show i))     (lcReadRes ctx t)
+    go (IFlagRead f)   = leaf Nothing                              (lcReadFlag ctx f)
+    go IIrqVector      = leaf (Just "irq_vector")                  (lcIrqVector ctx)
+    go e@(ILit v)      = leaf Nothing (litW v (exprWidth e))       -- literals: no name
 
-    go e@(ILit v) = do
-        let bw = exprWidth e
-        w <- freshWire
-        emit $ NComb w (N.PLit v bw) []
-        pure (Named w Nothing)               -- literals carry no propagated name
-
-    go (IReadReg ref) = do
-        w <- lcReadReg ctx ref
-        let nm = regName ref
-        hintWire w nm
-        pure (Named w (Just nm))
-
-    go (IField fr) = do
-        w <- lcField ctx fr
-        let nm = maybe id (\m s -> m ++ "_" ++ s) (lcMnemonic ctx) (frKey fr)
-        hintWire w nm
-        pure (Named w (Just nm))
-
-    go (IReadRes tok@(ReadTok i)) = do
-        w <- lcReadRes ctx tok
-        let nm = "rd" ++ show i
-        hintWire w nm
-        pure (Named w (Just nm))
-
-    go (IBin op a b) = do
+    go (IBin op a b) = bin (toPrim op) (followName (opTag op)) a b
+    go (IUn op a)    = un  (toPrim op) (tagWith (opTag op))   a
+    go (IMux c t f)  = do
+        Named wc _ <- go c
+        bin' (comb3 N.PMux wc) (followName "sel") t f
+    go (IIsZero a)   = do
         Named wa na <- go a
-        Named wb nb <- go b
-        w <- freshWire
-        emit $ NComb w (toPrim op) [wa, wb]
-        let nm = followName (opTag op) na nb
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
+        z <- litW 0 (exprWidth a)
+        named (tagSuffix "_isZero" na) =<< comb2 N.PEq wa z
 
-    go (IUn op a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (toPrim op) [wa]
-        let nm = fmap (\s -> opTag op ++ "_" ++ s) na
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
+    go e@(IResize a)      = un (N.PResize (exprWidth e))         keep a
+    go e@(IZeroExt a)     = un (N.PResize (exprWidth e))         keep a
+    go e@(ITrunc a)       = un (N.PSlice (exprWidth e - 1) 0)    keep a
+    go e@(ISignExt a)     = un (N.PSignedResize (exprWidth e))   keep a
+    go e@(IReinterpret a) = un (N.PReinterpret (exprRepr e))     keep a
+    go (ISlice hi lo a)   = un (N.PSlice hi lo)                  keep a
 
-    go (IMux c t f) = do
-        Named wc _  <- go c
-        Named wt nt <- go t
-        Named wf nf <- go f
-        w <- freshWire
-        emit $ NComb w N.PMux [wc, wt, wf]
-        let nm = followName "sel" nt nf
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
+    -- A resolved leaf wire with an optional name.
+    leaf :: Maybe String -> NetM WireId -> NetM Named
+    leaf mnm m = m >>= named mnm
+    -- A unary op carrying its child's name through @nameOf@.
+    un :: forall x. PrimOp -> (Maybe String -> Maybe String) -> IExpr x -> NetM Named
+    un prim nameOf a = do { Named wa na <- go a; named (nameOf na) =<< comb1 prim wa }
+    -- A binary op named from both children via @nameOf@.
+    bin :: forall x y. PrimOp
+        -> (Maybe String -> Maybe String -> Maybe String)
+        -> IExpr x -> IExpr y -> NetM Named
+    bin prim = bin' (comb2 prim)
+    bin' :: forall x y. (WireId -> WireId -> NetM WireId)
+         -> (Maybe String -> Maybe String -> Maybe String)
+         -> IExpr x -> IExpr y -> NetM Named
+    bin' mk nameOf a b = do
+        Named wa na <- go a; Named wb nb <- go b
+        named (nameOf na nb) =<< mk wa wb
+    -- Attach a name (if any) to a wire and wrap as 'Named'.
+    named :: Maybe String -> WireId -> NetM Named
+    named mnm w = do { maybe (pure ()) (hintWire w) mnm; pure (Named w mnm) }
 
-    go e@(IResize a)  = resizeLike (exprWidth e) a
-    go e@(IZeroExt a) = resizeLike (exprWidth e) a
-    go e@(ITrunc a)   = do
-        let dst = exprWidth e
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSlice (dst - 1) 0) [wa]
-        propagate w na
-    go e@(ISignExt a) = do
-        let dst = exprWidth e
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSignedResize dst) [wa]
-        propagate w na
-    -- | Same-width reinterpretation: a real signed()/unsigned() cast carrying
-    -- the *target* representation, recovered from the result value type.
-    go e@(IReinterpret a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PReinterpret (exprRepr e)) [wa]
-        propagate w na
-    go (IIsZero a) = do
-        let bw = exprWidth a
-        Named wa na <- go a
-        zw <- freshWire
-        emit $ NComb zw (N.PLit 0 bw) []
-        w  <- freshWire
-        emit $ NComb w N.PEq [wa, zw]
-        let nm = fmap (\s -> s ++ "_isZero") na
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
-
-    go (ISlice hi lo a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSlice hi lo) [wa]
-        propagate w na
-
-    go (IFlagRead flag) = do
-        w <- lcReadFlag ctx flag
-        pure (Named w Nothing)
-
-    go IIrqVector = do
-        w <- lcIrqVector ctx
-        hintWire w "irq_vector"
-        pure (Named w (Just "irq_vector"))
-
-    resizeLike :: forall j. Int -> IExpr j -> NetM Named
-    resizeLike dst a = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PResize dst) [wa]
-        propagate w na
-
-    propagate w na = do
-        maybe (pure ()) (hintWire w) na
-        pure (Named w na)
+    keep na               = na                            -- propagate name unchanged
+    tagWith tag na        = fmap (\s -> tag ++ "_" ++ s) na
+    tagSuffix suf na      = fmap (++ suf) na
+    mnem k                = maybe id (\m s -> m ++ "_" ++ s) (lcMnemonic ctx) k
 
 -- | Lower an expression, discarding the propagated name.
 lowerExpr_ :: LowerCtx -> IExpr w -> NetM WireId
@@ -277,8 +214,7 @@ renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
         pure r { rRegWrites = reverse ws ++ rRegWrites r }
       where
         sliceEntry w (p, idx) = do
-            sw <- freshWire
-            emit $ NComb sw (N.PSlice ((p + 1) * ew - 1) (p * ew)) [w]
+            sw <- comb1 (N.PSlice ((p + 1) * ew - 1) (p * ew)) w
             pure (RegWrite (RegFile file (FieldRef "") 1 idx) sw)
     step r (SWriteReg ref e) = do
         w <- lowerExpr_ ctx e

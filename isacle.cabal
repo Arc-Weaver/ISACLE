@@ -108,6 +108,7 @@ library
     Isacle.ISA.Backend.Synth
     Isacle.ISA.Backend.SynthCPU
     Isacle.ISA.Backend.SynthVnCPU
+    Isacle.ISA.Backend.Wire
     Isacle.ISA.CPUDef
     Isacle.ISA.Def
     Isacle.ISA.Encoding
