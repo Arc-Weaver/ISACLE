@@ -59,7 +59,8 @@ module Isacle.System.SystemDSL
 import Prelude
 import Data.Kind (Type)
 import Data.Word (Word32)
-import Control.Monad (forM, forM_, replicateM, zipWithM_)
+import Control.Monad (replicateM)
+import Data.List (zip4)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
 import Data.Proxy (Proxy(..))
@@ -209,33 +210,62 @@ attachPeripheral base token = BusDSL $ do
     let idx   = length (bdsSlots st)
         myReq = bdsReqFeed st !! idx
         nm    = ptName token
-        -- Build the peripheral purely from its (knot-tied) bus request.  The
-        -- protocol-agnostic slave port becomes a register-level 'BusIface' via
-        -- 'busPortIface'; 'runPeriphDef' returns the typed physical outputs, the
-        -- read-data signal, and the register spec — all as deferred 'Sig's.
-        bus = busPortIface (mqReq myReq) (mqWe myReq)
-                           (mqAddr myReq) (mqWData myReq) base
-        (phys, rd, spec) = runPeriphDef hdlOps bus (ptDef token)
+        -- Spec pass (pure, no emission): only the register-field metadata, which
+        -- doesn't depend on the request values.
+        specBus = busPortIface (mqReq myReq) (mqWe myReq)
+                               (mqAddr myReq) (mqWData myReq) base
+        (_, _, spec) = runPeriphDef hdlOps specBus (ptDef token)
         size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
         entry = PeriphEntry { peName = nm, peBase = base, peSpec = spec }
-        -- Top-level names for this peripheral's physical outputs:
-        -- @<instance>_<port>@ (e.g. @gpio_GpioPhys_gpioPort@).
-        physNames = [ nm ++ "_" ++ portName ps | ps <- portSpecs (Proxy @a) ]
-        slot  = PeriphSlot
+        specs = portSpecs (Proxy @a)
+        -- @<instance>_<port>@, e.g. @gpio0_GpioPhys_gpioPort@.
+        physNames  = [ nm ++ "_" ++ portName ps | ps <- specs ]
+        physWidths = map portWidth specs
+        nPhys      = physOutCount (Proxy @a)
+
+    -- Pre-allocate the physical-output wires the user receives now (driven later,
+    -- when 'createBus' instantiates the peripheral sub-entity via 'psRun').
+    physWires <- lift $ replicateM nPhys freshWire
+
+    let slot = PeriphSlot
             { psName = nm
             , psBase = base
             , psSize = size
             , psSpec = spec
             , psRun  = do
-                  -- Promote the physical outputs to top-level ports, then hand
-                  -- the slave response back for the bus read mux.
-                  emitPhysOuts physNames domInfo datW phys
-                  pure SlaveResp { srRData = rd, srStall = sigFalse }
+                  -- Instantiate the peripheral as its own named sub-entity
+                  -- (e.g. "gpio0" → gpio0.vhd): the bus request drives its input
+                  -- ports; its read-data + physical outputs come back as ports.
+                  reqW <- materialize (mqReq   myReq)
+                  weW  <- materialize (mqWe    myReq)
+                  adW  <- materialize (mqAddr  myReq)
+                  wdW  <- materialize (mqWData myReq)
+                  (_, outPorts) <- inBlock nm nm [reqW, weW, adW, wdW] $ do
+                      reqIn <- freshWire; emit $ NInput reqIn "req"   1   domInfo
+                      weIn  <- freshWire; emit $ NInput weIn  "we"    1   domInfo
+                      adIn  <- freshWire; emit $ NInput adIn  "addr"  32  domInfo
+                      wdIn  <- freshWire; emit $ NInput wdIn  "wdata" datW domInfo
+                      let busP = busPortIface (SWire reqIn) (SWire weIn)
+                                              (SWire adIn) (SWire wdIn) base
+                          (phys, rd, _) = runPeriphDef hdlOps busP (ptDef token)
+                      rdWid <- materialize rd
+                      emit $ NOutput rdWid "rd_data" datW domInfo
+                      emitPhysOuts (map portName specs) domInfo datW phys
+                  case outPorts of
+                      (_, rdActW, _) : physPorts -> do
+                          -- Drive the user's placeholders from the sub-entity's
+                          -- physical outputs, and promote them to top-level ports.
+                          sequence_
+                              [ do { alias pw actW; emit $ NOutput pw pn pwdt domInfo }
+                              | (pw, pn, pwdt, (_, actW, _))
+                                  <- zip4 physWires physNames physWidths physPorts ]
+                          pure SlaveResp { srRData = SWire rdActW, srStall = sigFalse }
+                      [] -> error ("attachPeripheral: " ++ nm ++ " emitted no ports")
             }
     put st { bdsPeriph = bdsPeriph st ++ [entry]
            , bdsSlots  = bdsSlots  st ++ [slot]
            }
-    pure phys
+    pure (fromPhysWires physWires :: a)
 
   where
     domInfo  = domId   (Proxy @dom)
