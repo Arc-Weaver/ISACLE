@@ -8,7 +8,8 @@ import Hdl.Net
 import Hdl.Types
 import Hdl.Prim
 import Hdl.Class
-import Hdl.Entity
+import Hdl.Entity hiding (entity)
+import Hdl.IO (bind, entity)
 import Hdl.Emit.Vhdl
 
 -- ---------------------------------------------------------------------------
@@ -88,12 +89,12 @@ testHierarchy :: IO ()
 testHierarchy = do
     let adder :: Entity (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
                         (Sig Clk (Unsigned 8))
-        adder = entity "adder8" $ hdl $ \(a, b) -> return (a + b)
+        adder = bind "adder8" $ hdl $ \(a, b) -> return (a + b)
 
         design = execDesign "top" $ do
             x <- inputS @Clk @(Unsigned 8) "x"
             y <- inputS @Clk @(Unsigned 8) "y"
-            s <- instEntity adder "u1" (x, y)
+            s <- entity "u1" adder (x, y)
             outputS @Clk @(Unsigned 8) "result" s
 
     assert "hier: design has 2 entities" (Map.size design == 2)
@@ -247,14 +248,14 @@ testMultiInst :: IO ()
 testMultiInst = do
     let half :: Entity (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
                        (Sig Clk (Unsigned 8), Sig Clk Bool)
-        half = entity "half_adder8" $ hdl $ \(a, b) -> return (a + b, a .==. b)
+        half = bind "half_adder8" $ hdl $ \(a, b) -> return (a + b, a .==. b)
 
         design = execDesign "top" $ do
             x <- inputS @Clk @(Unsigned 8) "x"
             y <- inputS @Clk @(Unsigned 8) "y"
             z <- inputS @Clk @(Unsigned 8) "z"
-            (s1, _) <- instEntity half "u_ha0" (x, y)
-            (s2, _) <- instEntity half "u_ha1" (s1, z)
+            (s1, _) <- entity "u_ha0" half (x, y)
+            (s2, _) <- entity "u_ha1" half (s1, z)
             outputS @Clk @(Unsigned 8) "result" s2
 
     let topNodes = design Map.! "top"
