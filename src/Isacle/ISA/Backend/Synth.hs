@@ -21,101 +21,104 @@ module Isacle.ISA.Backend.Synth
       -- * Rendering
     , RenderCtx(..)
     , renderSynth
-      -- * Netlist helpers reused by the CPU pass
-    , buildMatchWire
-    , extractFieldNetM
+      -- * Combinational helpers reused by the CPU pass
+    , buildMatch
+    , extractFieldSig
     ) where
 
 import Prelude hiding (Word)
-import Control.Monad (foldM)
 import Data.Either (partitionEithers)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 
-import Hdl.Net (NetM, WireId, freshWire, hintWire)
 import qualified Hdl.Net as N
-import Isacle.ISA.Backend.Wire (comb2, litW, sliceW, resizeW, andW, eqW)
+import Hdl.Types (Signal(..), KnownDom)
+import Hdl.Monad (Hdl(..))
 import Isacle.ISA.Types (CPUFlag(..))
 import Isacle.ISA.Encoding
 import Isacle.ISA.IR
 import Isacle.ISA.Backend.Lower
 
 -- ---------------------------------------------------------------------------
--- Per-instruction output types (consumed by SynthCPU's arbiters/sequencer)
+-- Per-instruction output signals (consumed by SynthCPU's arbiters/sequencer).
+-- Every "wire" is now a typed 'Signal' value — no NetM, no WireId.
 -- ---------------------------------------------------------------------------
 
 -- | Register-file (indexed) write request — guarded by 'rwMatchWire'.
-data RegWriteReq = RegWriteReq
-    { rwMatchWire :: WireId
+data RegWriteReq s dom = RegWriteReq
+    { rwMatchWire :: s dom ()
     , rwRfName    :: String
-    , rwIdxWire   :: WireId
-    , rwDataWire  :: WireId
-    } deriving (Show)
+    , rwIdxWire   :: s dom ()
+    , rwDataWire  :: s dom ()
+    }
 
 -- | Scalar-register write request (PC, SP, …) — guarded by 'swMatchWire'.
-data ScalarWriteReq = ScalarWriteReq
-    { swMatchWire :: WireId
+data ScalarWriteReq s dom = ScalarWriteReq
+    { swMatchWire :: s dom ()
     , swRegName   :: String
-    , swDataWire  :: WireId
-    } deriving (Show)
+    , swDataWire  :: s dom ()
+    }
 
--- | Register-file read request; the CPU pass emits the 'NMem' read port driving
--- 'rrOutWire' from 'rrIdxWire'.
-data RegReadReq = RegReadReq
+-- | Register-file read request (index signal + the read-result signal).
+data RegReadReq s dom = RegReadReq
     { rrRfName  :: String
-    , rrIdxWire :: WireId
-    , rrOutWire :: WireId
-    } deriving (Show)
+    , rrIdxWire :: s dom ()
+    , rrOutWire :: s dom ()
+    }
 
 -- | Data-memory write request.
-data MemWriteReq = MemWriteReq
-    { mwMatchWire :: WireId
-    , mwAddrWire  :: WireId
-    , mwDataWire  :: WireId
-    } deriving (Show)
+data MemWriteReq s dom = MemWriteReq
+    { mwMatchWire :: s dom ()
+    , mwAddrWire  :: s dom ()
+    , mwDataWire  :: s dom ()
+    }
 
--- | Data-memory read request.  'mrResultWire' is the wire the body consumed for
--- the read result; the CPU sequencer drives it from 'mrBusWire' (directly for a
--- single read, or via a per-cycle select + holding latch for multi-reads).
-data MemReadReq = MemReadReq
-    { mrMatchWire  :: WireId
-    , mrAddrWire   :: WireId
-    , mrBusWire    :: WireId
-    , mrResultWire :: WireId
-    } deriving (Show)
+-- | Data-memory read request.  'mrResultWire' is the signal the body consumed
+-- for the read result; the CPU sequencer produces it from 'mrBusWire' (the bus,
+-- directly for a single read, or via a per-cycle select + holding latch).
+data MemReadReq s dom = MemReadReq
+    { mrMatchWire  :: s dom ()
+    , mrAddrWire   :: s dom ()
+    , mrBusWire    :: s dom ()
+    , mrResultWire :: s dom ()
+    }
 
 -- | Flag write: set one status-register bit when the instruction fires.
-data FlagWriteReq = FlagWriteReq
-    { fwMatchWire :: WireId
+data FlagWriteReq s dom = FlagWriteReq
+    { fwMatchWire :: s dom ()
     , fwRegName   :: String
     , fwBitPos    :: Int
-    , fwValueWire :: WireId
-    } deriving (Show)
+    , fwValueWire :: s dom ()
+    }
 
 -- | All combinational outputs of one instruction.
-data SynthResult = SynthResult
-    { srMatchWire    :: Maybe WireId
-    , srRegWrites    :: [RegWriteReq]
-    , srScalarWrites :: [ScalarWriteReq]
-    , srRegReads     :: [RegReadReq]
-    , srMemWrites    :: [MemWriteReq]
-    , srMemReads     :: [MemReadReq]
-    , srFlagWrites   :: [FlagWriteReq]
-    } deriving (Show)
+data SynthResult s dom = SynthResult
+    { srMatchWire    :: Maybe (s dom ())
+    , srRegWrites    :: [RegWriteReq s dom]
+    , srScalarWrites :: [ScalarWriteReq s dom]
+    , srRegReads     :: [RegReadReq s dom]
+    , srMemWrites    :: [MemWriteReq s dom]
+    , srMemReads     :: [MemReadReq s dom]
+    , srFlagWrites   :: [FlagWriteReq s dom]
+    }
 
 -- ---------------------------------------------------------------------------
 -- Render context
 -- ---------------------------------------------------------------------------
 
--- | Resolution the CPU pass supplies for one instruction slot.
-data RenderCtx = RenderCtx
-    { rcInstrWire  :: WireId                    -- ^ instruction word (field source)
-    , rcReadScalar :: String -> NetM WireId     -- ^ scalar register reader
-    , rcDataBus    :: WireId                    -- ^ data_rd_data
-    , rcCodeBus    :: WireId                    -- ^ code read bus (LPM/2nd word)
-    , rcGetFlag    :: String -> Int -> NetM WireId  -- ^ status-bit reader
-    , rcIrqVector  :: Maybe WireId              -- ^ irq_vector (in an IRQ body)
-    , rcWordW      :: Int                       -- ^ data word width (write clamp)
+-- | Resolution the CPU pass supplies for one instruction slot.  Leaves are
+-- already-resolved signals; @rcReadRes@ is the per-read result the sequencer
+-- drives (the CPU renders twice — see 'SynthCPU').
+data RenderCtx s dom = RenderCtx
+    { rcInstrWire  :: s dom ()                  -- ^ instruction word (field source)
+    , rcReadScalar :: String -> s dom ()        -- ^ scalar register reader
+    , rcDataBus    :: s dom ()                  -- ^ data_rd_data
+    , rcCodeBus    :: s dom ()                  -- ^ code read bus (LPM/2nd word)
+    , rcReadRes    :: ReadTok -> s dom ()       -- ^ per-read result (from sequencer)
+    , rcGetFlag    :: String -> Int -> s dom () -- ^ status-bit reader
+    , rcRegCount   :: String -> Int             -- ^ register-file entry count
+    , rcIrqVector  :: Maybe (s dom ())          -- ^ irq_vector (in an IRQ body)
+    , rcWordW      :: Int                        -- ^ data word width (write clamp)
     }
 
 -- ---------------------------------------------------------------------------
@@ -126,106 +129,103 @@ data RenderCtx = RenderCtx
 --
 -- @mBase@ is the base match condition: 'Nothing' to derive it from the encoding
 -- (normal instructions), or @Just w@ to seed it (e.g. @irq_pending@).
-renderSynth :: RenderCtx -> Maybe WireId -> InstrIR -> NetM SynthResult
+renderSynth :: forall s m dom. (Hdl s m, Signal s, KnownDom dom)
+            => RenderCtx s dom -> Maybe (s dom ()) -> InstrIR -> m (SynthResult s dom)
 renderSynth ctx mBase ir = do
     let instrW = rcInstrWire ctx
         mEnc   = fmap parseEncoding (iirEncoding ir)
         col    = mconcat (map collectS (iirStmts ir))
                    <> maybe mempty collectE (iirGate ir)
         fieldKeys = nub (colFields col)
-        regReads  = nub (colRegReads col)   -- (rf, field, offset)
-        idxKeys   = nub (colIdx col)        -- (field, offset) used as a regfile index
+        regReads  = nub (colRegReads col)   -- (rf, field, scale, offset)
+        idxKeys   = nub (colIdx col)        -- (field, scale, offset) used as an index
 
-    -- Field-extraction wires (shared by immediates and register-file indices).
+    -- Field-extraction signals (shared by immediates and register-file indices).
     fieldPairs <- mapM (\k -> (,) k <$> extractFieldNamed mEnc instrW (iirMnemonic ir) k)
                        fieldKeys
     let fieldMap = Map.fromList fieldPairs
 
-    -- Base match wire — computed early so it can stand in as a fallback wire.
+    -- Base match signal — computed early so it can stand in as a fallback.
     base <- case mBase of
         Just w  -> pure w
-        Nothing -> case mEnc of
-            Just e  -> buildMatchWire e instrW
-            Nothing -> litW 1 1
-    case (mBase, iirMnemonic ir) of
-        (Nothing, Just nm) -> hintWire base ("match_" ++ nm)
-        _                  -> pure ()
+        Nothing -> case (mEnc, iirMnemonic ir) of
+            (Just e, Just nm) -> named ("match_" ++ nm) (buildMatch e instrW)
+            (Just e, Nothing) -> pure (buildMatch e instrW)
+            (Nothing, _)      -> pure (sigLitW 1 1)
 
-    -- Register-file index wires.  Offset 0 is the raw field; a non-zero offset
-    -- (sub-range encoding, e.g. AVR @ldi@ → R16..R31) adds a constant, producing
-    -- a real adder so the index reaches the high half of the file.
+    -- Register-file index signals.  Offset 0 is the raw field; a non-zero offset
+    -- (sub-range encoding, e.g. AVR @ldi@ → R16..R31) adds a constant.
     idxPairs <- mapM (\(k, sc, off) ->
                     if null k
                         then do  -- constant index: a literal, no field
-                            w <- litW (fromIntegral off) (rcWordW ctx)
-                            hintWire w (mnemPrefix (iirMnemonic ir) ("r" ++ show off ++ "_idx"))
-                            pure ((k, sc, off), w)
+                            s <- named (mnemPrefix (iirMnemonic ir) ("r" ++ show off ++ "_idx"))
+                                       (sigLitW (fromIntegral off) (rcWordW ctx))
+                            pure ((k, sc, off), s)
                         else do
                             let fw = Map.findWithDefault base k fieldMap
                             if sc == 1 && off == 0
                                 then pure ((k, sc, off), fw)
                                 else do
-                                    ext    <- resizeW (rcWordW ctx) fw
-                                    scaled <- if sc == 1 then pure ext
-                                              else comb2 N.PMul ext =<< litW (fromIntegral sc) (rcWordW ctx)
-                                    s <- if off == 0 then pure scaled
-                                         else comb2 N.PAdd scaled =<< litW (fromIntegral off) (rcWordW ctx)
-                                    hintWire s (mnemPrefix (iirMnemonic ir) (k ++ "_idx"))
+                                    let ext    = sigPrim1 (N.PResize (rcWordW ctx)) fw
+                                        scaled = if sc == 1 then ext
+                                                 else sigPrim2 N.PMul ext (sigLitW (fromIntegral sc) (rcWordW ctx))
+                                        s0     = if off == 0 then scaled
+                                                 else sigPrim2 N.PAdd scaled (sigLitW (fromIntegral off) (rcWordW ctx))
+                                    s <- named (mnemPrefix (iirMnemonic ir) (k ++ "_idx")) s0
                                     pure ((k, sc, off), s))
                    idxKeys
     let idxMap = Map.fromList idxPairs
         idxWire k sc off = Map.findWithDefault base (k, sc, off) idxMap
 
-    -- One read port per distinct (register file, index field, scale, offset).
+    -- One register-file read per distinct (file, index field, scale, offset),
+    -- resolved inline via 'regBankRead'.
     regTriples <- mapM (\(rf, k, sc, off) -> do
-                            outW <- freshWire
-                            hintWire outW (rf ++ "_" ++ slotTag k off)
-                            pure ((rf, k, sc, off), outW, RegReadReq rf (idxWire k sc off) outW))
+                            out <- regBankRead "cpu_state" rf (rcRegCount ctx rf) (idxWire k sc off)
+                            out' <- named (rf ++ "_" ++ slotTag k off) out
+                            pure ((rf, k, sc, off), out', RegReadReq rf (idxWire k sc off) out'))
                        regReads
     let regOutMap   = Map.fromList [ (key, o) | (key, o, _) <- regTriples ]
         regReadReqs = [ r | (_, _, r) <- regTriples ]
 
-    -- Read-result wires: data reads get a fresh wire (driven by the sequencer);
-    -- code reads alias the code bus directly.
-    tokPairs <- fmap concat $ mapM (\s -> case s of
-                    SReadMem  (ReadTok t) _ -> do { w <- freshWire; pure [(t, w)] }
-                    SReadCode (ReadTok t) _ -> pure [(t, rcCodeBus ctx)]
-                    _                       -> pure []) (iirStmts ir)
-    let tokMap = Map.fromList tokPairs
+    -- Read-result resolution: code reads alias the code bus; data reads use the
+    -- per-read signal the sequencer drives ('rcReadRes').
+    let codeToks = [ t | SReadCode (ReadTok t) _ <- iirStmts ir ]
+        readResSig (ReadTok t)
+            | t `elem` codeToks = rcCodeBus ctx
+            | otherwise         = rcReadRes ctx (ReadTok t)
 
-    let -- Read a view register: concatenate its constant-index entry reads, the
-        -- first (low) entry least significant.
-        readView file ew idxs = do
+    -- Read a view register: concatenate its constant-index entry reads, the
+    -- first (low) entry least significant.  Pure 'Signal' composition.
+    let readView file ew idxs =
             let total = ew * length idxs
-                entryWire idx = Map.findWithDefault base (file, "", 1, idx) regOutMap
-            parts <- mapM (\(p, idx) -> do
-                rz <- resizeW total (entryWire idx)
-                if p == 0 then pure rz
-                          else comb2 N.PShiftL rz =<< litW (fromIntegral (p * ew)) total)
-                (zip [0 :: Int ..] idxs)
-            case parts of
-                []       -> litW 0 (max total 1)
-                (x : xs) -> foldM (comb2 N.POr) x xs
-    let lctx = LowerCtx
+                entrySig idx = Map.findWithDefault base (file, "", 1, idx) regOutMap
+                parts = [ let z = sigPrim1 (N.PResize total) (entrySig idx)
+                          in if p == 0 then z
+                             else sigPrim2 N.PShiftL z (sigLitW (fromIntegral (p * ew)) total)
+                        | (p, idx) <- zip [0 :: Int ..] idxs ]
+            in case parts of
+                 []       -> sigLitW 0 (max total 1)
+                 (x : xs) -> foldl (sigPrim2 N.POr) x xs
+        lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
-                  RegScalar n                 -> rcReadScalar ctx n
-                  RegFile rf (FieldRef k) sc off -> pure (Map.findWithDefault base (rf, k, sc, off) regOutMap)
-                  RegEntries file ew idxs     -> readView file ew idxs
-            , lcField     = \(FieldRef k) -> pure (Map.findWithDefault base k fieldMap)
-            , lcReadRes   = \(ReadTok t)  -> pure (Map.findWithDefault (rcDataBus ctx) t tokMap)
+                  RegScalar n                    -> rcReadScalar ctx n
+                  RegFile rf (FieldRef k) sc off -> Map.findWithDefault base (rf, k, sc, off) regOutMap
+                  RegEntries file ew idxs        -> readView file ew idxs
+            , lcField     = \(FieldRef k) -> Map.findWithDefault base k fieldMap
+            , lcReadRes   = readResSig
             , lcReadFlag  = \f -> rcGetFlag ctx (cpuFlagReg f) (cpuFlagBit f)
-            , lcIrqVector = pure (maybe base id (rcIrqVector ctx))
+            , lcIrqVector = maybe base id (rcIrqVector ctx)
             , lcMnemonic  = iirMnemonic ir
             }
 
     -- irqGate refines the match condition.
     matchW <- case iirGate ir of
         Nothing -> pure base
-        Just g  -> andW base =<< lowerExpr_ lctx g
+        Just g  -> sigPrim2 N.PAnd base <$> lowerExpr_ lctx g
 
     r <- renderInstr lctx ir
 
-    -- Map the lowered Rendered into request structures.
+    -- Map the lowered 'Rendered' into request structures (pure now).
     let splitW (RegWrite (RegScalar n) w)                 = Left  (ScalarWriteReq matchW n w)
         splitW (RegWrite (RegFile rf (FieldRef k) sc off) w) =
             Right (RegWriteReq matchW rf (idxWire k sc off) w)
@@ -233,19 +233,14 @@ renderSynth ctx mBase ir = do
             error "view-register write should have been fanned out in renderInstr"
         (scalarWs, regWs) = partitionEithers (map splitW (rRegWrites r))
 
-    memWrites <- mapM (\(a, d) -> do
-                          dc <- clampW (rcWordW ctx) d
-                          pure (MemWriteReq matchW a dc)) (rMemWrites r)
-
-    let memReads = [ MemReadReq matchW a (rcDataBus ctx)
-                                (Map.findWithDefault (rcDataBus ctx) t tokMap)
-                   | (ReadTok t, a) <- rMemReads r ]
+        memWrites = [ MemWriteReq matchW a (sigPrim1 (N.PResize (rcWordW ctx)) d)
+                    | (a, d) <- rMemWrites r ]
+        memReads  = [ MemReadReq matchW a (rcDataBus ctx) (readResSig (ReadTok t))
+                    | (ReadTok t, a) <- rMemReads r ]
         flagWrites = [ FlagWriteReq matchW (cpuFlagReg f) (cpuFlagBit f) w
                      | (f, w) <- rFlagWrites r ]
-
-    jumpWs <- mapM (\(Jump rr condW tgtW) -> do
-                       g <- andW matchW condW
-                       pure (ScalarWriteReq g (regRefName rr) tgtW)) (rJumps r)
+        jumpWs = [ ScalarWriteReq (sigPrim2 N.PAnd matchW cond) (regRefName rr) tgt
+                 | Jump rr cond tgt <- rJumps r ]
 
     pure SynthResult
         { srMatchWire    = Just matchW
@@ -274,18 +269,15 @@ slotTag k off
 mnemPrefix :: Maybe String -> String -> String
 mnemPrefix mnem s = maybe s (\m -> m ++ "_" ++ s) mnem
 
--- | Extract a field's bits from the instruction word (or a fresh wire when the
+-- | Extract a field's bits from the instruction word (or a 0 literal when the
 -- encoding lacks it), named @\<mnemonic\>_\<key\>@.
-extractFieldNamed :: Maybe EncodingInfo -> WireId -> Maybe String -> String -> NetM WireId
+extractFieldNamed :: (Hdl s m, Signal s)
+                  => Maybe EncodingInfo -> s dom () -> Maybe String -> String -> m (s dom ())
 extractFieldNamed mEnc instrW mnem k = do
-    w <- case mEnc of
-        Just e  -> maybe freshWire (`extractFieldNetM` instrW) (Map.lookup k (encFields e))
-        Nothing -> freshWire
-    case mnem of { Just nm -> hintWire w (nm ++ "_" ++ k); _ -> pure () }
-    pure w
-
-clampW :: Int -> WireId -> NetM WireId
-clampW = resizeW
+    let sig = case mEnc >>= Map.lookup k . encFields of
+                Just bits -> extractFieldSig bits instrW
+                Nothing   -> sigLitW 0 1
+    case mnem of { Just nm -> named (nm ++ "_" ++ k) sig; _ -> pure sig }
 
 -- ---------------------------------------------------------------------------
 -- Pre-pass: collect field keys and register-file reads from the IR
@@ -349,21 +341,19 @@ collectS s = case s of
     SJumpIf r c t      -> collectRef r <> collectE c <> collectE t
 
 -- ---------------------------------------------------------------------------
--- Netlist helpers (shared with the CPU pass)
+-- Combinational helpers (pure Signal, shared with the CPU pass)
 -- ---------------------------------------------------------------------------
 
--- | Build the combinational instruction-match signal: @(instr AND mask) == value@.
-buildMatchWire :: EncodingInfo -> WireId -> NetM WireId
-buildMatchWire enc instrW = do
-    anded <- comb2 N.PAnd instrW =<< litW (encMask enc) (encTotalBits enc)
-    eqW anded =<< litW (encValue enc) (encTotalBits enc)
+-- | The combinational instruction-match signal: @(instr AND mask) == value@.
+buildMatch :: Signal s => EncodingInfo -> s dom () -> s dom ()
+buildMatch enc instrW =
+    sigPrim2 N.PEq
+        (sigPrim2 N.PAnd instrW (sigLitW (encMask enc) (encTotalBits enc)))
+        (sigLitW (encValue enc) (encTotalBits enc))
 
 -- | Extract non-contiguous field bits, reassembling MSB-first via PSlice/PConcat.
-extractFieldNetM :: [Int] -> WireId -> NetM WireId
-extractFieldNetM []   _      = litW 0 1
-extractFieldNetM [bp] instrW = sliceW bp bp instrW
-extractFieldNetM bps  instrW = mapM (\bp -> sliceW bp bp instrW) bps >>= foldBits
-  where
-    foldBits [w]    = pure w
-    foldBits (w:ws) = foldBits ws >>= comb2 N.PConcat w
-    foldBits []     = litW 0 1
+extractFieldSig :: Signal s => [Int] -> s dom () -> s dom ()
+extractFieldSig []   _      = sigLitW 0 1
+extractFieldSig [bp] instrW = sigPrim1 (N.PSlice bp bp) instrW
+extractFieldSig bps  instrW =
+    foldr1 (sigPrim2 N.PConcat) [ sigPrim1 (N.PSlice bp bp) instrW | bp <- bps ]
