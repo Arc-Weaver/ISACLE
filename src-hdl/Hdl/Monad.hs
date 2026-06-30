@@ -1,5 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
@@ -19,9 +21,8 @@ module Hdl.Monad
       Named(..)
     , name
     , erase
-      -- * The HDL monad
+      -- * The Hdl typeclass (netlist instance: Hdl Sig NetM)
     , Hdl(..)
-    , HDL(..)
     ) where
 
 import Prelude
@@ -63,7 +64,7 @@ name nm s = SExpr $ do
 
 -- | Erase a name (inputs): hand the body the plain signal within a continuation,
 -- so the name can seed a scope for the derived logic.  The inverse of 'name'.
-erase :: Hdl m => Sig dom (Named a) -> (Sig dom a -> m r) -> m r
+erase :: Sig dom (Named a) -> (Sig dom a -> m r) -> m r
 erase s k = k (retype s)
   where
     retype (SWire w) = SWire w
@@ -73,47 +74,47 @@ erase s k = k (retype s)
 -- Hdl — the fundamental monad-level hardware surface
 -- ---------------------------------------------------------------------------
 
--- | The fundamental HDL operations, abstract over the monad @m@.  Backends
--- (synthesis, future sim/doc) are instances.  Combinational logic is /not/ here
--- — it stays pure 'Signal' ops; only state and cross-domain wiring need the
--- monad.  Feedback (@rec q <- register i (step q)@) relies on 'MonadFix'.
-class (Monad m, MonadFix m) => Hdl m where
+-- | The fundamental HDL operations, abstract over both the signal interpreter
+-- @s@ ('Signal') and the monad @m@ (the fundep @m -> s@ pairs them per backend).
+-- Backends — the synthesis netlist instance below, future vhdl/verilog/sim — are
+-- instances; design code is written @(Signal s, Hdl s m) => …@ and runs through
+-- whichever it is interpreted by.  Combinational logic is /not/ here — it stays
+-- pure 'Signal' ops; only state and cross-domain wiring need the monad.  Feedback
+-- (@rec q <- register i (step q)@) relies on 'MonadFix'.
+class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -> s where
     -- | A clocked register: reset value, next-state signal → current value.
-    register     :: (HdlType a, KnownDom dom) => a -> Sig dom a -> m (Sig dom a)
+    register     :: (HdlType a, KnownDom dom) => a -> s dom a -> m (s dom a)
     -- | A register with a write-enable (the enable-high case is 'register').
-    registerEn   :: (HdlType a, KnownDom dom) => a -> Sig dom Bool -> Sig dom a -> m (Sig dom a)
+    registerEn   :: (HdlType a, KnownDom dom) => a -> s dom Bool -> s dom a -> m (s dom a)
     -- | The cross-domain "just connect it" escape hatch — for CDC code only.
-    forceConnect :: Sig d1 a -> m (Sig d2 a)
+    forceConnect :: s d1 a -> m (s d2 a)
     -- | Decoded assignment: select a branch by exact match on the selector,
     -- else the default.  Branches are monadic (all elaborate; the case selects
     -- their outputs).  Lowers to a mux chain today; a real VHDL @case@ later.
     caseOf       :: (HdlType sel, HdlType a, KnownDom dom)
-                 => Sig dom sel
-                 -> m (Sig dom a)               -- ^ default (@when others@)
-                 -> Map sel (m (Sig dom a))     -- ^ branches (label → result)
-                 -> m (Sig dom a)
+                 => s dom sel
+                 -> m (s dom a)               -- ^ default (@when others@)
+                 -> Map sel (m (s dom a))     -- ^ branches (label → result)
+                 -> m (s dom a)
     -- | Like 'caseOf' but keyed by inclusive @(lo, hi)@ ranges (discrete/ordered
     -- selector).  Overlap between distinct ranges is the caller's responsibility
     -- (VHDL forbids overlapping choices); lowers to range-compare muxes today.
     caseRange    :: (HdlType sel, HdlOrd sel, HdlType a, KnownDom dom)
-                 => Sig dom sel
-                 -> m (Sig dom a)                   -- ^ default (@when others@)
-                 -> Map (sel, sel) (m (Sig dom a))  -- ^ branches (inclusive lo..hi → result)
-                 -> m (Sig dom a)
+                 => s dom sel
+                 -> m (s dom a)                   -- ^ default (@when others@)
+                 -> Map (sel, sel) (m (s dom a))  -- ^ branches (inclusive lo..hi → result)
+                 -> m (s dom a)
 
 -- ---------------------------------------------------------------------------
--- HDL — the concrete synthesis instance (over NetM)
+-- Netlist instance — NetM (builds a NetNode netlist) is the netlist backend's
+-- concrete Hdl instance, paired with Sig (its concrete Signal).  vhdl/verilog/
+-- sim are sibling instances.  There is no concrete "HDL" type.
 -- ---------------------------------------------------------------------------
 
--- | The synthesis HDL monad.  @i@/@o@ are the entity interface (phantom here;
--- the 'HdlIO' entity layer reads them).  A true monad over the netlist builder.
-newtype HDL (i :: Type) (o :: Type) a = HDL { runHdl :: NetM a }
-    deriving newtype (Functor, Applicative, Monad, MonadFix)
-
-instance Hdl (HDL i o) where
-    register   initVal       = HDL . regNet initVal Nothing
-    registerEn initVal en inp = HDL (regNet initVal (Just en) inp)
-    forceConnect s            = HDL (pure (retypeDom s))
+instance Hdl Sig NetM where
+    register   initVal       = regNet initVal Nothing
+    registerEn initVal en inp = regNet initVal (Just en) inp
+    forceConnect s            = pure (retypeDom s)
     caseOf sel dflt branches  = do
         d <- dflt
         foldrM step d (Map.toList branches)

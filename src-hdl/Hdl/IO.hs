@@ -9,7 +9,6 @@ module Hdl.IO
 import Prelude
 
 import Hdl.Net    (NetM)
-import Hdl.Monad  (HDL)
 import Hdl.Entity (Entity, PortRef)
 import qualified Hdl.Entity as E
 import Hdl.Class  (instEntity)
@@ -19,7 +18,7 @@ import Hdl.Class  (instEntity)
 -- design.  Both interfaces are 'PortRef' records (port names from fields).
 class HdlIO h where
     -- | Build an entity from a name and its body.
-    bind   :: String -> (i -> HDL i o o) -> h i o
+    bind   :: String -> (i -> NetM o) -> h i o
     -- | Instantiate an entity as a named sub-instance, wiring inputs → outputs.
     entity :: (PortRef i, PortRef o) => String -> h i o -> i -> NetM o
 
