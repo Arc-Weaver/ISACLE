@@ -5,8 +5,8 @@ module Hdl.Class
       -- * Primitive circuit operations
     , regS
     , regEnS
-    , ramS
-    , romS
+    , ram
+    , rom
     , inputS
     , outputS
       -- * Optional wire naming
@@ -113,7 +113,7 @@ named hint sig = do
 
 -- | Synchronous-write / asynchronous-read block RAM.
 -- Emits a single 'NMem' node; all ports are materialized immediately.
-ramS :: forall dom a addr.
+ram :: forall dom a addr.
         (HdlType a, KnownDom dom)
      => Int            -- ^ number of entries
      -> [Integer]      -- ^ initial contents (padded with 0)
@@ -122,7 +122,7 @@ ramS :: forall dom a addr.
      -> Sig dom a      -- ^ write data
      -> Sig dom Bool   -- ^ write enable
      -> NetM (Sig dom a)
-ramS size initVals rdAddr wrAddr wrData wrEn = do
+ram size initVals rdAddr wrAddr wrData wrEn = do
     outWid <- freshWire
     rdA    <- materialize rdAddr
     wrA    <- materialize wrAddr
@@ -135,13 +135,13 @@ ramS size initVals rdAddr wrAddr wrData wrEn = do
 
 -- | Purely combinational ROM lookup.
 -- Emits a single 'NRom' node.
-romS :: forall dom a addr.
+rom :: forall dom a addr.
         HdlType a
      => Int            -- ^ number of entries
      -> [Integer]      -- ^ ROM contents (padded with 0)
      -> Sig dom addr   -- ^ read address
      -> NetM (Sig dom a)
-romS size initVals rdAddr = do
+rom size initVals rdAddr = do
     outWid <- freshWire
     rdA    <- materialize rdAddr
     let datW = fromIntegral (natVal (Proxy @(Width a)))

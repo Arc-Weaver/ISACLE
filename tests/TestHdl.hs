@@ -207,7 +207,7 @@ testRam = do
             wrAddr <- inputS @Clk @(Unsigned 5) "wr_addr"
             wrData <- inputS @Clk @(Unsigned 8) "wr_data"
             wrEn   <- inputS @Clk @Bool         "wr_en"
-            rdData <- ramS @Clk @(Unsigned 8) 32 [] rdAddr wrAddr wrData wrEn
+            rdData <- ram @Clk @(Unsigned 8) 32 [] rdAddr wrAddr wrData wrEn
             outputS @Clk @(Unsigned 8) "rd_data" rdData
         vhdl = emitVhdl Map.empty "ram32x8" nodes
     assert "ram: exactly 1 NMem node"         (countNodes isMem nodes == 1)
@@ -228,7 +228,7 @@ testRom = do
     let contents = [0..15] :: [Integer]
         nodes = execNetM $ do
             addr <- inputS @Clk @(Unsigned 4) "addr"
-            dout <- romS @Clk @(Unsigned 8) 16 contents addr
+            dout <- rom @Clk @(Unsigned 8) 16 contents addr
             outputS @Clk @(Unsigned 8) "dout" dout
         vhdl = emitVhdl Map.empty "rom16x8" nodes
     assert "rom: exactly 1 NRom node"    (countNodes isRom nodes == 1)

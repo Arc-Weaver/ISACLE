@@ -94,7 +94,7 @@ data RamPorts = RamPorts
 regFile32x8 :: Entity RamPorts (Sig SysClk (Unsigned 8))
 regFile32x8 = entity "reg_file_32x8" (hdl go)
   where
-    go RamPorts{..} = ramS 32 [] rdAddr wrAddr wrData wrEn
+    go RamPorts{..} = ram 32 [] rdAddr wrAddr wrData wrEn
 
 -- ---------------------------------------------------------------------------
 -- 6. ROM lookup table: 4-bit address → 8-bit sine approximation
@@ -103,7 +103,7 @@ regFile32x8 = entity "reg_file_32x8" (hdl go)
 sineLut :: Entity (Sig SysClk (Unsigned 4)) (Sig SysClk (Unsigned 8))
 sineLut = entity "sine_lut" (hdl go)
   where
-    go phase = romS 16 table phase
+    go phase = rom 16 table phase
     table = [0, 50, 98, 142, 180, 210, 233, 246, 255,
              246, 233, 210, 180, 142, 98, 50]
 

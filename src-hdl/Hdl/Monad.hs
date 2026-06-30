@@ -35,8 +35,8 @@ import qualified Data.Map.Strict as Map
 
 import Hdl.Net   (NetM, freshWire, emit, defer, hintWire,
                   NetNode(NReg), SomeBits(..))
-import Hdl.Types (Sig(..), Signal(sigLitW), materialize, mux, (.==.),
-                  HdlType(..), KnownDom(..))
+import Hdl.Types (Sig(..), Signal(sigLitW), materialize, mux, (.==.), (.<.),
+                  sigNot, (.&&.), HdlType(..), HdlOrd, KnownDom(..))
 
 -- ---------------------------------------------------------------------------
 -- Named — a representation-identical marker on the value type
@@ -92,6 +92,14 @@ class (Monad m, MonadFix m) => Hdl m where
                  -> m (Sig dom a)               -- ^ default (@when others@)
                  -> Map sel (m (Sig dom a))     -- ^ branches (label → result)
                  -> m (Sig dom a)
+    -- | Like 'caseOf' but keyed by inclusive @(lo, hi)@ ranges (discrete/ordered
+    -- selector).  Overlap between distinct ranges is the caller's responsibility
+    -- (VHDL forbids overlapping choices); lowers to range-compare muxes today.
+    caseRange    :: (HdlType sel, HdlOrd sel, HdlType a, KnownDom dom)
+                 => Sig dom sel
+                 -> m (Sig dom a)                   -- ^ default (@when others@)
+                 -> Map (sel, sel) (m (Sig dom a))  -- ^ branches (inclusive lo..hi → result)
+                 -> m (Sig dom a)
 
 -- ---------------------------------------------------------------------------
 -- HDL — the concrete synthesis instance (over NetM)
@@ -113,6 +121,14 @@ instance Hdl (HDL i o) where
         step (k, mb) acc = do
             b <- mb
             pure (mux (sel .==. litOf k) b acc)
+    caseRange sel dflt branches = do
+        d <- dflt
+        foldrM step d (Map.toList branches)
+      where
+        step ((lo, hi), mb) acc = do
+            b <- mb
+            let inRange = sigNot (sel .<. litOf lo) .&&. sigNot (litOf hi .<. sel)
+            pure (mux inRange b acc)
 
 -- | Reimplemented register primitive (deferred 'NReg' emission so @mdo@ feedback
 -- is safe), independent of the legacy "Hdl.Class".
