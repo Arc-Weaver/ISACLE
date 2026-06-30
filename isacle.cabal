@@ -69,6 +69,7 @@ library isacle-hdl
     Hdl.Class
     Hdl.Emit.Vhdl
     Hdl.Entity
+    Hdl.IO
     Hdl.Monad
     Hdl.Net
     Hdl.Prim
