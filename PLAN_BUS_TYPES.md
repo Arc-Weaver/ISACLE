@@ -166,8 +166,65 @@ Width bridge, stall bridge (`stallAdapter`), and **CDC** (`domA → domB`) are e
 child. Domain mismatch is a `dom ~ dom'` failure unless routed through a CDC node.
 Bake the `dom` parameter + crossing-node signatures in now; implement later.
 
+## The HDL layer (`Hdl` / `HdlIO` / backends)
+
+The bus nodes above sit on a layered HDL substrate, all typeclasses; concrete
+monads are only *instances*. Layering: `HdlType` (bits → VHDL/Verilog) → `Hdl m`
+(monad) → `HdlIO` (entities) → `SysDSL` (buses/CPU/IRQ/clocks). In progress on
+`docs/fundamentals-alignment`; core committed (`Hdl.Monad`, `06c543c`).
+
+**`Hdl m` — the monad typeclass (minimal primitives only).**
+```haskell
+class (Monad m, MonadFix m) => Hdl m where   -- MonadFix = the backward/feedback wire
+  register     :: (HdlType a, KnownDom dom) => a -> Sig dom a -> m (Sig dom a)   -- the ONE state primitive
+  registerEn   :: (HdlType a, KnownDom dom) => a -> Sig dom Bool -> Sig dom a -> m (Sig dom a)
+  forceConnect :: Sig d1 a -> m (Sig d2 a)                                       -- cross-domain escape (CDC only)
+  caseOf       :: (HdlType sel, HdlType a, KnownDom dom)                         -- exact-match decode (mux today, real `case` later)
+               => Sig dom sel -> m (Sig dom a) -> Map sel (m (Sig dom a)) -> m (Sig dom a)
+  -- caseRange (ordered, (lo,hi) keys, overlap-checked at emit) — sibling of caseOf
+```
+Combinational logic stays *pure* `Signal`/`Sig` ops (not in the class). FSMs/CPU
+ISAs are *lowerings onto* these primitives (`rec s <- register i0 (caseOf s …)`),
+not new methods — `MonadALU`/`ISA` already proves this for CPUs.
+
+**`Named` + naming** (kills bare `wN`): `Named a` is a representation-identical
+marker on the *value* type. `name :: String -> Sig dom a -> Sig dom (Named a)`
+(attach, outputs); `erase :: Hdl m => Sig dom (Named a) -> (Sig dom a -> m r) -> m r`
+(scoped strip, inputs — the name seeds a scope for derived logic).
+
+**`HdlIO` — the entity typeclass (methods, instanced per backend).**
+```haskell
+bind     :: (Named a, Named b) => String -> (a -> m b) -> h a b   -- we generate the body
+foreign_ :: (Named a, Named b) => String -> [Generic] -> ForeignSrc -> h a b  -- body is external VHDL/Verilog
+withSim  :: (a -> m b) -> h a b -> h a b                          -- optional Haskell sim model for a foreign block
+entity   :: h i o -> i -> m o                                     -- instantiate any of them, uniformly
+```
+Interfaces are `Named` records (derived); `bind` erases the input bundle for the
+plain-signal body and re-`name`s the outputs. Black-box/OEM primitives:
+
+```haskell
+data ForeignSrc = Referenced [Import]          -- emit these library/use clauses (user- or us-authored)
+                | Vendored   FilePath [Import]  -- ship the file into the fileset + emit its clauses
+```
+Provenance: user-library refs → user supplies the imports; manufacturer prims →
+we bake the imports into the shipped declaration; our-backend-library VHDL → we
+vendor the file. A foreign block is **opaque in sim** (drives `X`) unless
+`withSim` attaches a model. Generics ride as a `[Generic]` → the generic map.
+
+**Backends are just instances.** Synthesis (the `NetM`-based `newtype HDL i o a`)
+is one `Hdl`/`HdlIO` instance; sim, vhdl, verilog are siblings — none privileged.
+
+**Helpers, not primitives.** `ram`/`rom`, `name`/`erase`, scope: free functions
+over the monad (memory hides its IR inside the helper) — *not* `Hdl` methods.
+
+**Output is a fileset/manifest**, not a single `.vhd`: generated entities + the
+union of import clauses + any vendored files.
+
 ## Sequencing
 
+0. **HDL layer** (underway): add `HdlIO` (`bind`/`foreign_`/`withSim`/`entity`) +
+   `ram`/`rom` helpers; drop `ramS`/`romS` (→ helpers); convert `Hdl.Entity` onto
+   the monad; ripple entity bodies + consumers; verify. Then ↓ builds on it.
 1. **Types/API** (this doc): `Bus proto dom addrW dataW`, capability classes,
    `newX :: inputs -> (outputs, node)`, the `Layout` algebra + `layout` pass.
 2. **Stall**: `StallingBus` instances whose method muxes the selected child's
