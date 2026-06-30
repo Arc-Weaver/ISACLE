@@ -5,23 +5,28 @@ module Main where
 
 import Prelude
 import Hdl.Net
+import Hdl.Types (Sig(..), materialize)
+import Hdl.Monad ()            -- the Hdl Sig NetM instance (provides 'named')
 import Hdl.Bits (Unsigned)
 import Isacle.ISA.IR
 import Isacle.ISA.Backend.Lower
 
-dom :: DomId
-dom = DomId "sys" 1 Rising ActiveHigh "rst"
+domVal :: DomId
+domVal = DomId "sys" 1 Rising ActiveHigh "rst"
 
--- A stub lowering context: leaves become named input wires.
-ctx :: LowerCtx
+-- A stub lowering context: each leaf becomes a fresh named input signal.
+ctx :: LowerCtx Sig ()
 ctx = LowerCtx
-    { lcReadReg   = \_ -> do { w <- freshWire; emit (NInput w "r"  16 dom); pure w }
-    , lcField     = \_ -> do { w <- freshWire; emit (NInput w "f"  16 dom); pure w }
-    , lcReadRes   = \_ -> do { w <- freshWire; emit (NInput w "rd" 16 dom); pure w }
-    , lcReadFlag  = \_ -> do { w <- freshWire; emit (NInput w "fl" 1  dom); pure w }
-    , lcIrqVector = do { w <- freshWire; emit (NInput w "iv" 16 dom); pure w }
+    { lcReadReg   = \_ -> inS "r"  16
+    , lcField     = \_ -> inS "f"  16
+    , lcReadRes   = \_ -> inS "rd" 16
+    , lcReadFlag  = \_ -> inS "fl" 1
+    , lcIrqVector = inS "iv" 16
     , lcMnemonic  = Just "RCALL"
     }
+  where
+    inS :: String -> Int -> Sig () ()
+    inS nm w = SExpr (do { wid <- freshWire; emit (NInput wid nm w domVal); pure wid })
 
 main :: IO ()
 main = do
@@ -31,6 +36,6 @@ main = do
         ret = INamed "ret" (pc + 1)
         d   = IField (FieldRef "k") :: IExpr (Unsigned 16)
         top = (ret - sp) + d
-    let (_, nodes, _) = runNetM (lowerExpr_ ctx top)
+    let (_, nodes, _) = runNetM (lowerExpr_ ctx top >>= materialize)
     putStrLn "== naming injection + following =="
     mapM_ putStrLn [ "  w" ++ show w ++ " => " ++ n | NHint w n <- nodes ]
