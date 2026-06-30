@@ -57,6 +57,7 @@ module Isacle.System.SystemDSL
     ) where
 
 import Prelude
+import Data.Kind (Type)
 import Data.Word (Word32)
 import Control.Monad (forM, forM_, replicateM, zipWithM_)
 import Control.Monad.Trans.State.Strict
@@ -358,7 +359,7 @@ createSimpleVectorIrq _sources = pure $
 --
 -- The CPU address width (@addrW@) may differ from the bus address width
 -- (always 32-bit); a zero-extend resize is inserted automatically.
-createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
+createHarvardCPU :: forall addrW codeWordW codeAddrW (dom :: Type) dat alu.
               ( KnownDom dom
               , KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW
               , addrW <= 32

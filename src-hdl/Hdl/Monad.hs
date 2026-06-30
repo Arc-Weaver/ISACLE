@@ -105,18 +105,21 @@ class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -
                  -> Map (sel, sel) (m (s dom a))  -- ^ branches (inclusive lo..hi → result)
                  -> m (s dom a)
     -- | A register bank: an array-valued clocked register (one field of a named
-    -- record group, e.g. @cpu_state.GPR@) with @count@ entries.  Each write port
-    -- is an indexed, enabled assignment @bank(idx) <= data@; several ports may
-    -- fire in one cycle (e.g. MUL writing R0 and R1).  A bank of flip-flops, not
-    -- block RAM.  Reads are combinational ('regBankRead').
-    regBank      :: (HdlType a, KnownDom dom)
+    -- record group, e.g. @cpu_state.GPR@) with @count@ entries of @width@ bits.
+    -- Each write port is an indexed, enabled assignment @bank(idx) <= data@;
+    -- several ports may fire in one cycle (e.g. MUL writing R0 and R1).  A bank
+    -- of flip-flops, not block RAM.  Reads are combinational ('regBankRead').
+    -- The entry @width@ is a runtime 'Int' (the bank is structural, type-erased
+    -- bits) — like 'sigLitW'.
+    regBank      :: KnownDom dom
                  => String                              -- ^ record group name
                  -> String                              -- ^ array field name
                  -> Int                                 -- ^ entry count
+                 -> Int                                 -- ^ entry width (bits)
                  -> [(s dom idx, s dom a, s dom Bool)]  -- ^ (index, data, enable) ports
                  -> m ()
     -- | Combinational indexed read of a 'regBank' field: @bank(idx)@.
-    regBankRead  :: (HdlType a, KnownDom dom)
+    regBankRead  :: KnownDom dom
                  => String -> String -> Int -> s dom idx -> m (s dom a)
 
 -- ---------------------------------------------------------------------------
@@ -144,7 +147,7 @@ instance Hdl Sig NetM where
             b <- mb
             let inRange = sigNot (sel .<. litOf lo) .&&. sigNot (litOf hi .<. sel)
             pure (mux inRange b acc)
-    regBank group field count ports = regBankNet group field count ports
+    regBank = regBankNet
     regBankRead group field count addr =
         pure $ SExpr $ do
             addrW <- materialize addr
@@ -154,15 +157,14 @@ instance Hdl Sig NetM where
 
 -- | Register-bank emission (deferred 'NRegFile' so feedback is safe): each port
 -- materialises its (index, data, enable) wires inside the deferred action.
-regBankNet :: forall dom a idx. (HdlType a, KnownDom dom)
-           => String -> String -> Int
+regBankNet :: forall dom a idx. KnownDom dom
+           => String -> String -> Int -> Int
            -> [(Sig dom idx, Sig dom a, Sig dom Bool)]
            -> NetM ()
-regBankNet group field count ports = defer $ do
+regBankNet group field count width ports = defer $ do
     wports <- mapM (\(i, d, e) -> (,,) <$> materialize i <*> materialize d <*> materialize e)
                    ports
-    let width   = fromIntegral (natVal (Proxy @(Width a)))
-        domInfo = domId (Proxy @dom)
+    let domInfo = domId (Proxy @dom)
     emit $ NRegFile group field count width wports domInfo
 
 -- | Reimplemented register primitive (deferred 'NReg' emission so @mdo@ feedback

@@ -1,5 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE KindSignatures #-}
 -- | CPU-level synthesis: adjoins a 'CPUDef' with a 'ISADef' to produce a
 -- complete Harvard-architecture decode-execute circuit in the 'NetM' IR.
 --
@@ -40,6 +41,7 @@ module Isacle.ISA.Backend.SynthCPU
     ) where
 
 import Prelude hiding (Word)
+import Data.Kind (Type)
 import Data.List (foldl', nub)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
@@ -50,7 +52,8 @@ import GHC.TypeLits (natVal)
 import Hdl.Bits
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..))
+import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Monad (regBank)
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.Def
@@ -87,7 +90,7 @@ data CpuMemIface = CpuMemIface
 --   * @dmemRdDataW@ — read data from data memory
 --   * @cmemRdDataW@ — read data from code memory (LPM; stub OK)
 -- Returns 'CpuMemIface' with all interface wire IDs and their widths.
-synthHarvardCPU' :: forall dom wordW addrW codeWordW codeAddrW alu.
+synthHarvardCPU' :: forall (dom :: Type) wordW addrW codeWordW codeAddrW alu.
                     ( KnownDom dom
                     , KnownNat wordW, KnownNat addrW
                     , KnownNat codeWordW, KnownNat codeAddrW )
@@ -351,8 +354,12 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
                 enW  <- andGate en0 (esCommit sq)
                 return (idxW, mwDataWire mw, enW)
 
-        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth
-                          (instrWrites ++ aliasWrites) domInfo
+        -- The bank is a clocked array register in cpu_state; each write port is
+        -- an independent indexed assignment.  Emitted via the typed 'regBank'
+        -- Hdl primitive (wires wrapped as 'SWire'; entry value type is erased).
+        regBank "cpu_state" rfname rfCount rfWidth
+            ([ (SWire a, SWire d, SWire e) | (a, d, e) <- instrWrites ++ aliasWrites ]
+               :: [(Sig dom (), Sig dom (), Sig dom Bool)])
 
         -- Per-instruction reads for this rf, preserving slot order within each
         -- instruction.  Slot k = the k-th readReg call on rfname; each slot is an
@@ -574,7 +581,7 @@ synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId =
 -- | Standalone wrapper: synthesises the CPU with all memory interface signals
 -- exposed as top-level input/output ports.  Suitable for unit testing the CPU
 -- in isolation.  For SoC integration use 'synthHarvardCPU'' instead.
-synthHarvardCPU :: forall dom wordW addrW codeWordW codeAddrW alu.
+synthHarvardCPU :: forall (dom :: Type) wordW addrW codeWordW codeAddrW alu.
                    ( KnownDom dom
                    , KnownNat wordW, KnownNat addrW
                    , KnownNat codeWordW, KnownNat codeAddrW )
