@@ -59,16 +59,17 @@ module Isacle.System.SystemDSL
 import Prelude
 import Data.Kind (Type)
 import Data.Word (Word32)
-import Control.Monad (replicateM)
-import Data.List (zip4)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
 import Data.Proxy (Proxy(..))
+import GHC.Generics (Generic)
 import GHC.TypeLits (natVal, KnownNat, type (<=))
 
 import Hdl.Net
 import Hdl.Types
 import Hdl.Prim (Unsigned)
+import Hdl.Entity (PortRef, Entity)
+import Hdl.IO (bind, entity)
 import Hdl.Class (outputS, connectSig, freshSig)
 import Isacle.System.Periph
 import Isacle.System.BusHandle (BusHandle(..))
@@ -160,27 +161,36 @@ runSystemDSL (SysDSL st) = (a, nodes, doc)
 -- BusDSL monad
 -- ---------------------------------------------------------------------------
 
--- | Internal record for one peripheral slot inside a bus.  The peripheral logic
--- is built purely (typed 'Sig' signals) at 'attachPeripheral' time from the bus
--- request supplied via the knot ('bdsReqFeed'); 'psRun' only /materialises/ it.
+-- | The slave-side bus port a peripheral entity exposes (input bundle): the
+-- broadcast master request, which the peripheral decodes for itself.  A 'PortRef'
+-- record, so 'bind'/'entity' name the sub-entity's ports from these fields.
+data SlavePort dom dat = SlavePort
+    { spReq   :: Sig dom Bool
+    , spWe    :: Sig dom Bool
+    , spAddr  :: Sig dom (Unsigned 32)
+    , spWData :: Sig dom dat
+    } deriving (Generic)
+
+deriving instance (KnownDom dom, HdlType dat) => HdlPorts (SlavePort dom dat)
+deriving instance (KnownDom dom, HdlType dat) => PortRef  (SlavePort dom dat)
+
+-- | Internal record for one peripheral slot inside a bus.  The peripheral is
+-- instantiated as its own sub-entity (via 'bind'/'entity') at 'attachPeripheral'
+-- time; the slot just records the slave response it drives for the bus read mux.
 data PeriphSlot dom dat = PeriphSlot
     { psName :: String
     , psBase :: Word32
     , psSize :: Word32      -- address window in bytes
     , psSpec :: PeriphSpec
-    , psRun  :: NetM (SlaveResp Sig dom dat)
-      -- ^ Materialise the peripheral at the system level: promote its physical
-      -- outputs to top-level ports and return its slave response (read data +
-      -- stall) for the bus read mux.  The peripheral's bus request was already
-      -- captured (knot-tied) when the slot was built — 'psRun' takes no argument.
+    , psResp :: SlaveResp Sig dom dat
     }
 
 data BusDSLState dom dat = BusDSLState
-    { bdsPeriph  :: [PeriphEntry]
-    , bdsSlots   :: [PeriphSlot dom dat]
-    , bdsReqFeed :: [MasterReq Sig dom (Unsigned 32) dat]
-      -- ^ Per-slot bus requests, supplied lazily by 'createBus' via the knot;
-      -- 'attachPeripheral' indexes this by slot position.
+    { bdsPeriph :: [PeriphEntry]
+    , bdsSlots  :: [PeriphSlot dom dat]
+    , bdsMaster :: MasterReq Sig dom (Unsigned 32) dat
+      -- ^ The bus master's request, broadcast to every peripheral (each decodes
+      -- its own address window via 'busPortIface').
     }
 
 -- | Bus sub-monad; execute 'attachPeripheral' calls inside 'createBus'.
@@ -200,72 +210,49 @@ newtype BusDSL dom dat a = BusDSL (StateT (BusDSLState dom dat) NetM a)
 -- @
 attachPeripheral
     :: forall p dom dat a.
-       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), HdlPhys a, HdlPorts a)
+       ( KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat)
+       , HdlPhys a, HdlPorts a, PortRef a )
     => Word32
     -> PeriphToken p dom dat a
     -> BusDSL dom dat a
 attachPeripheral base token = BusDSL $ do
     st <- get
-    -- This slot's bus request (req/we/addr/wdata), supplied by createBus's knot.
-    let idx   = length (bdsSlots st)
-        myReq = bdsReqFeed st !! idx
-        nm    = ptName token
-        -- Spec pass (pure, no emission): only the register-field metadata, which
+    let master = bdsMaster st       -- broadcast: the peripheral decodes its window
+        nm     = ptName token
+        -- Spec (pure, no emission): only the register-field metadata, which
         -- doesn't depend on the request values.
-        specBus = busPortIface (mqReq myReq) (mqWe myReq)
-                               (mqAddr myReq) (mqWData myReq) base
+        specBus = busPortIface (mqReq master) (mqWe master)
+                               (mqAddr master) (mqWData master) base
         (_, _, spec) = runPeriphDef hdlOps specBus (ptDef token)
         size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
         entry = PeriphEntry { peName = nm, peBase = base, peSpec = spec }
-        specs = portSpecs (Proxy @a)
-        -- @<instance>_<port>@, e.g. @gpio0_GpioPhys_gpioPort@.
-        physNames  = [ nm ++ "_" ++ portName ps | ps <- specs ]
-        physWidths = map portWidth specs
-        nPhys      = physOutCount (Proxy @a)
+        -- Top-level names for the physical outputs: @<instance>_<port>@.
+        physNames = [ nm ++ "_" ++ portName ps | ps <- portSpecs (Proxy @a) ]
+        -- The peripheral's behaviour as a sub-entity body: decode the bus port,
+        -- return its read-data signal and physical-output bundle.
+        body :: SlavePort dom dat -> NetM (Sig dom dat, a)
+        body sp =
+            let busP = busPortIface (spReq sp) (spWe sp) (spAddr sp) (spWData sp) base
+                (phys, rd, _) = runPeriphDef hdlOps busP (ptDef token)
+            in pure (rd, phys)
 
-    -- Pre-allocate the physical-output wires the user receives now (driven later,
-    -- when 'createBus' instantiates the peripheral sub-entity via 'psRun').
-    physWires <- lift $ replicateM nPhys freshWire
+    -- Instantiate the peripheral as its own named sub-entity (e.g. "gpio0" →
+    -- gpio0.vhd) with the entity tooling; the broadcast master drives its ports.
+    (rd, phys) <- lift $ entity nm
+        (bind nm body :: Entity (SlavePort dom dat) (Sig dom dat, a))
+        SlavePort { spReq   = mqReq   master, spWe    = mqWe    master
+                  , spAddr  = mqAddr  master, spWData = mqWData master }
+    -- Promote the peripheral's physical outputs to top-level SoC ports.
+    lift $ emitPhysOuts physNames domInfo datW phys
 
     let slot = PeriphSlot
-            { psName = nm
-            , psBase = base
-            , psSize = size
-            , psSpec = spec
-            , psRun  = do
-                  -- Instantiate the peripheral as its own named sub-entity
-                  -- (e.g. "gpio0" → gpio0.vhd): the bus request drives its input
-                  -- ports; its read-data + physical outputs come back as ports.
-                  reqW <- materialize (mqReq   myReq)
-                  weW  <- materialize (mqWe    myReq)
-                  adW  <- materialize (mqAddr  myReq)
-                  wdW  <- materialize (mqWData myReq)
-                  (_, outPorts) <- inBlock nm nm [reqW, weW, adW, wdW] $ do
-                      reqIn <- freshWire; emit $ NInput reqIn "req"   1   domInfo
-                      weIn  <- freshWire; emit $ NInput weIn  "we"    1   domInfo
-                      adIn  <- freshWire; emit $ NInput adIn  "addr"  32  domInfo
-                      wdIn  <- freshWire; emit $ NInput wdIn  "wdata" datW domInfo
-                      let busP = busPortIface (SWire reqIn) (SWire weIn)
-                                              (SWire adIn) (SWire wdIn) base
-                          (phys, rd, _) = runPeriphDef hdlOps busP (ptDef token)
-                      rdWid <- materialize rd
-                      emit $ NOutput rdWid "rd_data" datW domInfo
-                      emitPhysOuts (map portName specs) domInfo datW phys
-                  case outPorts of
-                      (_, rdActW, _) : physPorts -> do
-                          -- Drive the user's placeholders from the sub-entity's
-                          -- physical outputs, and promote them to top-level ports.
-                          sequence_
-                              [ do { alias pw actW; emit $ NOutput pw pn pwdt domInfo }
-                              | (pw, pn, pwdt, (_, actW, _))
-                                  <- zip4 physWires physNames physWidths physPorts ]
-                          pure SlaveResp { srRData = SWire rdActW, srStall = sigFalse }
-                      [] -> error ("attachPeripheral: " ++ nm ++ " emitted no ports")
+            { psName = nm, psBase = base, psSize = size, psSpec = spec
+            , psResp = SlaveResp { srRData = rd, srStall = sigFalse }
             }
     put st { bdsPeriph = bdsPeriph st ++ [entry]
            , bdsSlots  = bdsSlots  st ++ [slot]
            }
-    pure (fromPhysWires physWires :: a)
+    pure phys
 
   where
     domInfo  = domId   (Proxy @dom)
@@ -306,33 +293,18 @@ createBus busName bh (BusDSL busSt) = SysDSL $ do
             , mqWData = bhWrData bh
             }
 
-    -- Two passes, no feedback knot.  The request routing depends only on the
-    -- master and the static base/size layout (never on the responses), and the
-    -- layout doesn't depend on the request at all — so we discover the layout
-    -- first, route the per-child requests purely, then build the peripherals.
-    (userA, masterResp, periph) <- lift $ do
-        -- Pass 1: layout discovery.  'attachPeripheral' has no netlist effects,
-        -- so building peripherals with a neutral request feed and reading off
-        -- their base/size is pure and side-effect-free.
-        (_, layoutSt) <- runStateT busSt
-            BusDSLState { bdsPeriph = [], bdsSlots = [], bdsReqFeed = repeat master }
-        let layout    = [ (toInteger (psBase s), toInteger (psSize s))
-                        | s <- bdsSlots layoutSt ]
-            -- Route requests via the architecture (responses are never forced by
-            -- request routing — 'synthBus's child request ignores the response).
-            childReqs = snd $ synthBus SimpleBus master
-                            [ (b, s, errResp) | (b, s) <- layout ]
-            errResp   = error "createBus: response unused in request routing"
-        -- Pass 2: real build with the routed requests.
-        (userA, finalSt) <- runStateT busSt
-            BusDSLState { bdsPeriph = [], bdsSlots = [], bdsReqFeed = childReqs }
-        let slots = bdsSlots finalSt
-        -- Materialise each peripheral (promotes phys outputs, yields its response).
-        resps <- mapM psRun slots
-        let children :: [BusChild Sig dom dat]
-            children   = zipWith (\(b, s) r -> (b, s, r)) layout resps
-            masterResp = fst $ synthBus SimpleBus master children
-        pure (userA, masterResp, bdsPeriph finalSt)
+    -- Single pass, no knot.  Each peripheral is instantiated as its own
+    -- sub-entity by 'attachPeripheral' (broadcast master in, response out); the
+    -- bus read mux just selects the addressed child's read data by window.  No
+    -- feedback: the master is built from the handle's write/read-address signals,
+    -- and the aggregated read data flows back to a distinct handle signal.
+    (userA, finalSt) <- lift $ runStateT busSt
+        BusDSLState { bdsPeriph = [], bdsSlots = [], bdsMaster = master }
+    let children :: [BusChild Sig dom dat]
+        children   = [ (toInteger (psBase s), toInteger (psSize s), psResp s)
+                     | s <- bdsSlots finalSt ]
+        masterResp = fst $ synthBus SimpleBus master children
+        periph     = bdsPeriph finalSt
 
     -- Feed the aggregated read data and stall back into the master handle.
     lift $ connectSig (bhRdData bh) (srRData masterResp)

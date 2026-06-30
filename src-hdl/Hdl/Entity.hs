@@ -105,6 +105,9 @@ class HdlPorts a => PortRef a where
     default portNames :: (Generic a, PortLabels (Rep a)) => Proxy a -> [String]
     portNames _ = portLabels @(Rep a)
 
+instance PortRef () where
+    portNames _ = []
+
 instance (HdlType a, KnownDom dom) => PortRef (Sig dom a) where
     portNames _ = ["p"]
 
