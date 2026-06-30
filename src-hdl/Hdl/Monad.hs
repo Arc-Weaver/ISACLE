@@ -86,6 +86,17 @@ class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -
     register     :: (HdlType a, KnownDom dom) => a -> s dom a -> m (s dom a)
     -- | A register with a write-enable (the enable-high case is 'register').
     registerEn   :: (HdlType a, KnownDom dom) => a -> s dom Bool -> s dom a -> m (s dom a)
+    -- | A write-enabled register over a /runtime/ width and raw init bits — the
+    -- type-erased dual of 'registerEn' (as 'regBank' is to a register file).  For
+    -- "just bits" state (CPU scalar registers, sequencer counters/latches) whose
+    -- width is known only at value level.  Emission is deferred so @mdo@ feedback
+    -- (output → arbiter → next) is safe.
+    registerW    :: KnownDom dom
+                 => Int          -- ^ width (bits)
+                 -> Integer      -- ^ reset value (raw bits)
+                 -> s dom Bool   -- ^ write enable
+                 -> s dom a      -- ^ next value
+                 -> m (s dom a)
     -- | The cross-domain "just connect it" escape hatch — for CDC code only.
     forceConnect :: s d1 a -> m (s d2 a)
     -- | Decoded assignment: select a branch by exact match on the selector,
@@ -137,6 +148,7 @@ class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -
 instance Hdl Sig NetM where
     register   initVal       = regNet initVal Nothing
     registerEn initVal en inp = regNet initVal (Just en) inp
+    registerW                  = regNetW
     forceConnect s            = pure (retypeDom s)
     caseOf sel dflt branches  = do
         d <- dflt
@@ -191,6 +203,18 @@ regNet initVal mEn inp = do
         inWid <- materialize inp
         mEnW  <- traverse materialize mEn
         emit $ NReg outWid inWid mEnW initBits domInfo
+    pure (SWire outWid)
+
+-- | Runtime-width register (deferred 'NReg'): the type-erased dual of 'regNet'.
+regNetW :: forall dom a. KnownDom dom
+        => Int -> Integer -> Sig dom Bool -> Sig dom a -> NetM (Sig dom a)
+regNetW width initBits en inp = do
+    outWid <- freshWire
+    let domInfo = domId (Proxy @dom)
+    defer $ do
+        inWid <- materialize inp
+        enWid <- materialize en
+        emit $ NReg outWid inWid (Just enWid) (SomeBits initBits width) domInfo
     pure (SWire outWid)
 
 -- | A literal signal of a selector label.

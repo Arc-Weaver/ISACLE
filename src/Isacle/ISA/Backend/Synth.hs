@@ -46,7 +46,7 @@ import Isacle.ISA.Backend.Lower
 
 -- | Register-file (indexed) write request — guarded by 'rwMatchWire'.
 data RegWriteReq s dom = RegWriteReq
-    { rwMatchWire :: s dom ()
+    { rwMatchWire :: s dom Bool
     , rwRfName    :: String
     , rwIdxWire   :: s dom ()
     , rwDataWire  :: s dom ()
@@ -54,7 +54,7 @@ data RegWriteReq s dom = RegWriteReq
 
 -- | Scalar-register write request (PC, SP, …) — guarded by 'swMatchWire'.
 data ScalarWriteReq s dom = ScalarWriteReq
-    { swMatchWire :: s dom ()
+    { swMatchWire :: s dom Bool
     , swRegName   :: String
     , swDataWire  :: s dom ()
     }
@@ -68,7 +68,7 @@ data RegReadReq s dom = RegReadReq
 
 -- | Data-memory write request.
 data MemWriteReq s dom = MemWriteReq
-    { mwMatchWire :: s dom ()
+    { mwMatchWire :: s dom Bool
     , mwAddrWire  :: s dom ()
     , mwDataWire  :: s dom ()
     }
@@ -77,7 +77,7 @@ data MemWriteReq s dom = MemWriteReq
 -- for the read result; the CPU sequencer produces it from 'mrBusWire' (the bus,
 -- directly for a single read, or via a per-cycle select + holding latch).
 data MemReadReq s dom = MemReadReq
-    { mrMatchWire  :: s dom ()
+    { mrMatchWire  :: s dom Bool
     , mrAddrWire   :: s dom ()
     , mrBusWire    :: s dom ()
     , mrResultWire :: s dom ()
@@ -85,7 +85,7 @@ data MemReadReq s dom = MemReadReq
 
 -- | Flag write: set one status-register bit when the instruction fires.
 data FlagWriteReq s dom = FlagWriteReq
-    { fwMatchWire :: s dom ()
+    { fwMatchWire :: s dom Bool
     , fwRegName   :: String
     , fwBitPos    :: Int
     , fwValueWire :: s dom ()
@@ -93,7 +93,7 @@ data FlagWriteReq s dom = FlagWriteReq
 
 -- | All combinational outputs of one instruction.
 data SynthResult s dom = SynthResult
-    { srMatchWire    :: Maybe (s dom ())
+    { srMatchWire    :: Maybe (s dom Bool)
     , srRegWrites    :: [RegWriteReq s dom]
     , srScalarWrites :: [ScalarWriteReq s dom]
     , srRegReads     :: [RegReadReq s dom]
@@ -130,7 +130,7 @@ data RenderCtx s dom = RenderCtx
 -- @mBase@ is the base match condition: 'Nothing' to derive it from the encoding
 -- (normal instructions), or @Just w@ to seed it (e.g. @irq_pending@).
 renderSynth :: forall s m dom. (Hdl s m, Signal s, KnownDom dom)
-            => RenderCtx s dom -> Maybe (s dom ()) -> InstrIR -> m (SynthResult s dom)
+            => RenderCtx s dom -> Maybe (s dom Bool) -> InstrIR -> m (SynthResult s dom)
 renderSynth ctx mBase ir = do
     let instrW = rcInstrWire ctx
         mEnc   = fmap parseEncoding (iirEncoding ir)
@@ -152,6 +152,8 @@ renderSynth ctx mBase ir = do
             (Just e, Just nm) -> named ("match_" ++ nm) (buildMatch e instrW)
             (Just e, Nothing) -> pure (buildMatch e instrW)
             (Nothing, _)      -> pure (sigLitW 1 1)
+    -- Data fallback for missing field/index/read lookups (an undriven 0).
+    let dflt = sigLitW 0 1 :: s dom ()
 
     -- Register-file index signals.  Offset 0 is the raw field; a non-zero offset
     -- (sub-range encoding, e.g. AVR @ldi@ → R16..R31) adds a constant.
@@ -162,7 +164,7 @@ renderSynth ctx mBase ir = do
                                        (sigLitW (fromIntegral off) (rcWordW ctx))
                             pure ((k, sc, off), s)
                         else do
-                            let fw = Map.findWithDefault base k fieldMap
+                            let fw = Map.findWithDefault dflt k fieldMap
                             if sc == 1 && off == 0
                                 then pure ((k, sc, off), fw)
                                 else do
@@ -175,7 +177,7 @@ renderSynth ctx mBase ir = do
                                     pure ((k, sc, off), s))
                    idxKeys
     let idxMap = Map.fromList idxPairs
-        idxWire k sc off = Map.findWithDefault base (k, sc, off) idxMap
+        idxWire k sc off = Map.findWithDefault dflt (k, sc, off) idxMap
 
     -- One register-file read per distinct (file, index field, scale, offset),
     -- resolved inline via 'regBankRead'.
@@ -198,7 +200,7 @@ renderSynth ctx mBase ir = do
     -- first (low) entry least significant.  Pure 'Signal' composition.
     let readView file ew idxs =
             let total = ew * length idxs
-                entrySig idx = Map.findWithDefault base (file, "", 1, idx) regOutMap
+                entrySig idx = Map.findWithDefault dflt (file, "", 1, idx) regOutMap
                 parts = [ let z = sigPrim1 (N.PResize total) (entrySig idx)
                           in if p == 0 then z
                              else sigPrim2 N.PShiftL z (sigLitW (fromIntegral (p * ew)) total)
@@ -209,12 +211,12 @@ renderSynth ctx mBase ir = do
         lctx = LowerCtx
             { lcReadReg = \ref -> case ref of
                   RegScalar n                    -> rcReadScalar ctx n
-                  RegFile rf (FieldRef k) sc off -> Map.findWithDefault base (rf, k, sc, off) regOutMap
+                  RegFile rf (FieldRef k) sc off -> Map.findWithDefault dflt (rf, k, sc, off) regOutMap
                   RegEntries file ew idxs        -> readView file ew idxs
-            , lcField     = \(FieldRef k) -> Map.findWithDefault base k fieldMap
+            , lcField     = \(FieldRef k) -> Map.findWithDefault dflt k fieldMap
             , lcReadRes   = readResSig
             , lcReadFlag  = \f -> rcGetFlag ctx (cpuFlagReg f) (cpuFlagBit f)
-            , lcIrqVector = maybe base id (rcIrqVector ctx)
+            , lcIrqVector = maybe dflt id (rcIrqVector ctx)
             , lcMnemonic  = iirMnemonic ir
             }
 
@@ -345,7 +347,7 @@ collectS s = case s of
 -- ---------------------------------------------------------------------------
 
 -- | The combinational instruction-match signal: @(instr AND mask) == value@.
-buildMatch :: Signal s => EncodingInfo -> s dom () -> s dom ()
+buildMatch :: Signal s => EncodingInfo -> s dom () -> s dom Bool
 buildMatch enc instrW =
     sigPrim2 N.PEq
         (sigPrim2 N.PAnd instrW (sigLitW (encMask enc) (encTotalBits enc)))
