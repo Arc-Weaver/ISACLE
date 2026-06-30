@@ -39,7 +39,7 @@ gpioBusSys
     -> SysDSL Clk (Unsigned 8) (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 gpioBusSys gpioIn = do
     gpio <- createGpio "gpio" gpioIn
-    bh <- orphanBusMaster @32 @8
+    bh <- orphanBusMaster
     (port, ddr) <- createBus "databus" bh $ do
         gpio' <- attachPeripheral gpioBase gpio
         return (gpioPort gpio', gpioDdr gpio')
@@ -123,7 +123,7 @@ runBusTests = do
     let rampSys :: SysDSL Clk (Unsigned 8) ()
         rampSys = do
             r  <- createRamp "ramp0" (SExpr (pure 1))
-            bh <- orphanBusMaster @32 @8
+            bh <- orphanBusMaster
             _  <- createBus "rbus" bh (attachPeripheral 0x40 r >> return ())
             return ()
         rampHdr = reduceToCHeader "ramphdr" rampSys

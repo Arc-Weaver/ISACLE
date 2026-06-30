@@ -11,6 +11,9 @@ module Hdl.Class
     , outputS
       -- * Optional wire naming
     , named
+      -- * Forward-declared signals (typed alias for feedback wiring)
+    , freshSig
+    , connectSig
     ) where
 
 import Prelude
@@ -110,6 +113,23 @@ named hint sig = do
     wid <- materialize sig
     hintWire wid hint
     pure (SWire wid)
+
+-- | A forward-declared signal: a fresh wire with no driver yet, to be driven
+-- later by 'connectSig'.  The typed replacement for a bare @freshWire@ placeholder
+-- when wiring feedback/cross-entity loops at the system layer (e.g. a bus master's
+-- read-data input, driven by the fabric after the master is elaborated).
+freshSig :: NetM (Sig dom a)
+freshSig = SWire <$> freshWire
+
+-- | Drive a forward-declared signal ('freshSig') from another signal — the typed
+-- form of a netlist alias.  @connectSig dst src@ connects @dst@ (which must be a
+-- placeholder wire) to @src@; emits an identity buffer so the placeholder carries
+-- @src@'s value.  Use only on placeholders created by 'freshSig'.
+connectSig :: Sig dom a -> Sig dom a -> NetM ()
+connectSig dst src = do
+    dw <- materialize dst
+    sw <- materialize src
+    emit $ NComb dw POr [sw, sw]
 
 -- | Synchronous-write / asynchronous-read block RAM.
 -- Emits a single 'NMem' node; all ports are materialized immediately.

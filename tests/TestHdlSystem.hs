@@ -22,7 +22,7 @@ mySystem (uart0Rx, gpio0In) = do
     uart0 <- createUart "uart0" uart0Rx
     gpio0 <- createGpio "gpio0" gpio0In
 
-    bh <- orphanBusMaster @32 @8
+    bh <- orphanBusMaster
     (uart0Tx, gpio0Port, gpio0Ddr) <- createBus "databus" bh $ do
         uart0' <- attachPeripheral 0x100 uart0
         gpio0' <- attachPeripheral 0x300 gpio0

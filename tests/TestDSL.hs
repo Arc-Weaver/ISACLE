@@ -38,7 +38,7 @@ mySystem rxPin gpioIn = do
     uart <- createUart "uart" rxPin
     gpio <- createGpio "gpio" gpioIn
 
-    bh <- orphanBusMaster @32 @8
+    bh <- orphanBusMaster
     (tx, port, ddr) <- createBus "databus" bh $ do
         uart' <- attachPeripheral 0x0100 uart
         gpio' <- attachPeripheral 0x0300 gpio

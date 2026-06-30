@@ -29,8 +29,9 @@ import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..))
+import Hdl.Types (KnownDom(..), Sig(..))
 import Hdl.Prim (Unsigned)
+import Hdl.Class (connectSig)
 import Isacle.Cache.Config (CacheConfig(..))
 import Isacle.ISA.Backend.SynthVnCPU (VnMemIface(..))
 import Isacle.System.BusHandle (BusHandle(..))
@@ -58,10 +59,10 @@ newtype CacheHandle = CacheHandle
 -- has no caching effect.  Replace the body of this function with a real
 -- tag/data-array implementation to add actual caching.
 synthL1Cache
-    :: forall dom wordW addrW busAddrW dat.
+    :: forall dom wordW addrW dat.
        ( KnownDom dom, KnownNat wordW, KnownNat addrW )
     => CacheConfig
-    -> BusHandle busAddrW dat  -- ^ unified system bus (cache acts as sole bus master)
+    -> BusHandle dom (Unsigned 32) dat  -- ^ unified system bus (cache is sole master)
     -> NetM CacheHandle
 synthL1Cache _cfg busH = do
     let domInfo  = domId (Proxy @dom)
@@ -75,24 +76,25 @@ synthL1Cache _cfg busH = do
     dataWrAddrW <- freshWire
     dataWrDataW <- freshWire
 
-    -- Pass-through: forward CPU write signals to the system bus.
-    emit $ NComb (bhWrAddr busH) N.POr [fetchAddrW, fetchAddrW]  -- instruction fetches use fetch addr
-    emit $ NComb (bhWrEn   busH) N.POr [dataWrEnW,  dataWrEnW]
-    emit $ NComb (bhWrAddr busH) N.POr [dataWrAddrW, dataWrAddrW]
-    emit $ NComb (bhWrData busH) N.POr [dataWrDataW, dataWrDataW]
-    emit $ NComb (bhRdAddr busH) N.POr [dataRdAddrW, dataRdAddrW]
+    -- Pass-through: drive the typed master→fabric signals from the CPU's outputs
+    -- ('connectSig' = typed alias).  Stub: the data write port owns the bus write
+    -- channel; instruction fetches share the read channel.
+    connectSig (bhWrEn   busH) (SWire dataWrEnW)
+    connectSig (bhWrData busH) (SWire dataWrDataW)
+    connectSig (bhWrAddr busH) (SWire dataWrAddrW)
+    connectSig (bhRdAddr busH) (SWire dataRdAddrW)
 
-    -- Pass-through read data from bus to CPU.
+    -- Pass-through read data from bus to CPU (drive the CPU-facing placeholders).
     instrWordW  <- freshWire
     dataRdDataW <- freshWire
-    emit $ NComb instrWordW  N.POr [bhRdData busH, bhRdData busH]
-    emit $ NComb dataRdDataW N.POr [bhRdData busH, bhRdData busH]
+    connectSig (SWire instrWordW  :: Sig dom dat) (bhRdData busH)
+    connectSig (SWire dataRdDataW :: Sig dom dat) (bhRdData busH)
 
     -- stall = 0 permanently (pass-through never stalls).
     stallW <- freshWire
     emit $ NComb stallW (N.PLit 0 1) []
 
-    let _ = (domInfo, wordBits, addrBits)  -- suppress unused warnings
+    let _ = (domInfo, wordBits, addrBits, fetchAddrW)  -- suppress unused warnings
 
     return $ CacheHandle $ VnMemIface
         { vniFetchAddr  = fetchAddrW

@@ -241,3 +241,85 @@ union of import clauses + any vendored files.
   netlist effects to `materialize`; outputs/forward-refs compose as values).
 - Node name: `Bus` vs `Region` vs `Space` (bikeshed).
 - `Layout`/trie existential over child `addrW` vs a fixed combinator shape.
+
+---
+
+## Conversion progress (2026-06-30): bus wiring landed, cache/CPU leg next
+
+**Done & compiling (up to the cache leg):**
+- `Hdl.Class` gained two typed feedback primitives (sanctioned, wrap netlist
+  internals): `freshSig :: NetM (Sig dom a)` (forward-declared/undriven wire) and
+  `connectSig :: Sig dom a -> Sig dom a -> NetM ()` (typed `alias` — drive a
+  `freshSig` placeholder). These replace bare `freshWire`+`alias` at the system
+  layer. `isacle-hdl` builds clean.
+- `BusArch`: `synthBus` is a **pure** `Signal` function `MasterReq -> [BusChild]
+  -> (SlaveResp, [MasterReq])` (no `NetM`). `BusHandle`: typed `Sig` fields,
+  `BusHandle dom addr dat`.
+- `SystemDSL` `createBus`/`attachPeripheral`/`PeriphSlot` fully converted —
+  **no `WireId`/`inBlock`/`BusPort`/`alias`**:
+  - `PeriphSlot` carries `psRun :: NetM (SlaveResp Sig dom dat)` (materialises the
+    peripheral: promotes phys via `emitPhysOuts`, returns its response). The
+    peripheral logic is built **purely** by `runPeriphDef hdlOps bus def`
+    (returns deferred `Sig`s) from the bus request.
+  - `BusDSLState` gains `bdsReqFeed :: [MasterReq Sig dom (Unsigned 32) dat]` —
+    per-slot requests fed back via the **mdo knot** in `createBus`.
+    `attachPeripheral` indexes it by slot position and returns the typed phys
+    bundle directly (no pre-allocated placeholders).
+  - `createBus` is one `mdo`: `synthBus` produces `childReqs` (→ `bdsReqFeed`) and
+    `masterResp`; `mapM psRun slots` gives the responses (→ `children`). Cycle is
+    well-founded: `childReqs`/`selOf` depend only on master + static base/size,
+    never on responses. Master read-data/stall driven into the handle with
+    `connectSig`. `RecursiveDo` pragma added.
+
+**Next domino (the gate): cache/CPU leg.** `cabal build lib:isacle` now stops at
+`Cache/L1.hs:64` — `synthL1Cache :: ... -> BusHandle busAddrW dat -> NetM
+CacheHandle` still uses the **old Nat-param** `BusHandle`. Fix its signature to
+`BusHandle dom (Unsigned 32) dat`, then `createHarvardCPU`/`createCachedCPU`
+(which allocate the handle's `bhRdData`/`bhStall` as `freshSig` placeholders the
+CPU reads, then `createBus` drives via `connectSig`) and the master-side wiring.
+The CPU master ports come from the typed `BusHandle`/`MasterReq`.
+
+**Then the bulk:** retarget `SynthCPU`/`SynthVnCPU`/`Lower`/`Synth`
+(`synthHarvardCPU'`) from `InstrIR -> NetNode` to `InstrIR -> Hdl` (regfile banks
+→ `register` over an array type; decode → `caseOf`; exec sequencer → clocked
+`Hdl`). Needs a register-file/bank class primitive added to `Hdl`. This is the
+multi-session piece. Finally: convert `HdlCircuit.emitPhysOuts` to `outputS`
+(drop raw `emit`), then un-export `NetM`/`emit`/`freshWire`/`inBlock`.
+
+---
+
+## UPDATE (2026-06-30): bus + cache/CPU-boundary conversion DONE & GREEN
+
+The typed-signal conversion of the whole system-layer wiring is complete and
+verified end-to-end: **ISACLE `cabal test` 1/1 pass; clavr `cabal test` 658/658
+pass; clavr `ghdl-sim` all instruction coverage (cov_flow/cov_arith/cov_io +
+every fixture) passes through real VHDL synthesis.**
+
+What landed:
+- `freshSig`/`connectSig` typed primitives in `Hdl.Class`.
+- `BusArch` pure `synthBus`; `BusHandle dom addr dat` typed.
+- `createBus`: **two-pass, no `mfix`** (the earlier mdo-knot deadlocked with a
+  `<<loop>>` because `mapM psRun` forced its own result's spine). Pass 1 runs the
+  (effect-free) `BusDSL` with a neutral request feed to discover the static
+  base/size layout; routes per-child requests purely via `synthBus` (the child
+  request ignores the response, so a `error` placeholder response is safe). Pass
+  2 re-runs the `BusDSL` with the routed requests, materialises peripherals
+  (`mapM psRun`), and builds the read mux. No `WireId`/`inBlock`/`BusPort`/`alias`.
+- `attachPeripheral`/`PeriphSlot`: peripheral built purely by `runPeriphDef`;
+  `psRun :: NetM (SlaveResp Sig dom dat)` promotes phys outputs + returns the
+  response. Phys output names threaded explicitly (`<inst>_<port>`), so
+  `emitPhysOuts` now takes a `[String]` names list (the old per-entity `p0/p1` +
+  `promotePhysOuts` rename step is gone).
+- `createHarvardCPU` builds the typed `BusHandle` by wrapping the CPU's output
+  wires as `SWire` (master→fabric) and `bhRdData`/`bhStall` as placeholders the
+  bus drives via `connectSig`. `orphanBusMaster`/`createL1Cache`/`synthL1Cache`
+  (VN pass-through stub) likewise typed; callers dropped `@32 @8`.
+
+**Boundary note:** the CPU/cache *internals* (`synthHarvardCPU'`, `synthVnCPU'`,
+`Lower`/`Synth`, the L1 stub) are still raw `NetM`/`WireId` — they are *bridged*
+to the typed bus via `SWire` at the `BusHandle`. That retarget
+(`InstrIR -> NetNode` ⇒ `InstrIR -> Hdl`, + a register-file/bank `Hdl` primitive)
+is the remaining bulk (todo #5). Also still internal-`NetM`: `HdlCircuit.hdlOps`
++ `emitPhysOuts` (materialize/emit), and `createHarvardCPU`'s ROM/entity wiring
+(`inBlock`/`NRom`). Final step after the retarget: un-export
+`NetM`/`emit`/`freshWire`/`inBlock`.

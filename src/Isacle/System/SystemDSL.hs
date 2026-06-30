@@ -67,10 +67,11 @@ import GHC.TypeLits (natVal, KnownNat, type (<=))
 import Hdl.Net
 import Hdl.Types
 import Hdl.Prim (Unsigned)
-import Hdl.Class (outputS)
+import Hdl.Class (outputS, connectSig, freshSig)
 import Isacle.System.Periph
 import Isacle.System.BusHandle (BusHandle(..))
-import Isacle.System.BusArch (BusArch(..), SimpleBus(..), BusPort(..))
+import Isacle.System.BusArch
+    (BusArch(..), SimpleBus(..), MasterReq(..), SlaveResp(..), BusChild)
 import Isacle.System.HdlCircuit
     ( hdlOps, hdlBusIface, busPortIface, HdlPhys(..)
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
@@ -157,29 +158,27 @@ runSystemDSL (SysDSL st) = (a, nodes, doc)
 -- BusDSL monad
 -- ---------------------------------------------------------------------------
 
--- | Internal record for one peripheral slot inside a bus.
--- The 'psRun' closure captures everything needed to instantiate the peripheral
--- entity; it receives the bus-entity output wire for the gated write enable.
+-- | Internal record for one peripheral slot inside a bus.  The peripheral logic
+-- is built purely (typed 'Sig' signals) at 'attachPeripheral' time from the bus
+-- request supplied via the knot ('bdsReqFeed'); 'psRun' only /materialises/ it.
 data PeriphSlot dom dat = PeriphSlot
-    { psName      :: String
-    , psBase      :: Word32
-    , psSize      :: Word32      -- address window in bytes
-    , psRdData    :: WireId      -- pre-allocated system-level wire; peripheral drives this
-    , psPhysWires :: [WireId]    -- pre-allocated system-level wires for physical outputs
-    , psPhysMeta  :: [PortSpec]  -- metadata (name, width, dom) for each physical output
-    , psSpec      :: PeriphSpec
-    , psRun       :: (WireId, WireId, WireId, WireId) -> NetM ()
-      -- ^ Instantiates the peripheral sub-entity at the system level.
-      -- Argument: this child's @(req, we, addr, wdata)@ wires, driven by the
-      -- bus interconnect ('synthBus').  The peripheral presents a
-      -- protocol-agnostic slave 'BusPort' — it carries no bus protocol.
-      -- Side-effect: aliases psRdData ← peripheral rd_data output,
-      --              aliases psPhysWires[i] ← peripheral physical output i.
+    { psName :: String
+    , psBase :: Word32
+    , psSize :: Word32      -- address window in bytes
+    , psSpec :: PeriphSpec
+    , psRun  :: NetM (SlaveResp Sig dom dat)
+      -- ^ Materialise the peripheral at the system level: promote its physical
+      -- outputs to top-level ports and return its slave response (read data +
+      -- stall) for the bus read mux.  The peripheral's bus request was already
+      -- captured (knot-tied) when the slot was built — 'psRun' takes no argument.
     }
 
 data BusDSLState dom dat = BusDSLState
     { bdsPeriph  :: [PeriphEntry]
     , bdsSlots   :: [PeriphSlot dom dat]
+    , bdsReqFeed :: [MasterReq Sig dom (Unsigned 32) dat]
+      -- ^ Per-slot bus requests, supplied lazily by 'createBus' via the knot;
+      -- 'attachPeripheral' indexes this by slot position.
     }
 
 -- | Bus sub-monad; execute 'attachPeripheral' calls inside 'createBus'.
@@ -205,68 +204,41 @@ attachPeripheral
     -> BusDSL dom dat a
 attachPeripheral base token = BusDSL $ do
     st <- get
-    -- Spec-only pass (no NetM nodes emitted).
-    let specBus = hdlBusIface (SWire 0 :: Sig dom (Unsigned 32))
-                               (SWire 0 :: Sig dom dat)
-                               (SWire 0 :: Sig dom Bool)
-                               (SWire 0 :: Sig dom (Unsigned 32)) base
-        (_, _, spec) = runPeriphDef hdlOps specBus (ptDef token)
-        entry = PeriphEntry { peName = ptName token, peBase = base, peSpec = spec }
-        size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
+    -- This slot's bus request (req/we/addr/wdata), supplied by createBus's knot.
+    let idx   = length (bdsSlots st)
+        myReq = bdsReqFeed st !! idx
         nm    = ptName token
-
-    -- Pre-allocate system-level wires for this peripheral's rd_data and physical
-    -- outputs.  These wires are driven later (via alias) when the peripheral
-    -- sub-entity is instantiated at the system level by createBus.
-    let n = physOutCount (Proxy @a)
-    (rdDataW, physWires) <- lift $ do
-        rd   <- freshWire
-        phys <- replicateM n freshWire
-        pure (rd, phys)
-
-    -- Closure run by createBus at the system level after the bus interconnect
-    -- has been built.  Receives this child's protocol-agnostic slave-port
-    -- request wires (req, we, addr, wdata), driven by 'synthBus'.  The
-    -- peripheral entity carries no bus protocol — it only sees register-level
-    -- reads/writes via 'busPortIface'.
-    let runPeriph (reqW, weW, addrW, wdataW) = do
-            let parentIns = [reqW, weW, addrW, wdataW]
-            (_, outPorts) <- inBlock nm nm parentIns $ do
-                reqIn  <- freshWire; emit $ NInput reqIn  "req"   1        domInfo
-                weIn   <- freshWire; emit $ NInput weIn   "we"    1        domInfo
-                addrIn <- freshWire; emit $ NInput addrIn "addr"  busAddrW domInfo
-                wdIn   <- freshWire; emit $ NInput wdIn   "wdata" datW     domInfo
-                let bus = busPortIface (SWire reqIn) (SWire weIn)
-                                       (SWire addrIn) (SWire wdIn) base
-                let (phys, rd, _) = runPeriphDef hdlOps bus (ptDef token)
-                rdWid <- materialize rd
-                emit $ NOutput rdWid "rd_data" datW domInfo
-                emitPhysOuts domInfo datW phys
-            case outPorts of
-                [] -> error $ "attachPeripheral: " ++ nm ++ " returned no ports"
-                (_, rdActW, _) : physPorts -> do
-                    alias rdDataW rdActW
-                    zipWithM_ (\preW (_, actW, _) -> alias preW actW) physWires physPorts
-
-    let slot = PeriphSlot
-            { psName      = nm
-            , psBase      = base
-            , psSize      = size
-            , psRdData    = rdDataW
-            , psPhysWires = physWires
-            , psPhysMeta  = portSpecs (Proxy @a)
-            , psSpec      = spec
-            , psRun       = runPeriph
+        -- Build the peripheral purely from its (knot-tied) bus request.  The
+        -- protocol-agnostic slave port becomes a register-level 'BusIface' via
+        -- 'busPortIface'; 'runPeriphDef' returns the typed physical outputs, the
+        -- read-data signal, and the register spec — all as deferred 'Sig's.
+        bus = busPortIface (mqReq myReq) (mqWe myReq)
+                           (mqAddr myReq) (mqWData myReq) base
+        (phys, rd, spec) = runPeriphDef hdlOps bus (ptDef token)
+        size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
+        entry = PeriphEntry { peName = nm, peBase = base, peSpec = spec }
+        -- Top-level names for this peripheral's physical outputs:
+        -- @<instance>_<port>@ (e.g. @gpio_GpioPhys_gpioPort@).
+        physNames = [ nm ++ "_" ++ portName ps | ps <- portSpecs (Proxy @a) ]
+        slot  = PeriphSlot
+            { psName = nm
+            , psBase = base
+            , psSize = size
+            , psSpec = spec
+            , psRun  = do
+                  -- Promote the physical outputs to top-level ports, then hand
+                  -- the slave response back for the bus read mux.
+                  emitPhysOuts physNames domInfo datW phys
+                  pure SlaveResp { srRData = rd, srStall = sigFalse }
             }
     put st { bdsPeriph = bdsPeriph st ++ [entry]
            , bdsSlots  = bdsSlots  st ++ [slot]
            }
-    pure (fromPhysWires physWires :: a)
+    pure phys
 
   where
     domInfo  = domId   (Proxy @dom)
     datW     = fromIntegral (natVal (Proxy @(Width dat)))
-    busAddrW = 32 :: Int
 
 -- ---------------------------------------------------------------------------
 -- createBus
@@ -289,109 +261,53 @@ createBus
     :: forall dom dat a.
        (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
-    -> BusHandle 32 (Width dat)
+    -> BusHandle dom (Unsigned 32) dat
     -> BusDSL dom dat a
     -> SysDSL dom dat a
 createBus busName bh (BusDSL busSt) = SysDSL $ do
-    let wrAddr = bhWrAddr bh
-        wrData = bhWrData bh
-        wrEn   = bhWrEn   bh
-        rdAddr = bhRdAddr bh
+    -- The master's single-channel request: a combinational SimpleBus is always
+    -- requesting; the address is the write address on writes, else the read
+    -- address.  These are typed 'Sig' signals straight off the 'BusHandle'.
+    let master = MasterReq
+            { mqReq   = sigTrue
+            , mqWe    = bhWrEn bh
+            , mqAddr  = mux (bhWrEn bh) (bhWrAddr bh) (bhRdAddr bh)
+            , mqWData = bhWrData bh
+            }
 
-    -- Run the BusDSL: attachPeripheral pre-allocates rd_data/phys wires and
-    -- builds psRun closures; no peripheral IR is emitted yet.
-    let initSt = BusDSLState { bdsPeriph = [], bdsSlots = [] }
-    (userA, finalSt) <- lift $ runStateT busSt initSt
-    let slots  = bdsSlots  finalSt
-        periph = bdsPeriph finalSt
-
-    -- Build the interconnect as its own sub-entity, so the bus structure is
-    -- preserved (each bus is its own decoder; attaching a bus to a bus nests
-    -- decoders).  The protocol — address decode, read mux, stall — comes from
-    -- the BusArch instance via 'synthBus', driven by the per-child base/size
-    -- layout.  The entity exposes, per child, a protocol-agnostic slave port
-    -- (req/we/addr/wdata) and the aggregated rd_data.
-    let busParentIns = [wrAddr, wrData, wrEn, rdAddr] ++ map psRdData slots
-    (childPortParWires, rdParentWire) <- lift $ do
-        ((), outPorts) <- inBlock busName busName busParentIns $ do
-            waIn <- freshWire; emit $ NInput waIn "wr_addr" addrW domInfo
-            wdIn <- freshWire; emit $ NInput wdIn "wr_data" datW  domInfo
-            weIn <- freshWire; emit $ NInput weIn "wr_en"   1     domInfo
-            raIn <- freshWire; emit $ NInput raIn "rd_addr" addrW domInfo
-            rdIns <- forM slots $ \slot -> do
-                w <- freshWire
-                emit $ NInput w (psName slot ++ "_rd_data") datW domInfo
-                pure w
-            -- Upstream master port: one transaction/cycle.  A combinational
-            -- SimpleBus is always requesting; the address is the write address
-            -- on writes, the read address otherwise.
-            reqU   <- litOne
-            addrU  <- do { o <- freshWire; emit $ NComb o PMux [weIn, waIn, raIn]; pure o }
-            rdataU <- freshWire
-            stallU <- freshWire
-            let up = BusPort { bpReq = reqU, bpWe = weIn, bpAddr = addrU
-                             , bpWData = wdIn, bpRData = rdataU, bpStall = stallU
-                             , bpAddrW = addrW, bpDataW = datW }
-            -- One downstream child port per peripheral slot.
-            children <- forM (zip slots rdIns) $ \(slot, rdIn) -> do
-                reqC   <- freshWire; weC    <- freshWire
-                addrC  <- freshWire; wdataC <- freshWire
-                stallC <- litZero1
-                let child = BusPort { bpReq = reqC, bpWe = weC, bpAddr = addrC
-                                    , bpWData = wdataC, bpRData = rdIn, bpStall = stallC
-                                    , bpAddrW = addrW, bpDataW = datW }
-                pure ( fromIntegral (psBase slot)
-                     , fromIntegral (psBase slot + psSize slot) - fromIntegral (psBase slot)
-                     , child )
-            -- Protocol interconnect: drives child req/we/addr/wdata and the
-            -- upstream rdata/stall.
-            synthBus SimpleBus domInfo up children
-            -- Expose each child's slave port and the aggregated read data.
-            forM_ (zip slots children) $ \(slot, (_, _, child)) -> do
-                emit $ NOutput (bpReq   child) (psName slot ++ "_req")   1     domInfo
-                emit $ NOutput (bpWe    child) (psName slot ++ "_we")    1     domInfo
-                emit $ NOutput (bpAddr  child) (psName slot ++ "_addr")  addrW domInfo
-                emit $ NOutput (bpWData child) (psName slot ++ "_wdata") datW  domInfo
-            emit $ NOutput rdataU "rd_data" datW domInfo
-
-        -- Emission order: 4 ports per child (req,we,addr,wdata), then rd_data.
-        case reverse outPorts of
-            ((_, rdW, _) : revFront) ->
-                pure (chunk4 (map (\(_, w, _) -> w) (reverse revFront)), rdW)
-            [] -> error "createBus: bus inBlock returned no output ports"
-
-    -- Instantiate peripheral entities (siblings of the bus), each wired to its
-    -- child port, then promote their physical outputs to top-level ports.
-    lift $ zipWithM_ psRun slots childPortParWires
-    lift $ mapM_ promotePhysOuts slots
-
-    -- SimpleBus never stalls its master: drive the handle's stall wire low.
-    busStallW <- lift $ do
-        w <- freshWire
-        emit $ NComb w (PLit 0 1) []
-        hintWire w (busName ++ "_stall")
-        pure w
+    -- Two passes, no feedback knot.  The request routing depends only on the
+    -- master and the static base/size layout (never on the responses), and the
+    -- layout doesn't depend on the request at all — so we discover the layout
+    -- first, route the per-child requests purely, then build the peripherals.
+    (userA, masterResp, periph) <- lift $ do
+        -- Pass 1: layout discovery.  'attachPeripheral' has no netlist effects,
+        -- so building peripherals with a neutral request feed and reading off
+        -- their base/size is pure and side-effect-free.
+        (_, layoutSt) <- runStateT busSt
+            BusDSLState { bdsPeriph = [], bdsSlots = [], bdsReqFeed = repeat master }
+        let layout    = [ (toInteger (psBase s), toInteger (psSize s))
+                        | s <- bdsSlots layoutSt ]
+            -- Route requests via the architecture (responses are never forced by
+            -- request routing — 'synthBus's child request ignores the response).
+            childReqs = snd $ synthBus SimpleBus master
+                            [ (b, s, errResp) | (b, s) <- layout ]
+            errResp   = error "createBus: response unused in request routing"
+        -- Pass 2: real build with the routed requests.
+        (userA, finalSt) <- runStateT busSt
+            BusDSLState { bdsPeriph = [], bdsSlots = [], bdsReqFeed = childReqs }
+        let slots = bdsSlots finalSt
+        -- Materialise each peripheral (promotes phys outputs, yields its response).
+        resps <- mapM psRun slots
+        let children :: [BusChild Sig dom dat]
+            children   = zipWith (\(b, s) r -> (b, s, r)) layout resps
+            masterResp = fst $ synthBus SimpleBus master children
+        pure (userA, masterResp, bdsPeriph finalSt)
 
     -- Feed the aggregated read data and stall back into the master handle.
-    lift $ alias (bhRdData bh) rdParentWire
-    lift $ alias (bhStall  bh) busStallW
+    lift $ connectSig (bhRdData bh) (srRData masterResp)
+    lift $ connectSig (bhStall  bh) (srStall masterResp)
     modify $ \doc -> doc { sdBuses = sdBuses doc ++ [BusSection busName periph] }
     pure userA
-  where
-    domInfo = domId (Proxy @dom)
-    datW    = fromIntegral (natVal (Proxy @(Width dat)))
-    addrW   = 32 :: Int
-    litOne :: NetM WireId
-    litOne   = do { o <- freshWire; emit $ NComb o (PLit 1 1) []; pure o }
-    litZero1 :: NetM WireId
-    litZero1 = do { o <- freshWire; emit $ NComb o (PLit 0 1) []; pure o }
-    chunk4 :: [WireId] -> [(WireId, WireId, WireId, WireId)]
-    chunk4 (a:b:c:d:rest) = (a, b, c, d) : chunk4 rest
-    chunk4 _              = []
-    promotePhysOuts slot =
-        zipWithM_ (\wid ps ->
-            emit $ NOutput wid (psName slot ++ "_" ++ portName ps) (portWidth ps) (portDom ps)
-        ) (psPhysWires slot) (psPhysMeta slot)
 
 -- | Allocate a 'BusHandle' with fresh, undriven master wires.
 --
@@ -402,17 +318,13 @@ createBus busName bh (BusDSL busSt) = SysDSL $ do
 -- _ <- createBus "databus" bh $ attachPeripheral 0x60 gpio
 -- @
 orphanBusMaster
-    :: forall addrW dataW dom dat.
-       (KnownNat addrW, KnownNat dataW)
-    => SysDSL dom dat (BusHandle addrW dataW)
+    :: forall dom dat. SysDSL dom dat (BusHandle dom (Unsigned 32) dat)
 orphanBusMaster = SysDSL $ lift $ do
-    wa <- freshWire; wd <- freshWire; we <- freshWire; ra <- freshWire
-    rd <- freshWire; st <- freshWire
+    wa <- freshSig; wd <- freshSig; we <- freshSig; ra <- freshSig
+    rd <- freshSig; st <- freshSig
     pure BusHandle
         { bhWrAddr = wa, bhWrData = wd, bhWrEn = we, bhRdAddr = ra
         , bhRdData = rd, bhStall  = st
-        , bhAddrW  = fromIntegral (natVal (Proxy @addrW))
-        , bhDataW  = fromIntegral (natVal (Proxy @dataW))
         }
 
 -- ---------------------------------------------------------------------------
@@ -456,7 +368,7 @@ createHarvardCPU :: forall addrW codeWordW codeAddrW dom dat alu.
            -> CPUDef alu
            -> ISADef (ISABuild alu (Width dat) addrW codeWordW codeAddrW)
            -> [Integer]
-           -> SysDSL dom dat (BusHandle 32 (Width dat))
+           -> SysDSL dom dat (BusHandle dom (Unsigned 32) dat)
 createHarvardCPU instName cpuDef isaDef romWords = SysDSL $ do
     let codeWordB    = fromIntegral (natVal (Proxy @codeWordW))  :: Int
     let wordBits     = fromIntegral (natVal (Proxy @(Width dat))) :: Int
@@ -553,15 +465,16 @@ createHarvardCPU instName cpuDef isaDef romWords = SysDSL $ do
             else pure ()
         pure (wr, rd)
 
+    -- Build the typed master handle: the CPU's load/store outputs become the
+    -- master→fabric signals (wrapped from their netlist wires); the bus drives
+    -- the read-data/stall placeholders back (via 'connectSig' in 'createBus').
     let dataBus = BusHandle
-                    { bhWrAddr = wrAddrR
-                    , bhWrData = dataWrDataParW
-                    , bhWrEn   = dataWrEnParW
-                    , bhRdAddr = rdAddrR
-                    , bhRdData = rdDataFromBus
-                    , bhStall  = stallFromBus
-                    , bhAddrW  = 32
-                    , bhDataW  = wordBits
+                    { bhWrAddr = SWire wrAddrR        :: Sig dom (Unsigned 32)
+                    , bhWrData = SWire dataWrDataParW :: Sig dom dat
+                    , bhWrEn   = SWire dataWrEnParW   :: Sig dom Bool
+                    , bhRdAddr = SWire rdAddrR        :: Sig dom (Unsigned 32)
+                    , bhRdData = SWire rdDataFromBus  :: Sig dom dat
+                    , bhStall  = SWire stallFromBus   :: Sig dom Bool
                     }
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
     pure dataBus
@@ -576,10 +489,10 @@ createHarvardCPU instName cpuDef isaDef romWords = SysDSL $ do
 -- to the bus and returns bus read data to the CPU.  In the current stub
 -- implementation, stall is always 0 (pass-through, no actual caching).
 createL1Cache
-    :: forall dom wordW addrW busAddrW busDataW dat.
-       ( KnownDom dom, KnownNat wordW, KnownNat addrW, KnownNat busAddrW, HdlType dat )
+    :: forall dom wordW addrW dat.
+       ( KnownDom dom, KnownNat wordW, KnownNat addrW, HdlType dat )
     => CacheConfig
-    -> BusHandle busAddrW busDataW
+    -> BusHandle dom (Unsigned 32) dat
     -> SysDSL dom dat CacheHandle
 createL1Cache cfg busH = SysDSL $ lift $
     synthL1Cache @dom @wordW @addrW cfg busH
