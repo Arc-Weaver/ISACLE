@@ -76,7 +76,7 @@ import Isacle.System.BusHandle (BusHandle(..))
 import Isacle.System.BusArch
     (BusArch(..), SimpleBus(..), MasterReq(..), SlaveResp(..), BusChild)
 import Isacle.System.HdlCircuit
-    ( hdlOps, hdlBusIface, busPortIface, HdlPhys(..)
+    ( hdlOps, busPortIface, HdlPhys(..)
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
     )
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
@@ -84,7 +84,7 @@ import Isacle.Periph.UART  (uartDefWithFSM, UART)
 import Isacle.Periph.Timer (timerDefWithFSM, Timer)
 import Isacle.Periph.Ramp  (rampDefWithFSM, Ramp)
 import Isacle.ISA.CPUDef (CPUDef)
-import Isacle.ISA.Def    (ISADef, isaInterruptBody)
+import Isacle.ISA.Def    (ISADef)
 import Isacle.ISA.Build (ISABuild)
 import Isacle.ISA.Backend.SynthCPU (synthHarvardCPU', CpuMemIface(..))
 import Isacle.ISA.Backend.SynthVnCPU (synthVonNeumannCPU', VnMemIface(..))
@@ -351,6 +351,70 @@ createSimpleVectorIrq _sources = pure $
 -- CPU
 -- ---------------------------------------------------------------------------
 
+-- | The Harvard CPU's input ports (a 'PortRef' record so 'bind'/'entity' name
+-- the sub-entity's ports).  Field types carry widths via @Unsigned cw/caw@ and
+-- @dat@; the ISA compiler runs type-erased and is re-tagged at the boundary.
+data HCpuIn dom dat cw caw = HCpuIn
+    { hciInstr   :: Sig dom (Unsigned cw)    -- ^ instruction word at PC
+    , hciDmemRd  :: Sig dom dat              -- ^ data read result (from the bus)
+    , hciCmemRd  :: Sig dom (Unsigned cw)    -- ^ 2nd code word at PC+1
+    , hciStall   :: Sig dom Bool
+    , hciIrqPend :: Sig dom Bool
+    , hciIrqVec  :: Sig dom (Unsigned caw)
+    } deriving (Generic)
+
+-- | The Harvard CPU's output ports.
+data HCpuOut dom dat aw caw = HCpuOut
+    { hcoCodeAddr   :: Sig dom (Unsigned caw)  -- ^ PC → code memory address
+    , hcoDataRdAddr :: Sig dom (Unsigned aw)
+    , hcoDataWrEn   :: Sig dom Bool
+    , hcoDataWrAddr :: Sig dom (Unsigned aw)
+    , hcoDataWrData :: Sig dom dat
+    } deriving (Generic)
+
+deriving instance (KnownDom dom, HdlType dat, KnownNat cw, KnownNat caw)
+    => HdlPorts (HCpuIn dom dat cw caw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat cw, KnownNat caw)
+    => PortRef  (HCpuIn dom dat cw caw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw, KnownNat caw)
+    => HdlPorts (HCpuOut dom dat aw caw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw, KnownNat caw)
+    => PortRef  (HCpuOut dom dat aw caw)
+
+-- | Re-tag a signal's phantom representation type — a no-op rewrap (the second
+-- 'Sig' parameter is phantom).  Bridges the ISA compiler's type-erased
+-- @Sig dom ()@ and the width-carrying port types at an entity boundary.
+retagSig :: Sig dom a -> Sig dom b
+retagSig (SWire w) = SWire w
+retagSig (SExpr m) = SExpr m
+
+-- | The cached von Neumann CPU's input ports (driven by the L1 cache + IRQ).
+data VnCpuIn dom dat aw = VnCpuIn
+    { vciInstr   :: Sig dom dat            -- ^ instruction word from the cache
+    , vciDmemRd  :: Sig dom dat            -- ^ data read result from the cache
+    , vciStall   :: Sig dom Bool
+    , vciIrqPend :: Sig dom Bool
+    , vciIrqVec  :: Sig dom (Unsigned aw)
+    } deriving (Generic)
+
+-- | The cached von Neumann CPU's output ports (→ the L1 cache).
+data VnCpuOut dom dat aw = VnCpuOut
+    { vcoFetchAddr  :: Sig dom (Unsigned aw)
+    , vcoDataRdAddr :: Sig dom (Unsigned aw)
+    , vcoDataWrEn   :: Sig dom Bool
+    , vcoDataWrAddr :: Sig dom (Unsigned aw)
+    , vcoDataWrData :: Sig dom dat
+    } deriving (Generic)
+
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
+    => HdlPorts (VnCpuIn dom dat aw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
+    => PortRef  (VnCpuIn dom dat aw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
+    => HdlPorts (VnCpuOut dom dat aw)
+deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
+    => PortRef  (VnCpuOut dom dat aw)
+
 -- | Synthesise a Harvard CPU into the system, connect it to a data bus, and
 -- instantiate an internal code ROM.
 --
@@ -374,98 +438,80 @@ createHarvardCPU :: forall addrW codeWordW codeAddrW (dom :: Type) dat alu.
            -> SysDSL dom dat (BusHandle dom (Unsigned 32) dat)
 createHarvardCPU instName cpuDef isaDef romWords = SysDSL $ do
     let codeWordB    = fromIntegral (natVal (Proxy @codeWordW))  :: Int
-    let wordBits     = fromIntegral (natVal (Proxy @(Width dat))) :: Int
     let addrBits     = fromIntegral (natVal (Proxy @addrW))       :: Int
     let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW))   :: Int
-    let domInfo      = domId (Proxy @dom)
 
-    -- Pre-allocate parent-side wires that map to the CPU's input ports.
-    -- These are driven in the parent context after the sub-entity is built.
-    instrWordParW  <- lift freshWire
-    dmemRdDataParW <- lift freshWire
-    cmemRdDataParW <- lift freshWire
-    stallParW      <- lift freshWire
+    -- Pre-allocate the CPU's input signals.  They are driven below — ROM →
+    -- instr/2nd-code-word, data bus → read-data/stall (via createBus), IRQ →
+    -- tied off.  'freshSig' + later 'connectSig'/ROM form the fetch/bus feedback
+    -- without a recursive knot (the CPU outputs feed the ROM, not its inputs).
+    instrSig   <- lift freshSig
+    cmemRdSig  <- lift freshSig
+    dmemRdSig  <- lift freshSig
+    stallSig   <- lift freshSig
+    irqPendSig <- lift freshSig
+    irqVecSig  <- lift freshSig
 
-    -- The CPU always takes irq_pending/irq_vector input ports; with no interrupt
-    -- controller wired up they are tied off (0) in the parent below.
-    irqPendParW <- lift freshWire
-    irqVecParW  <- lift freshWire
-
-    -- Synthesise the CPU inside a named sub-entity so it appears as a distinct
-    -- entity in the VHDL hierarchy.  The CPU itself is the abstract, NetM-free
-    -- 'synthHarvardCPU''; here at the entity boundary it runs at @s = Sig@,
-    -- @m = NetM@: ports become 'SWire' inputs, its 'Sig' outputs are materialised.
-    ((), cpuPorts) <- lift $ inBlock instName instName
-        [instrWordParW, dmemRdDataParW, cmemRdDataParW, stallParW, irqPendParW, irqVecParW] $ do
-            let inPort nm w = do { wid <- freshWire; emit (NInput wid nm w domInfo)
-                                 ; pure (SWire wid :: Sig dom ()) }
-                outPort :: forall a. String -> Int -> Sig dom a -> NetM ()
-                outPort nm w sig = do { o <- materialize sig; hintWire o nm
-                                      ; emit (NOutput o nm w domInfo) }
-            instrWordS <- inPort "instr_word"   codeWordB
-            dmemRdS    <- inPort "data_rd_data" wordBits
-            cmemRdS    <- inPort "code_rd_data" codeWordB
-            stallS     <- inPort "stall"        1
-            irqPS      <- inPort "irq_pending"  1
-            irqVS      <- inPort "irq_vector"   codeAddrBits
+    -- CPU sub-entity body: the abstract, NetM-free 'synthHarvardCPU'' run at
+    -- @s = Sig@, @m = NetM@.  Port types carry widths; re-tag to the compiler's
+    -- erased @Sig dom ()@ on the way in, and back to the port types on the way out.
+    let cpuBody :: HCpuIn dom dat codeWordW codeAddrW
+                -> NetM (HCpuOut dom dat addrW codeAddrW)
+        cpuBody hci = do
             cmi <- synthHarvardCPU' @Sig @NetM @dom @(Width dat) @addrW @codeWordW @codeAddrW
-                       cpuDef isaDef instrWordS dmemRdS cmemRdS stallS irqPS irqVS
-            -- Output ports — order determines index in cpuPorts list.
-            outPort "code_addr"    codeAddrBits (cmiCodeRdAddr cmi)
-            outPort "data_rd_addr" addrBits     (cmiDataRdAddr cmi)
-            outPort "data_wr_en"   1            (cmiDataWrEn   cmi)
-            outPort "data_wr_addr" addrBits     (cmiDataWrAddr cmi)
-            outPort "data_wr_data" wordBits     (cmiDataWrData cmi)
+                       cpuDef isaDef
+                       (retagSig (hciInstr   hci)) (retagSig (hciDmemRd  hci))
+                       (retagSig (hciCmemRd  hci)) (retagSig (hciStall   hci))
+                       (retagSig (hciIrqPend hci)) (retagSig (hciIrqVec  hci))
+            pure HCpuOut
+                { hcoCodeAddr   = retagSig (cmiCodeRdAddr cmi)
+                , hcoDataRdAddr = retagSig (cmiDataRdAddr cmi)
+                , hcoDataWrEn   =           cmiDataWrEn   cmi
+                , hcoDataWrAddr = retagSig (cmiDataWrAddr cmi)
+                , hcoDataWrData = retagSig (cmiDataWrData cmi)
+                }
 
-    -- Resolve parent wires for each CPU output port by name.
-    let findPort name = case [ w | (n, w, _) <- cpuPorts, n == name ] of
-            (w:_) -> w
-            []    -> error ("createHarvardCPU: missing output port " ++ name)
-        codeAddrParW   = findPort "code_addr"
-        dataRdAddrParW = findPort "data_rd_addr"
-        dataWrEnParW   = findPort "data_wr_en"
-        dataWrAddrParW = findPort "data_wr_addr"
-        dataWrDataParW = findPort "data_wr_data"
+    -- Instantiate the CPU as a named sub-entity via the entity tooling.
+    out <- lift $ entity instName
+        (bind instName cpuBody
+            :: Entity (HCpuIn dom dat codeWordW codeAddrW)
+                      (HCpuOut dom dat addrW codeAddrW))
+        HCpuIn { hciInstr   = instrSig,   hciDmemRd = dmemRdSig, hciCmemRd = cmemRdSig
+               , hciStall   = stallSig,   hciIrqPend = irqPendSig, hciIrqVec = irqVecSig }
 
-    -- Code ROMs live in the parent context, addressed by the CPU's PC output.
+    -- Code ROM in the parent, addressed by the CPU's PC output: the instruction
+    -- word at PC, and the 2nd code word at PC+1 (for 2-word instructions).
     let romCapacity = 2 ^ codeAddrBits
         romData     = take romCapacity (romWords ++ repeat 0)
-    lift $ emit $ NRom instrWordParW codeAddrParW romCapacity codeWordB romData
-
-    -- Second ROM port at PC+1 for 2-word instructions.
     lift $ do
+        codeAddrW' <- materialize (hcoCodeAddr out)
+        instrWid   <- materialize instrSig
+        cmemWid    <- materialize cmemRdSig
+        emit $ NRom instrWid codeAddrW' romCapacity codeWordB romData
         lit1W    <- freshWire
         pcPlus1W <- freshWire
         emit $ NComb lit1W    (PLit 1 codeAddrBits) []
-        emit $ NComb pcPlus1W PAdd [codeAddrParW, lit1W]
-        emit $ NRom cmemRdDataParW pcPlus1W romCapacity codeWordB romData
+        emit $ NComb pcPlus1W PAdd [codeAddrW', lit1W]
+        emit $ NRom cmemWid pcPlus1W romCapacity codeWordB romData
 
-    -- Allocate wires the bus will drive back into the CPU (filled by createBus).
-    rdDataFromBus <- lift freshWire
-    stallFromBus  <- lift freshWire
+    -- Tie off interrupt inputs (no IRQ controller wired yet).
+    lift $ connectSig irqPendSig (sigLitW 0 1)
+    lift $ connectSig irqVecSig  (sigLitW 0 codeAddrBits)
 
-    -- Resize CPU address outputs to 32-bit bus width and build the BusHandle.
-    (wrAddrR, rdAddrR) <- lift $ do
-        wr <- resizeTo addrBits 32 dataWrAddrParW
-        rd <- resizeTo addrBits 32 dataRdAddrParW
-        -- Bus response wires → CPU input wires.
-        alias dmemRdDataParW rdDataFromBus
-        alias stallParW      stallFromBus
-        -- Tie off interrupt inputs (no IRQ controller wired yet).
-        do { w <- freshWire; emit $ NComb w (PLit 0 1) []; alias irqPendParW w }
-        do { w <- freshWire; emit $ NComb w (PLit 0 codeAddrBits) []; alias irqVecParW w }
-        pure (wr, rd)
+    -- Resize CPU address outputs to the 32-bit bus width.
+    wrAddrR <- lift $ materialize (hcoDataWrAddr out) >>= resizeTo addrBits 32
+    rdAddrR <- lift $ materialize (hcoDataRdAddr out) >>= resizeTo addrBits 32
 
-    -- Build the typed master handle: the CPU's load/store outputs become the
-    -- master→fabric signals (wrapped from their netlist wires); the bus drives
-    -- the read-data/stall placeholders back (via 'connectSig' in 'createBus').
+    -- Typed master handle: the CPU's store outputs become master→fabric signals;
+    -- the data-read result and stall (the CPU's own pre-allocated input signals)
+    -- are driven back by 'createBus' via 'connectSig'.
     let dataBus = BusHandle
-                    { bhWrAddr = SWire wrAddrR        :: Sig dom (Unsigned 32)
-                    , bhWrData = SWire dataWrDataParW :: Sig dom dat
-                    , bhWrEn   = SWire dataWrEnParW   :: Sig dom Bool
-                    , bhRdAddr = SWire rdAddrR        :: Sig dom (Unsigned 32)
-                    , bhRdData = SWire rdDataFromBus  :: Sig dom dat
-                    , bhStall  = SWire stallFromBus   :: Sig dom Bool
+                    { bhWrAddr = SWire wrAddrR     :: Sig dom (Unsigned 32)
+                    , bhWrData = hcoDataWrData out
+                    , bhWrEn   = hcoDataWrEn   out
+                    , bhRdAddr = SWire rdAddrR     :: Sig dom (Unsigned 32)
+                    , bhRdData = dmemRdSig
+                    , bhStall  = stallSig
                     }
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
     pure dataBus
@@ -506,42 +552,44 @@ createCachedCPU
     -> CacheHandle
     -> SysDSL dom dat ()
 createCachedCPU instName cpuDef isaDef cacheH = SysDSL $ do
-    let wordBits  = fromIntegral (natVal (Proxy @(Width dat))) :: Int
-    let addrBits  = fromIntegral (natVal (Proxy @addrW))       :: Int
-    let domInfo   = domId (Proxy @dom)
+    let addrBits  = fromIntegral (natVal (Proxy @addrW)) :: Int
 
-    -- Synthesise the abstract VN CPU at the entity boundary (s = Sig, m = NetM):
-    -- the cache drives the CPU input ports; the CPU's Sig outputs are materialised.
-    ((), cpuPorts) <- lift $ inBlock instName instName
-        [chInstrWord cacheH, chDataRdData cacheH, chStall cacheH] $ do
-            let inPort nm w = do { wid <- freshWire; emit (NInput wid nm w domInfo)
-                                 ; pure (SWire wid :: Sig dom ()) }
-                outPort :: forall a. String -> Int -> Sig dom a -> NetM ()
-                outPort nm w sig = do { o <- materialize sig; emit (NOutput o nm w domInfo) }
-                irqP = sigLitW 0 1        :: Sig dom ()   -- no IRQ controller: tie to 0
-                irqV = sigLitW 0 addrBits :: Sig dom ()
-            instrS  <- inPort "instr_word"   wordBits
-            rdDataS <- inPort "data_rd_data" wordBits
-            stallS  <- inPort "stall"        1
-            vnm <- synthVonNeumannCPU' @Sig @NetM @dom @(Width dat) @addrW
-                       cpuDef isaDef instrS rdDataS stallS irqP irqV
-            outPort "fetch_addr"   addrBits (vniFetchAddr  vnm)
-            outPort "data_rd_addr" addrBits (vniDataRdAddr vnm)
-            outPort "data_wr_en"   1        (vniDataWrEn   vnm)
-            outPort "data_wr_addr" addrBits (vniDataWrAddr vnm)
-            outPort "data_wr_data" wordBits (vniDataWrData vnm)
+    -- CPU sub-entity body: the abstract, NetM-free 'synthVonNeumannCPU'' at
+    -- @s = Sig@, @m = NetM@.  Re-tag between port types and the compiler's erased
+    -- @Sig dom ()@.
+    let vnBody :: VnCpuIn dom dat addrW -> NetM (VnCpuOut dom dat addrW)
+        vnBody vci = do
+            vmi <- synthVonNeumannCPU' @Sig @NetM @dom @(Width dat) @addrW
+                       cpuDef isaDef
+                       (retagSig (vciInstr  vci)) (retagSig (vciDmemRd vci))
+                       (retagSig (vciStall  vci)) (retagSig (vciIrqPend vci))
+                       (retagSig (vciIrqVec vci))
+            pure VnCpuOut
+                { vcoFetchAddr  = retagSig (vniFetchAddr  vmi)
+                , vcoDataRdAddr = retagSig (vniDataRdAddr vmi)
+                , vcoDataWrEn   =           vniDataWrEn   vmi
+                , vcoDataWrAddr = retagSig (vniDataWrAddr vmi)
+                , vcoDataWrData = retagSig (vniDataWrData vmi)
+                }
 
-    let findPort nm = case [ w | (n, w, _) <- cpuPorts, n == nm ] of
-            (w:_) -> w
-            []    -> error ("createCachedCPU: missing port " ++ nm)
+    -- Instantiate the CPU as a named sub-entity; the cache drives its inputs.
+    out <- lift $ entity instName
+        (bind instName vnBody
+            :: Entity (VnCpuIn dom dat addrW) (VnCpuOut dom dat addrW))
+        VnCpuIn { vciInstr   = SWire (chInstrWord  cacheH)
+                , vciDmemRd  = SWire (chDataRdData cacheH)
+                , vciStall   = SWire (chStall      cacheH)
+                , vciIrqPend = sigLitW 0 1                  -- no IRQ controller
+                , vciIrqVec  = sigLitW 0 addrBits
+                }
 
     -- Wire CPU outputs → cache inputs.
     lift $ do
-        alias (chFetchAddr  cacheH) (findPort "fetch_addr")
-        alias (chDataRdAddr cacheH) (findPort "data_rd_addr")
-        alias (chDataWrEn   cacheH) (findPort "data_wr_en")
-        alias (chDataWrAddr cacheH) (findPort "data_wr_addr")
-        alias (chDataWrData cacheH) (findPort "data_wr_data")
+        materialize (vcoFetchAddr  out) >>= alias (chFetchAddr  cacheH)
+        materialize (vcoDataRdAddr out) >>= alias (chDataRdAddr cacheH)
+        materialize (vcoDataWrEn   out) >>= alias (chDataWrEn   cacheH)
+        materialize (vcoDataWrAddr out) >>= alias (chDataWrAddr cacheH)
+        materialize (vcoDataWrData out) >>= alias (chDataWrData cacheH)
 
     modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
 
