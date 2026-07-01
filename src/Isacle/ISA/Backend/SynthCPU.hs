@@ -67,19 +67,22 @@ notS = sigPrim1 N.PNot
 toBool :: Signal s => s dom x -> s dom Bool
 toBool x = sigPrim2 N.PEq x (sigLitW 1 1)
 
--- Data ops — yield a (type-erased) data signal.
-addS, bwAndS, bwOrS :: Signal s => s dom x -> s dom y -> s dom ()
+-- Data ops — width-generic: same-width binary ops preserve the operand type,
+-- so typed signals (e.g. @Unsigned addrW@) flow through unchanged.
+addS, bwAndS, bwOrS :: Signal s => s dom a -> s dom a -> s dom a
 addS   = sigPrim2 N.PAdd
 bwAndS = sigPrim2 N.PAnd
 bwOrS  = sigPrim2 N.POr
 
-muxS :: Signal s => s dom Bool -> s dom () -> s dom () -> s dom ()
+-- | A mux preserving its branch type (both arms and the result share @a@).
+muxS :: Signal s => s dom Bool -> s dom a -> s dom a -> s dom a
 muxS = sigPrim3 N.PMux
 
-sliceS :: Signal s => Int -> Int -> s dom x -> s dom ()
+-- Width-changing ops: free output type (annotate at the use site).
+sliceS :: Signal s => Int -> Int -> s dom x -> s dom a
 sliceS hi lo = sigPrim1 (N.PSlice hi lo)
 
-resizeS :: Signal s => Int -> s dom x -> s dom ()
+resizeS :: Signal s => Int -> s dom x -> s dom a
 resizeS w = sigPrim1 (N.PResize w)
 
 -- | OR-reduce a list of conditions; constant-0 when empty.
@@ -88,7 +91,8 @@ orReduce []     = litS 0 1
 orReduce (x:xs) = foldl' orS x xs
 
 -- | Right-to-left priority mux: the /first/ matching pair wins, else @def@.
-priorityMux :: Signal s => [(s dom Bool, s dom ())] -> s dom () -> s dom ()
+-- Preserves the branch type @a@ across all pairs and the default.
+priorityMux :: Signal s => [(s dom Bool, s dom a)] -> s dom a -> s dom a
 priorityMux pairs def = foldr (\(sel, v) acc -> muxS sel v acc) def pairs
 
 -- ---------------------------------------------------------------------------
