@@ -120,8 +120,16 @@ class Signal (sig :: k -> Type -> Type) where
     sigPrim2 :: PrimOp -> sig dom a -> sig dom b -> sig dom c
     -- | Apply a ternary primitive operation (e.g. mux).
     sigPrim3 :: PrimOp -> sig dom a -> sig dom b -> sig dom c -> sig dom d
-    -- | A raw bit-pattern literal of the given value and width.
+    -- | A raw bit-pattern literal of the given value and width.  The low-level
+    -- escape (genuinely value-level widths only, e.g. inside the emitter); typed
+    -- code uses 'sigLit', whose width comes from the type and so cannot disagree.
     sigLitW  :: Integer -> Int -> sig dom a
+    -- | A typed literal: its width is @'Width' a@, taken from the type — the
+    -- type-driven replacement for 'sigLitW' (a literal can't disagree with the
+    -- representation it's used at).
+    sigLit   :: HdlType a => Integer -> sig dom a
+    default sigLit :: forall dom a. HdlType a => Integer -> sig dom a
+    sigLit v = sigLitW v (fromIntegral (natVal (Proxy @(Width a))))
 
 instance Signal Sig where
     sigPrim1 = primSig1

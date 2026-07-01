@@ -17,7 +17,7 @@ module Isacle.ISA.Backend.SynthVnCPU
 
 import Prelude hiding (Word)
 import Data.Kind (Type)
-import Data.List (foldl', nub)
+import Data.List (foldl', nub, find)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Control.Monad (forM)
@@ -82,8 +82,8 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
         initOf name = Map.findWithDefault 0 name resetRegMap
                   .|. Map.findWithDefault 0 name resetFlagContribs
 
-        regList      = schRegisters schema
-        widthOf name = maybe wordBits id (lookup name regList)
+        regList      = schRegisters schema            -- [RegDecl] (typed)
+        widthOf name = maybe wordBits rdWidth (find ((== name) . rdName) regList)
         rfInfoMap    = Map.fromList [ (n, (c, w)) | (n, c, w) <- schRegFiles schema ]
         regCount rf  = maybe 1 fst (Map.lookup rf rfInfoMap)
         statusRegMap = Map.fromList [ (n, (w, fs)) | (n, w, fs) <- schStatusRegs schema ]
@@ -92,9 +92,10 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
 
     mdo
         -- Scalar registers (enable from the arbiters, gated with ~stall).
-        scalarOuts <- forM regList $ \(name, w) ->
-            named name =<< registerW w (initOf name) (enOf name) (nxtOf name)
-        let scalarMap    = Map.fromList (zip (map fst regList) scalarOuts)
+        scalarOuts <- forM regList $ \decl ->
+            let name = rdName decl
+            in  named name =<< registerW (rdWidth decl) (initOf name) (enOf name) (nxtOf name)
+        let scalarMap    = Map.fromList (zip (map rdName regList) scalarOuts)
             readScalar n = Map.findWithDefault (litS 0 wordBits) n scalarMap
             getFlag rn bp = maybe (litS 0 1) (sliceS bp bp) (Map.lookup rn scalarMap)
             mkCtx rcIrq = RenderCtx
@@ -155,8 +156,10 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
             allFlagWrites   = concatMap srFlagWrites allResults
             scalarWritesByReg = foldl' (\mp r -> Map.insertWith (++) (swRegName r) [r] mp)
                                        Map.empty allScalarWrites
-            arbiterOf (name, w) =
-                let scWrites   = Map.findWithDefault [] name scalarWritesByReg
+            arbiterOf decl =
+                let name       = rdName decl
+                    w          = rdWidth decl
+                    scWrites   = Map.findWithDefault [] name scalarWritesByReg
                     writePairs = [ (swMatchWire r, swDataWire r) | r <- scWrites ]
                     regSig     = scalarMap Map.! name
                 in if name == pcName

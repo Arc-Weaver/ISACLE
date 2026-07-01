@@ -6,10 +6,9 @@ module Isacle.ISA.CPUDef where
 
 import Prelude
 import Control.Monad.Writer
-import Data.List (sortBy)
-import Data.Maybe (fromMaybe)
+import Data.List (sortBy, find)
 import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal)
+import GHC.TypeLits (natVal, someNatVal, SomeNat(..))
 import GHC.Generics (Generic, Rep)
 import Hdl.Bits
 import Hdl.Types (HdlType, Width, GFields, recordFields)
@@ -26,10 +25,22 @@ import Isacle.ISA.Types
 newtype CPUDef a = CPUDef (Writer CPUSchema a)
     deriving newtype (Functor, Applicative, Monad)
 
+-- | A register declaration that keeps its HDL value /type/ (not just a width):
+-- @newReg \@(Unsigned 16) "SP"@ records @RegDecl "SP" (Proxy \@(Unsigned 16))@, so
+-- the synthesis backend can create a typed @register \@t@ whose width /is/
+-- @'Width' t@ — the type drives the width, and the two can't disagree.
+data RegDecl = forall t. HdlType t => RegDecl String (Proxy t)
+
+rdName :: RegDecl -> String
+rdName (RegDecl n _) = n
+
+rdWidth :: RegDecl -> Int
+rdWidth (RegDecl _ (_ :: Proxy t)) = fromIntegral (natVal (Proxy @(Width t)))
+
 data CPUSchema = CPUSchema
     { schEndianness :: Endianness
     , schRegFiles   :: [(String, Int, Int)]          -- name, count, element width
-    , schRegisters  :: [(String, Int)]               -- name, width (includes status registers)
+    , schRegisters  :: [RegDecl]                      -- typed register declarations (incl. status regs)
     , schStatusRegs :: [(String, Int, [String])]     -- name, width, flag names MSB-first
     , schAliasRegs  :: [(String, Integer)]           -- reg name, data address
     , schAliasFiles :: [(String, Integer)]           -- regfile name, data base address (entry i → base+i)
@@ -67,7 +78,7 @@ derivedStatusRegs sch =
     | rn <- regsWithFlags ]
   where
     regsWithFlags = nubOrd [ r | (r, _, _) <- schFlags sch ]
-    regWidthOf rn = fromMaybe 8 (lookup rn (schRegisters sch))
+    regWidthOf rn = maybe 8 rdWidth (find ((== rn) . rdName) (schRegisters sch))
     -- MSB-first: highest bit position first.
     namesMsbFirst rn =
         [ nm | (_, _, nm) <- sortByBitDesc [ f | f@(r,_,_) <- schFlags sch, r == rn ] ]
@@ -100,7 +111,7 @@ newRegFile name = CPUDef $ do
 -- value type explicitly when it cannot be inferred from the result.
 newReg :: forall t. HdlType t => String -> CPUDef (CPURegister t)
 newReg name = CPUDef $ do
-    tell mempty { schRegisters = [(name, fromIntegral (natVal (Proxy @(Width t))))] }
+    tell mempty { schRegisters = [RegDecl name (Proxy @t)] }
     pure (CPURegister name)
 
 -- | Declare a plain unsigned register by giving its width directly:
@@ -128,7 +139,7 @@ flagPack regName flagNames = CPUDef $ do
                         (reverse [0 .. length flagNames - 1])
                         flagNames
     tell mempty
-        { schRegisters  = [(regName, w)]
+        { schRegisters  = [RegDecl regName (Proxy @(Unsigned n))]
         , schStatusRegs = [(regName, w, flagNames)]
         }
     pure (CPURegister regName, flags)
@@ -150,7 +161,7 @@ flagRec regName = CPUDef $ do
         flagNames = map plName places
         flags     = [ CPUFlag regName (plPos p) | p <- places ]
     tell mempty
-        { schRegisters  = [(regName, w)]
+        { schRegisters  = [RegDecl regName (Proxy @a)]
         , schStatusRegs = [(regName, w, flagNames)]
         }
     pure (CPURegister regName, flags)
@@ -163,7 +174,13 @@ flagRec regName = CPUDef $ do
 -- fields, so they cannot drift from the Haskell type. Status registers still use
 -- 'flagRec' (for the bit-fields); this covers the plain scalar/array registers.
 regsFromRecord :: forall a. (Generic a, GFields (Rep a)) => Proxy a -> CPUDef ()
-regsFromRecord _ = CPUDef $ tell mempty { schRegisters = recordFields (Proxy @a) }
+regsFromRecord _ = CPUDef $ tell mempty { schRegisters = map declOfField (recordFields (Proxy @a)) }
+  where
+    -- Unused by the real cores (they use hand @reg@/@flagRec@ declarations);
+    -- reflect each field's width to an @Unsigned@ decl so the schema still types.
+    declOfField (nm, w) = case someNatVal (fromIntegral (max 0 w)) of
+        Just (SomeNat (_ :: Proxy k)) -> RegDecl nm (Proxy @(Unsigned k))
+        Nothing                       -> RegDecl nm (Proxy @(Unsigned 0))
 
 -- Declare that a register is readable/writable via a data space address.
 -- The pipeline uses these to detect hazards across the register/memory boundary.
