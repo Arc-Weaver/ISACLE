@@ -1,620 +1,647 @@
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
--- | CPU-level synthesis: adjoins a 'CPUDef' with a 'ISADef' to produce a
--- complete Harvard-architecture decode-execute circuit in the 'NetM' IR.
+{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE RecursiveDo         #-}
+-- | CPU-level synthesis: adjoins a 'CPUDef' with an 'ISADef' to produce a
+-- complete Harvard decode-execute circuit — written entirely against the
+-- 'Hdl'/'Signal' interface (no 'NetM', no 'WireId').
 --
--- = Hdl structure
---
--- * Scalar registers (PC, SP, …) become 'NReg' nodes, initialised from
---   'isaReset'.
--- * Flags become 1-bit 'NReg' nodes.
--- * Register files become register banks: one 'NReg' flip-flop per entry, with
---   combinational read muxes and one decoded write port per simultaneous-write
---   slot (so e.g. MUL writes R0 and R1 in the same cycle).  Not block RAM.
--- * Each instruction body in 'isaInstrs' is elaborated by 'runSynthM'; the
---   resulting write requests are combined into write arbiters.
--- * The PC is always updated: by a jump ('ScalarWriteReq' to PC) or by the
---   default single-word increment (PC + 1).
---
--- = Port names emitted
---
--- * @\"instr_word\"@   — input, @codeWordW@-bit instruction from code memory
--- * @\"data_rd_data\"@ — input, @wordW@-bit read data from data memory
--- * @\"code_rd_data\"@ — input, @codeWordW@-bit read data from code memory (LPM)
--- * @\"code_rd_addr\"@ — output, PC value driving code memory address
--- * @\"data_rd_addr\"@ — output, load address driving data memory read
--- * @\"data_wr_en\"@   — output, data memory write enable
--- * @\"data_wr_addr\"@ — output, data memory write address
--- * @\"data_wr_data\"@ — output, data memory write data
+-- State is 'registerW' (scalar registers, sequencer counters/latches) and
+-- 'regBank' (register files); combinational logic is pure 'Signal' composition;
+-- the @mdo@ block ties the feedback loops (register output → write arbiter →
+-- next; data-read address → execution sequencer → read result).  CPU memory
+-- inputs are signal arguments; outputs are the returned 'CpuMemIface'.
 module Isacle.ISA.Backend.SynthCPU
-    ( synthHarvardCPU
-    , synthHarvardCPU'
+    ( synthHarvardCPU'
     , CpuMemIface(..)
-      -- * Shared netlist utilities
     , extractPcName
-    , litWire
-    , driveWire
-    , buildOrTree
-    , buildMuxTree
     , addrBitsFor
+    , seqNAcc
+      -- * Pure Signal vocabulary reused by the VN pass
+    , litS, andS, orS, notS, toBool, eqS, muxS, sliceS, resizeS, addS, bwAndS, bwOrS
+    , orReduce, priorityMux
     ) where
 
 import Prelude hiding (Word)
-import Data.List (foldl', nub)
+import Data.List (foldl', nub, find)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Control.Monad (forM, forM_)
-import GHC.TypeLits (natVal)
+import GHC.TypeLits (natVal, KnownNat, someNatVal, SomeNat(..))
 
-import Hdl.Bits
-import Hdl.Net
+import Hdl.Bits (Unsigned(..), Bit(..))
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..))
+import GHC.Generics (Generic, Rep)
+import Hdl.Types (KnownDom(..), Signal(..), HdlType, Width, fromBits, GFields, recordFields, projectField, updateField)
+import Hdl.Monad (Hdl(..))
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
 import Isacle.ISA.Def
+import Isacle.ISA.IR (ReadTok(..), IStmt(..), iirStmts)
 import Isacle.ISA.Build (ISABuild, runISABuild, evalISABuild)
 import Isacle.ISA.Backend.Synth
+import Data.Bits ((.|.), shiftL)
+
+-- ---------------------------------------------------------------------------
+-- Pure Signal vocabulary (the Signal operators the backend reaches for)
+-- ---------------------------------------------------------------------------
+
+-- | A literal (width from the 'Int', type from context — must be an 'HdlType').
+litS :: (Signal s, HdlType a) => Integer -> Int -> s dom a
+litS = sigLitW
+
+-- Logical ops (sigPrim's output phantom is free) — yield a Bool condition.
+andS, orS, eqS, ltS :: (Signal s, HdlType x, HdlType y) => s dom x -> s dom y -> s dom Bool
+andS = sigPrim2 N.PAnd
+orS  = sigPrim2 N.POr
+eqS  = sigPrim2 N.PEq
+ltS  = sigPrim2 N.PLt
+
+notS :: (Signal s, HdlType x) => s dom x -> s dom Bool
+notS = sigPrim1 N.PNot
+
+-- | A 1-bit signal as a Bool condition: @x = '1'@.
+toBool :: forall s dom x. (Signal s, HdlType x) => s dom x -> s dom Bool
+toBool x = sigPrim2 N.PEq x (sigLitW 1 1 :: s dom x)
+
+-- Data ops — width-generic: same-width binary ops preserve the operand type,
+-- so typed signals (e.g. @Unsigned addrW@) flow through unchanged.
+addS, bwAndS, bwOrS :: (Signal s, HdlType a) => s dom a -> s dom a -> s dom a
+addS   = sigPrim2 N.PAdd
+bwAndS = sigPrim2 N.PAnd
+bwOrS  = sigPrim2 N.POr
+
+-- | A mux preserving its branch type (both arms and the result share @a@).
+muxS :: (Signal s, HdlType a) => s dom Bool -> s dom a -> s dom a -> s dom a
+muxS = sigPrim3 N.PMux
+
+-- Width-changing ops: free output type (annotate at the use site).
+sliceS :: (Signal s, HdlType x, HdlType a) => Int -> Int -> s dom x -> s dom a
+sliceS hi lo = sigPrim1 (N.PSlice hi lo)
+
+resizeS :: (Signal s, HdlType x, HdlType a) => Int -> s dom x -> s dom a
+resizeS w = sigPrim1 (N.PResize w)
+
+-- | OR-reduce a list of conditions; constant-0 when empty.
+orReduce :: Signal s => [s dom Bool] -> s dom Bool
+orReduce []     = litS 0 1
+orReduce (x:xs) = foldl' orS x xs
+
+-- | Right-to-left priority mux: the /first/ matching pair wins, else @def@.
+-- Preserves the branch type @a@ across all pairs and the default.
+priorityMux :: (Signal s, HdlType a) => [(s dom Bool, s dom a)] -> s dom a -> s dom a
+priorityMux pairs def = foldr (\(sel, v) acc -> muxS sel v acc) def pairs
 
 -- ---------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------
 
--- | Memory interface wires returned by 'synthHarvardCPU''.
--- Input wires (@cmiInstrWord@, @cmiDataRdData@) must be driven externally
--- (by a code ROM and data bus respectively) after synthesis.
-data CpuMemIface = CpuMemIface
-    { cmiInstrWord  :: WireId  -- ^ pre-allocated; must be driven by code ROM
-    , cmiDataRdData :: WireId  -- ^ pre-allocated; must be driven by data bus
-    , cmiCodeRdAddr :: WireId  -- ^ PC output (width = cmiCodeAddrW)
-    , cmiDataRdAddr :: WireId  -- ^ data read address (width = cmiDataAddrW)
-    , cmiDataWrEn   :: WireId  -- ^ data write enable (1-bit)
-    , cmiDataWrAddr :: WireId  -- ^ data write address (width = cmiDataAddrW)
-    , cmiDataWrData :: WireId  -- ^ data write data (width = cmiWordW)
+-- | The CPU's memory-port /outputs/ (the CPU drives all of these).  Inputs
+-- (instruction word, read data, stall, irq) are passed to 'synthHarvardCPU'' as
+-- signal arguments.
+data CpuMemIface s dom codeAddrW addrW wordW = CpuMemIface
+    { cmiCodeRdAddr :: s dom (Unsigned codeAddrW) -- ^ single code read address: PC (opcode), then PC+1, PC+2, … (operands)
+    , cmiDataRdAddr :: s dom (Unsigned addrW)     -- ^ data read address
+    , cmiDataWrEn   :: s dom Bool                 -- ^ data write enable (1-bit)
+    , cmiDataWrAddr :: s dom (Unsigned addrW)     -- ^ data write address
+    , cmiDataWrData :: s dom (Unsigned wordW)     -- ^ data write data
+    , cmiIrqAck     :: s dom Bool                 -- ^ 1 the cycle the interrupt handler commits (takes the IRQ)
     , cmiCodeAddrW  :: Int
     , cmiDataAddrW  :: Int
     , cmiWordW      :: Int
     , cmiCodeWordW  :: Int
-    , cmiIrqPending :: Maybe WireId  -- ^ Just w when ISA has an interrupt body
-    , cmiIrqVector  :: Maybe WireId  -- ^ Just w when ISA has an interrupt body
     }
 
--- | Synthesise a complete single-cycle Harvard CPU from a 'CPUDef' and
--- 'ISADef'.  Emits all 'NetNode' IR nodes into the current 'NetM' context.
--- The caller must pre-allocate three input wires and drive them after calling:
---   * @instrWordW@  — instruction word from code ROM
---   * @dmemRdDataW@ — read data from data memory
---   * @cmemRdDataW@ — read data from code memory (LPM; stub OK)
--- Returns 'CpuMemIface' with all interface wire IDs and their widths.
-synthHarvardCPU' :: forall dom wordW addrW codeWordW codeAddrW alu.
-                    ( KnownDom dom
-                    , KnownNat wordW, KnownNat addrW
-                    , KnownNat codeWordW, KnownNat codeAddrW )
-                 => CPUDef alu
-                 -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
-                 -> WireId   -- ^ pre-allocated instr_word wire
-                 -> WireId   -- ^ pre-allocated data_rd_data wire
-                 -> WireId   -- ^ pre-allocated code_rd_data wire (LPM stub)
-                 -> WireId   -- ^ pre-allocated stall wire (1 = data txn not complete)
-                 -> NetM CpuMemIface
-synthHarvardCPU' cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId = do
+-- | Synthesise a complete Harvard CPU from a 'CPUDef' and 'ISADef' as 'Hdl'.
+--
+-- Inputs (all signals): instruction word, data read data, code read data (LPM),
+-- stall (1 = data transaction not complete), and irq pending / vector (tie to 0
+-- when the ISA has no interrupt body / no controller is wired).
+synthHarvardCPU'
+    :: forall core s m dom wordW addrW codeWordW codeAddrW alu.
+       ( Hdl s m, Signal s, KnownDom dom
+       , HdlType core, Generic core, GFields (Rep core)
+       , KnownNat wordW, KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW )
+    => CPUDef alu
+    -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
+    -> s dom (Unsigned codeWordW)   -- ^ code_data: the single code read port's data
+                                    --   (opcode on the fetch cycle, operand words after)
+    -> s dom (Unsigned wordW)       -- ^ data_rd_data
+    -> s dom Bool                   -- ^ stall
+    -> s dom Bool                   -- ^ irq_pending
+    -> s dom (Unsigned codeAddrW)   -- ^ irq_vector
+    -> m (CpuMemIface s dom codeAddrW addrW wordW)
+synthHarvardCPU' cpuDef isaDef codeData dmemRdData stallSig irqPendSig irqVecSig = do
     let (aluRec, schema) = runCPUDef cpuDef
-    let domInfo      = domId (Proxy @dom)
-    let wordBits     = fromIntegral (natVal (Proxy @wordW))     :: Int
-    let addrBits     = fromIntegral (natVal (Proxy @addrW))     :: Int
-    let codeBits     = fromIntegral (natVal (Proxy @codeWordW)) :: Int
-    let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW)) :: Int
+        wordBits     = fromIntegral (natVal (Proxy @wordW))     :: Int
+        addrBits     = fromIntegral (natVal (Proxy @addrW))     :: Int
+        codeBits     = fromIntegral (natVal (Proxy @codeWordW)) :: Int
+        codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW)) :: Int
 
-    -- Build reset value maps from isaReset
-    let resetEntries = runResetDef (isaReset isaDef) aluRec
-    let resetRegMap  = Map.fromList
-            [ (n, v) | ResetRegEntry n (Unsigned v) <- resetEntries ]
-    -- Accumulate per-bit flag reset contributions into per-register initial values.
-    let resetFlagContribs = Map.fromListWith (.|.)
+        -- Reset value maps from isaReset.
+        resetEntries = runResetDef (isaReset isaDef) aluRec
+        resetRegMap  = Map.fromList [ (n, v) | ResetRegEntry n (Unsigned v) <- resetEntries ]
+        resetFlagContribs = Map.fromListWith (.|.)
             [ (rn, if b == Hi then 1 `shiftL` bp else 0)
             | ResetFlagEntry rn bp b <- resetEntries ]
-
-    -- -----------------------------------------------------------------------
-    -- Scalar registers (NReg, deferred)
-    -- Status registers are included here — flagPack adds them to schRegisters.
-    -- Their initial value merges resetReg and resetFlag contributions.
-    -- -----------------------------------------------------------------------
-
-    scalarRegs <- forM (schRegisters schema) $ \(name, w) -> do
-        outW <- freshWire
-        nxtW <- freshWire
-        enW  <- freshWire
-        let initVal = Map.findWithDefault 0 name resetRegMap
+        initOf name = Map.findWithDefault 0 name resetRegMap
                   .|. Map.findWithDefault 0 name resetFlagContribs
-        defer $ emit $ NReg outW nxtW (Just enW) (SomeBits initVal w) domInfo
-        hintWire outW name
-        hintWire nxtW (name ++ "_nxt")
-        hintWire enW  (name ++ "_en")
-        return (name, w, outW, nxtW, enW)
 
-    -- Group all CPU state registers into a VHDL record so the emitter
-    -- produces  "type cpu_state_t is record ..."  and references like
-    -- "cpu_state.PC" instead of flat signal names.
-    emit $ N.NGroup "cpu_state"
-        [ (name, outW) | (name, _, outW, _, _) <- scalarRegs ]
+        regList      = schRegisters schema            -- [RegDecl] (typed)
+        widthOf name = maybe wordBits rdWidth (find ((== name) . rdName) regList)
+        rfInfoMap    = Map.fromList [ (n, (c, w)) | (n, c, w) <- schRegFiles schema ]
+        regCount rf  = maybe 1 fst (Map.lookup rf rfInfoMap)
+        statusRegMap = Map.fromList [ (n, (w, fs)) | (n, w, fs) <- schStatusRegs schema ]
+        pcName       = extractPcName aluRec isaDef
 
-    let scalarRegMap :: Map String (Int, WireId, WireId, WireId)
-        scalarRegMap = Map.fromList
-            [ (n, (w, outW, nxtW, enW)) | (n, w, outW, nxtW, enW) <- scalarRegs ]
+        -- PASS 1 — static ISA analysis (pure, no elaboration monad).  Every size
+        -- the hardware needs is counted from each instruction body's IR, so it is
+        -- independent of the render results.  That independence is load-bearing:
+        -- if a size depended on @allResults@, forcing the thing it sizes (e.g.
+        -- @opWords@' spine) during render would knot the mfix.
+        --   • @maxCode@  sizes the operand-word register array.
+        --   • @maxCyc@   sizes the exec-cycle counter (opened as a type in pass 2).
+        allBodies = isaInstrs isaDef ++ maybe [] (: []) (isaInterruptBody isaDef)
+        stmtsOf body   = iirStmts (runISABuild aluRec body)
+        codeReadsOf body = length [ () | SReadCode  _ _ <- stmtsOf body ]
+        dataAccOf  body  = length [ () | SReadMem   _ _ <- stmtsOf body ]
+                         + length [ () | SWriteMem  _ _ <- stmtsOf body ]
+        -- commit cycle = a fetch cycle (opcode read, for any instruction with code
+        -- operands) then code-operand reads (0..nCode-1) then data accesses, with
+        -- one settle cycle for a pure code-read instruction.  MUST mirror
+        -- 'commitCycleOf' (pass 2) exactly, or the counter is mis-sized — the
+        -- @fetchOffset@ term is what makes an operanded instruction take its extra
+        -- opcode-fetch cycle, so it must be counted here too.
+        fetchOffStatic body = if codeReadsOf body > 0 then 1 else 0
+        commitCycStatic body = fetchOffStatic body + codeReadsOf body + max (dataAccOf body) 1 - 1
+        maxCode = maximum (0 : map codeReadsOf allBodies)
+        maxCyc  = maximum (1 : map (\b -> commitCycStatic b + 1) allBodies)
 
-    let scReadRegFn :: String -> WireId -> NetM WireId
-        scReadRegFn name _ = case Map.lookup name scalarRegMap of
-            Just (_, outW, _, _) -> return outW
-            Nothing              -> freshWire
+        -- The Core record's fields (MSB-first) and its packed reset value: each
+        -- @coreXXX@ field's reset is @initOf "XXX"@ (strip the @core@ prefix).
+        coreFields = recordFields (Proxy @core)
+        coreReset  = fromBits
+            (foldl' (\acc (fn, w) -> (acc `shiftL` w) .|. initOf (drop 4 fn)) 0 coreFields) :: core
 
-    -- -----------------------------------------------------------------------
-    -- Register-file info table (from CPUSchema)
-    -- -----------------------------------------------------------------------
+        -- A register read: project the named field of the core signal at the
+        -- demanded type.  Kept /outside/ the @mdo@ knot and applied to
+        -- @coreState@ inline at each use, so it stays polymorphic (a binding
+        -- inside the recursive group would be monomorphised to a single type).
+        readScalarOf :: forall a. HdlType a => s dom core -> String -> s dom a
+        readScalarOf cst n = projectField ("core" ++ n) cst
 
-    let rfInfoMap :: Map String (Int, Int)
-        rfInfoMap = Map.fromList
-            [ (n, (c, w)) | (n, c, w) <- schRegFiles schema ]
+        -- Endianness-aware byte addressing for multi-byte register aliases.
+        nBytesOf bits = (bits + wordBits - 1) `div` wordBits
+        byteAtOffset nBytes off = case schEndianness schema of
+            LittleEndian -> off
+            BigEndian    -> nBytes - 1 - off
 
-    -- -----------------------------------------------------------------------
-    -- Status register map: name → (width, [flag names MSB-first])
-    -- Used for the combined flag+scalar write arbiter.
-    -- -----------------------------------------------------------------------
+    -- PASS 2 — elaboration, in a CPS prelude that opens the exec-cycle counter
+    -- width @cyW@ as a real type from the pass-1 size.  'reflectNat' is a pure
+    -- @case@ on 'someNatVal' that wraps (does not enter) the @mdo@, so the whole
+    -- recursive body runs with @cyW@ in scope — the counter is @Unsigned cyW@ and
+    -- its @execNxt@ feedback stays inside one @mdo@, no fixed width, no boundary.
+    reflectNat (addrBitsFor maxCyc) $ \(Proxy :: Proxy cyW) -> mdo
+        -- The scalar core (SP/PC/SREG) is one clocked register; the arbiter below
+        -- ties its next value.  A register read projects the field at the demanded
+        -- type — no erased signal, no per-name map.
+        coreState <- named "cpu_core" =<< register coreReset nextCore
+        let -- read status-register bit @bp@: project the status reg (reflect its
+            -- runtime width to a type) and slice the bit.
+            getFlag :: String -> Int -> s dom Bool
+            getFlag rn bp =
+                case someNatVal (fromIntegral (maybe wordBits fst (Map.lookup rn statusRegMap))) of
+                    Just (SomeNat (_ :: Proxy n)) -> sliceS bp bp (readScalarOf coreState rn :: s dom (Unsigned n))
+                    Nothing                       -> litS 0 1
 
-    let statusRegMap = Map.fromList
-            [ (n, (w, fs)) | (n, w, fs) <- schStatusRegs schema ]
+            -- byte @b@ of a register signal, as a wordBits value
+            regByteSig :: forall x. HdlType x => s dom x -> Int -> Int -> s dom (Unsigned wordW)
+            regByteSig srcSig srcBits b =
+                let lo = wordBits * b; hi = min (wordBits * (b + 1)) srcBits
+                in resizeS wordBits (sliceS (hi - 1) lo srcSig :: s dom (Unsigned wordW))
+            -- replace byte @b@ of @regSig@ with @dat@ (keeping the other bytes)
+            replaceByteSig :: forall a b. (HdlType a, HdlType b)
+                           => s dom a -> Int -> Int -> s dom b -> s dom a
+            replaceByteSig regSig regW b dat =
+                let lo = wordBits * b; hi = min (wordBits * (b + 1)) regW
+                    clearVal = (2 :: Integer) ^ hi - 2 ^ lo
+                    maskVal  = (2 ^ regW - 1) - clearVal
+                    cleared  = bwAndS regSig (litS maskVal regW)
+                    shifted  = sigPrim2 N.PShiftL (resizeS regW dat :: s dom a) (litS (fromIntegral lo) regW :: s dom a) :: s dom a
+                in bwOrS cleared shifted
 
-    -- -----------------------------------------------------------------------
-    -- Flag reader: extract a single bit from the status register output wire.
-    -- -----------------------------------------------------------------------
+            -- @addr@ in @[base, base+count)@ ?
+            inFileRange :: forall a. HdlType a => s dom a -> Integer -> Int -> s dom Bool
+            inFileRange addr base count =
+                andS (notS (sigPrim2 N.PLt addr (litS base addrBits :: s dom a) :: s dom Bool))
+                     (sigPrim2 N.PLt addr (litS (base + fromIntegral count) addrBits :: s dom a) :: s dom Bool)
+            fileIndexW :: forall a. HdlType a => s dom a -> Integer -> Int -> s dom (Unsigned 8)
+            fileIndexW addr base count =
+                resizeS (addrBitsFor count) (sigPrim2 N.PSub addr (litS base addrBits :: s dom a) :: s dom a)
 
-    let getFlagFn :: String -> Int -> NetM WireId
-        getFlagFn regName bitPos = case Map.lookup regName scalarRegMap of
-            Nothing -> freshWire
-            Just (_, regOutW, _, _) -> do
-                out <- freshWire
-                emit $ NComb out (N.PSlice bitPos bitPos) [regOutW]
-                return out
+        -- Alias-aware data read: a read whose address matches a memory-mapped
+        -- register (or a register-file alias window) returns the live state.
+        -- Polymorphic in the address type so the override can pass the read's
+        -- address WITHOUT forcing it — a data read whose address is a (sequenced)
+        -- code-read result must not force the sequencer while it is being built.
+        let aliasReadOf :: forall aw. HdlType aw => s dom aw -> m (s dom (Unsigned wordW))
+            aliasReadOf addr = do
+                rfAcc <- foldr (\(fileName, base) accM -> do
+                            acc <- accM
+                            case Map.lookup fileName rfInfoMap of
+                              Nothing -> pure acc
+                              Just (count, _) -> do
+                                rd <- regBankRead "cpu_state" fileName count (fileIndexW addr base count)
+                                pure (muxS (inFileRange addr base count) rd acc))
+                          (pure dmemRdData) (schAliasFiles schema)
+                pure $ foldr (\(regName, aliasAddr) acc ->
+                          let srcBits = widthOf regName
+                              nBytes  = nBytesOf srcBits
+                          in case someNatVal (fromIntegral srcBits) of
+                               Just (SomeNat (_ :: Proxy n)) ->
+                                 let src = readScalarOf coreState regName :: s dom (Unsigned n)
+                                 in foldr (\off a ->
+                                      let cmp   = eqS addr (litS (aliasAddr + fromIntegral off) addrBits :: s dom (Unsigned addrW))
+                                          byteV = regByteSig src srcBits (byteAtOffset nBytes off)
+                                                    :: s dom (Unsigned wordW)
+                                      in muxS cmp byteV a) acc [0 .. nBytes - 1]
+                               Nothing -> acc)
+                       rfAcc (schAliasRegs schema)
 
-    -- -----------------------------------------------------------------------
-    -- Alias-aware data memory reader
-    -- For each aliasReg entry, builds a comparator and mux so that reads from
-    -- the alias address return the register value instead of SRAM data.
-    -- -----------------------------------------------------------------------
+        -- Per-instruction render context.  @rcReadRes@ is supplied by the
+        -- sequencer (mdo); register reads come from the scalar map / regBankRead.
+        let mkCtx i rcIrq = RenderCtx
+                { rcInstrWire  = sigRetype decodeOpcode
+                , rcReadScalar = readScalarOf coreState
+                , rcDataBus    = sigRetype dmemRdData
+                , rcCodeBus    = sigRetype codeData
+                  -- the @j@-th sequentially-fetched operand word (a latched
+                  -- register, see @opWords@ below) — forcing it forces a register,
+                  -- not the exec sequencer, so no mfix knot.
+                , rcCodeWord   = \j -> sigRetype (opWords !! j)
+                , rcReadRes    = runSeqReadRes seqReadRes i
+                , rcGetFlag    = getFlag
+                , rcRegCount   = regCount
+                , rcIrqVector  = fmap sigRetype rcIrq
+                , rcWordW      = wordBits
+                }
 
-    let scReadMemFnAlias :: WireId -> NetM WireId
-        scReadMemFnAlias addrW =
-            foldl' (\accM (regName, aliasAddr) -> do
-                acc <- accM
-                let mSrc = fmap (\(rw, rout, _, _) -> (rout, rw))
-                                (Map.lookup regName scalarRegMap)
-                case mSrc of
-                    Nothing -> return acc
-                    Just (srcW, srcBits) -> do
-                        addrLitW <- litWire aliasAddr addrBits
-                        cmpW <- freshWire
-                        emit $ NComb cmpW N.PEq [addrW, addrLitW]
-                        dataW <- case compare srcBits wordBits of
-                            EQ -> return srcW
-                            LT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PResize wordBits) [srcW]
-                                     ; return w }
-                            GT -> do { w <- freshWire
-                                     ; emit $ NComb w (N.PSlice (wordBits - 1) 0) [srcW]
-                                     ; return w }
-                        muxW <- freshWire
-                        emit $ NComb muxW N.PMux [cmpW, dataW, acc]
-                        return muxW)
-                (return dmemRdDataW)
-                (schAliasRegs schema)
+        -- Render every instruction body (and the interrupt body, if any).
+        results <- forM (zip [0 ..] (isaInstrs isaDef)) $ \(i, instr) ->
+            renderSynth (mkCtx i Nothing) Nothing (runISABuild aluRec instr)
+        irqResult <- case isaInterruptBody isaDef of
+            Nothing   -> pure Nothing
+            Just body -> Just <$>
+                renderSynth (mkCtx (length (isaInstrs isaDef)) (Just irqVecSig))
+                            (Just (toBool irqPendSig)) (runISABuild aluRec body)
+        -- Interrupt preemption: when the interrupt is TAKEN this cycle (its match =
+        -- @irq_pending@ AND the ISA's gate, e.g. the I/EA flag), the fetched
+        -- instruction must not commit — otherwise it races the handler (its PC
+        -- write beats the vector, its writes corrupt the pushes).  Suppress every
+        -- instruction's effects with @not irqActive@ so only the handler runs, the
+        -- clean single-body semantics the reference sim's 'runIrq' already models.
+        -- With no interrupt body (or @irq_pending = 0@) @irqActive = 0@, so this is
+        -- a no-op — normal instruction execution is unchanged.
+        let irqActive    = maybe (litS 0 1) id (irqResult >>= srMatchWire)
+            notIrqActive = notS irqActive
+            allResults0  = map (suppressWhen notIrqActive) results
+                        ++ maybe [] (: []) irqResult
 
-    let renderCtx = RenderCtx
-            { rcInstrWire  = instrWireId
-            , rcReadScalar = \n -> scReadRegFn n 0
-            , rcDataBus    = dmemRdDataW
-            , rcCodeBus    = cmemRdDataW
-            , rcGetFlag    = getFlagFn
-            , rcIrqVector  = Nothing
-            , rcWordW      = wordBits
+        -- Execution-cycle counter — from @allResults0@ (it depends only on
+        -- per-instruction access COUNTS and match wires, which the alias override
+        -- below does not change).  It must precede the override, because the
+        -- override materialises code-operand addresses (an aliased @LDS@ reads
+        -- register-file state at a code-fetched address), which forces @opWords@,
+        -- which thread through this counter's @exec_cycle@ effect.
+        --
+        -- Built INLINE in this outer @mdo@ (not a helper with its own @mdo@): a
+        -- nested @mfix@ forced mid-tie would black-hole.  The counter register is
+        -- @Unsigned cyW@ — the exact width from pass 1 (@cyW@ opened by the CPS
+        -- prelude) — and its @execNxt@ feedback stays inside this one @mdo@.
+        -- Downstream cycle comparisons use @execCyc16@ (a resize) so nothing else
+        -- needs the narrow width.
+        let memActive = orReduce [ m | r <- allResults0, seqNAcc r >= 1, Just m <- [srMatchWire r] ]
+            notWait   = notS (andS memActive stallSig)
+            cw        = addrBitsFor maxCyc          -- == natVal @cyW
+        execCycN <- if maxCyc < 2
+            then pure (litS 0 cw :: s dom (Unsigned cyW))
+            else named "exec_cycle" =<< registerW cw 0 (litS 1 1) execNxt
+        let execCyc16 = resizeS 16 execCycN :: s dom (Unsigned 16)
+            cyclesNeeded = priorityMux
+                [ (m, litS (fromIntegral (commitCycleOf r)) cw)
+                | r <- allResults0, commitCycleOf r >= 1, Just m <- [srMatchWire r] ]
+                (litS 0 cw) :: s dom (Unsigned cyW)
+            isLast  = eqS execCycN cyclesNeeded
+            commit  = if maxCyc < 2 then notWait else andS isLast notWait
+            execNxt = muxS (notS notWait) execCycN
+                           (muxS isLast (litS 0 cw) (addS execCycN (litS 1 cw)))
+                    :: s dom (Unsigned cyW)
+            gate :: Int -> s dom Bool -> Int -> s dom Bool
+            gate _ m i
+                | maxCyc < 2 = m
+                | otherwise  = andS m (eqS execCyc16 (litS (fromIntegral i) 16 :: s dom (Unsigned 16)))
+            execCtr = ExecCounter commit gate execCyc16 notWait
+
+        -- Sequentially-fetched code operand words.  The CPU walks the code bus:
+        -- operand word @j@ is at @PC + 1 + j@, read on exec cycle @j@ and latched.
+        -- A body reads back the /register/ (not a mux with the live bus), so the
+        -- read path is a plain wire: forcing/materialising a code-operand value
+        -- (e.g. as an @LDS@ address in the alias override) touches only the
+        -- register, never @exec_cycle@ — that is what keeps the mfix from knotting.
+        -- The cost is that the final word must be latched before the instruction
+        -- commits, so a pure code-read instruction gets one settle cycle (see
+        -- @commitCycleOf@).  @maxCode@ is a static ISA count, so the list spine is
+        -- render-independent.
+        -- The code memory is a SINGLE read port.  The opcode is the first read
+        -- (exec cycle 0, address = PC), latched so the decoder sees it stable while
+        -- operand words are fetched at PC+1, PC+2, … on later cycles.  The decode
+        -- signal is the live bus on the fetch cycle — so a single-cycle instruction
+        -- (no operands) decodes and commits at cycle 0 — and the latch afterwards.
+        opcodeReg <- registerW codeBits 0
+                       (eqS execCyc16 (litS 0 16 :: s dom (Unsigned 16))) codeData
+                     :: m (s dom (Unsigned codeWordW))
+        let decodeOpcode = muxS (eqS execCyc16 (litS 0 16 :: s dom (Unsigned 16)))
+                                codeData opcodeReg :: s dom (Unsigned codeWordW)
+        -- Operand word @j@ is at @PC+1+j@, read on exec cycle @j+1@ (cycle 0 is the
+        -- opcode fetch) and latched.  Read back as the register, so forcing it forces
+        -- a register, not the sequencer — no mfix knot.
+        opWords <- forM [0 .. maxCode - 1] $ \j -> do
+            let onCyc = eqS execCyc16 (litS (fromIntegral (j + 1)) 16 :: s dom (Unsigned 16))
+            registerW codeBits 0 onCyc codeData :: m (s dom (Unsigned codeWordW))
+
+        -- Override each data read's bus value with its alias-decoded read.  This
+        -- materialises the read address; for a code-fetched address that is one of
+        -- the @opWords@ registers, whose deferred read (see 'regBankRead') keeps the
+        -- surrounding @mfix@ from being forced here.
+        allResults <- forM allResults0 $ \r -> do
+            mrs <- forM (srMemReads r) $ \(MemReadReq match tok adr _) -> do
+                bus <- aliasReadOf adr
+                pure (MemReadReq match tok adr bus)
+            pure r { srMemReads = mrs }
+
+        -- Data-read result latches (from the overridden results): the per-(instr,
+        -- read) value each body consumed, sequenced onto the counter's cycles.
+        seqReadRes <- buildDataLatches wordBits execCtr allResults
+
+        -- Register files: one indexed write port per RegWriteReq (match AND
+        -- commit), plus data-space alias-window stores.  The entry width is
+        -- reflected to a type so the ports are typed.
+        let allRegWrites = concatMap srRegWrites allResults
+            allMemWrites = concatMap srMemWrites allResults
+            involvedRfs  = nub ([ nm | RegWriteReq _ nm _ _ <- allRegWrites ]
+                                ++ map (\(n,_,_) -> n) (schRegFiles schema))
+        forM_ involvedRfs $ \rfname -> do
+            let (rfCount, rfWidth) = maybe (1, wordBits) id (Map.lookup rfname rfInfoMap)
+                fileBases          = [ base | (fn, base) <- schAliasFiles schema, fn == rfname ]
+            case someNatVal (fromIntegral rfWidth) of
+              Just (SomeNat (_ :: Proxy ew)) -> do
+                let instrWrites =
+                      [ ( sigRetype idx :: s dom (Unsigned 8)
+                        , sigRetype dat :: s dom (Unsigned ew)
+                        , andS match commit )
+                      | RegWriteReq match nm idx dat <- allRegWrites, nm == rfname ]
+                    aliasWrites =
+                      [ ( fileIndexW addr base rfCount
+                        , sigRetype dt :: s dom (Unsigned ew)
+                        , andS (andS match (inFileRange addr base rfCount)) commit )
+                      | base <- fileBases, MemWriteReq match adr dt <- allMemWrites
+                      , let addr = sigRetype adr :: s dom (Unsigned addrW) ]
+                regBank "cpu_state" rfname rfCount rfWidth (instrWrites ++ aliasWrites)
+              Nothing -> pure ()
+
+        -- Data writes to a memory-mapped scalar register byte → a ScalarWriteReq.
+        -- The register width is reflected to a type so the (typed) full-register
+        -- next-value can be built from its current value and the written byte.
+        let aliasScalarWrites =
+                [ ScalarWriteReq gated regName full
+                | (regName, aliasAddr) <- schAliasRegs schema
+                , let regW = widthOf regName; nBytes = nBytesOf regW
+                , MemWriteReq match adr dt <- allMemWrites
+                , off <- [0 .. nBytes - 1]
+                , Just (SomeNat (_ :: Proxy rw)) <- [someNatVal (fromIntegral (max 1 regW))]
+                , let addr   = sigRetype adr :: s dom (Unsigned addrW)
+                      cmp    = eqS addr (litS (aliasAddr + fromIntegral off) addrBits :: s dom (Unsigned addrW))
+                      gated  = andS match cmp
+                      regSig = readScalarOf coreState regName :: s dom (Unsigned rw)
+                      full   = replaceByteSig regSig regW (byteAtOffset nBytes off) (sigRetype dt :: s dom (Unsigned wordW)) ]
+
+        -- Scalar / status write arbiter → the next Core value: fold each register's
+        -- committed next-value into the core record with 'updateField'.  Each
+        -- register's writes are re-tagged to /its/ type (they all target the same
+        -- register, so the widths coincide) as they are collected.
+        let allScalarWrites = concatMap srScalarWrites allResults ++ aliasScalarWrites
+            allFlagWrites   = concatMap srFlagWrites allResults
+            writesOfAt :: forall t. HdlType t => String -> [(s dom Bool, s dom t)]
+            writesOfAt name = [ (m, sigRetype d :: s dom t)
+                              | ScalarWriteReq m nm d <- allScalarWrites, nm == name ]
+            statusBits :: forall t. HdlType t => String -> s dom t -> s dom t
+            statusBits name cur =
+                let w      = fromIntegral (natVal (Proxy @(Width t)))
+                    writes = writesOfAt name :: [(s dom Bool, s dom t)]
+                    bitNext bitPos =
+                        let curBit  = sliceS bitPos bitPos cur :: s dom Bool
+                            fwPairs = [ (fwMatchWire fw, fwValueWire fw)
+                                      | fw <- allFlagWrites
+                                      , fwRegName fw == name, fwBitPos fw == bitPos ]
+                            scPairs = [ (m, sliceS bitPos bitPos d :: s dom Bool) | (m, d) <- writes ]
+                        in priorityMux (fwPairs ++ scPairs) curBit
+                    place i b = sigPrim2 N.PShiftL
+                                  (resizeS w (b :: s dom Bool)     :: s dom t)
+                                  (litS (fromIntegral i) w         :: s dom t) :: s dom t
+                in case [ place i (bitNext i) | i <- [0 .. w - 1] ] of
+                     []     -> litS 0 (max 1 w)
+                     (x:xs) -> foldl' (sigPrim2 N.POr) x xs
+            updateReg acc (RegDecl name (_ :: Proxy t)) =
+                let cur     = readScalarOf coreState name :: s dom t
+                    w       = fromIntegral (natVal (Proxy @(Width t)))
+                    writes  = writesOfAt name :: [(s dom Bool, s dom t)]
+                    matches = map fst writes
+                           ++ [ fwMatchWire fw | fw <- allFlagWrites, fwRegName fw == name ]
+                    nxt | name == pcName               = priorityMux writes (addS cur (litS 1 w))
+                        | Map.member name statusRegMap = statusBits name cur
+                        | otherwise                    = priorityMux writes cur
+                    en  | name == pcName = commit
+                        | otherwise      = andS commit (orReduce matches)
+                in updateField ("core" ++ name) (muxS en nxt cur) acc
+            nextCore = foldl' updateReg coreState regList
+
+        -- Single code read address: PC on the opcode-fetch cycle, then PC+1, PC+2,
+        -- … as the exec cycle advances (operand words follow the opcode on the same
+        -- one port — the code memory is a simple single-word-read bus).
+        let pcRegW = widthOf pcName
+            pcAddr = (case someNatVal (fromIntegral (max 1 pcRegW)) of
+                Just (SomeNat (_ :: Proxy pw)) ->
+                    resizeS codeAddrBits (readScalarOf coreState pcName :: s dom (Unsigned pw))
+                Nothing -> litS 0 codeAddrBits) :: s dom (Unsigned codeAddrW)
+            codeAddr = addS pcAddr (resizeS codeAddrBits execCyc16)
+                     :: s dom (Unsigned codeAddrW)
+
+        -- Data-memory read address mux (each read gated by its exec cycle).  Data
+        -- reads follow the opcode fetch and operand reads, so read @j@ is on cycle
+        -- @fetchOffset + nCode + j@.
+        let readsIndexed = [ (seqNAcc r, fetchOffset r + length (srCodeReads r) + idx, rr)
+                           | r <- allResults, (idx, rr) <- zip [0 ..] (srMemReads r) ]
+            gatedReads   = [ (gate nAcc match cyc, sigRetype adr :: s dom (Unsigned addrW))
+                           | (nAcc, cyc, MemReadReq match _ adr _) <- readsIndexed ]
+            dmemRdAddr   = priorityMux gatedReads (litS 0 addrBits) :: s dom (Unsigned addrW)
+        -- Data-memory write arbiter (write j on cycle fetchOffset + nCode + nReads + j).
+        let writesIndexed = [ (seqNAcc r, fetchOffset r + length (srCodeReads r) + length (srMemReads r) + idx, mw)
+                            | r <- allResults, (idx, mw) <- zip [0 ..] (srMemWrites r) ]
+            gatedWrites   = [ ( gate nAcc match cyc
+                              , sigRetype adr :: s dom (Unsigned addrW)
+                              , sigRetype dt  :: s dom (Unsigned wordW) )
+                            | (nAcc, cyc, MemWriteReq match adr dt) <- writesIndexed ]
+            dmemWrEn      = orReduce [ g | (g, _, _) <- gatedWrites ]
+            dmemWrAddr    = priorityMux [ (g, a) | (g, a, _) <- gatedWrites ] (litS 0 addrBits) :: s dom (Unsigned addrW)
+            dmemWrData    = priorityMux [ (g, d) | (g, _, d) <- gatedWrites ] (litS 0 wordBits) :: s dom (Unsigned wordW)
+
+        pure CpuMemIface
+            { cmiCodeRdAddr = codeAddr
+            , cmiDataRdAddr = dmemRdAddr
+            , cmiDataWrEn   = dmemWrEn
+            , cmiDataWrAddr = dmemWrAddr
+            , cmiDataWrData = dmemWrData
+            , cmiIrqAck     = andS irqActive commit  -- handler commits this cycle
+            , cmiCodeAddrW  = codeAddrBits
+            , cmiDataAddrW  = addrBits
+            , cmiWordW      = wordBits
+            , cmiCodeWordW  = codeBits
             }
 
-    -- Each body is built into an InstrIR, then lowered to a SynthResult.
-    results <- forM (isaInstrs isaDef) $ \instr ->
-        renderSynth renderCtx Nothing (runISABuild aluRec instr)
+-- ---------------------------------------------------------------------------
+-- Execution sequencer
+-- ---------------------------------------------------------------------------
 
-    -- Interrupt body synthesis (if ISA declares one)
-    irqData <- case isaInterruptBody isaDef of
-        Nothing   -> return Nothing
-        Just body -> do
-            irqPendW <- freshWire
-            emit $ NInput irqPendW "irq_pending" 1 domInfo
-            irqVecW  <- freshWire
-            emit $ NInput irqVecW "irq_vector" codeAddrBits domInfo
-            r <- renderSynth renderCtx { rcIrqVector = Just irqVecW }
-                             (Just irqPendW) (runISABuild aluRec body)
-            return (Just (irqPendW, irqVecW, r))
+-- | Qualify every match wire of a rendered instruction with @off@ (AND it in), so
+-- the instruction's effects are suppressed whenever @off@ is low.  Used to hold
+-- the fetched instruction off the architectural state while an interrupt is taken.
+suppressWhen :: forall s dom. Signal s => s dom Bool -> SynthResult s dom -> SynthResult s dom
+suppressWhen off r = r
+    { srMatchWire    = fmap (andS off) (srMatchWire r)
+    , srRegWrites    = [ w { rwMatchWire = andS off (rwMatchWire w) } | w <- srRegWrites r ]
+    , srScalarWrites = [ w { swMatchWire = andS off (swMatchWire w) } | w <- srScalarWrites r ]
+    , srMemWrites    = [ w { mwMatchWire = andS off (mwMatchWire w) } | w <- srMemWrites r ]
+    , srMemReads     = [ w { mrMatchWire = andS off (mrMatchWire w) } | w <- srMemReads r ]
+    , srCodeReads    = [ w { crMatchWire = andS off (crMatchWire w) } | w <- srCodeReads r ]
+    , srFlagWrites   = [ w { fwMatchWire = andS off (fwMatchWire w) } | w <- srFlagWrites r ]
+    }
 
-    let allResults0 = results ++ maybe [] (\(_, _, r) -> [r]) irqData
+-- | Total accesses sequenced onto distinct cycles: code operand reads on
+-- @0..nCode-1@ (the CPU walks the code bus fetching operand words), then data
+-- reads, then data writes.  A read-modify-write of one address reads before it
+-- writes, never both at once.
+seqNAcc :: SynthResult s dom -> Int
+seqNAcc r = length (srCodeReads r) + length (srMemReads r) + length (srMemWrites r)
 
-    -- Route every data-memory read through the alias mux: a read whose address
-    -- matches a memory-mapped register (SP at 0x5D, SREG at 0x5F, …) returns the
-    -- live architectural register value instead of SRAM data.  For an address
-    -- that matches nothing — or an ISA with no aliases — this is the SRAM bus
-    -- unchanged.  Done per read so each port compares its own address.
-    allResults <- forM allResults0 $ \r -> do
-        mrs <- forM (srMemReads r) $ \rr -> do
-            busW <- scReadMemFnAlias (mrAddrWire rr)
-            return rr { mrBusWire = busW }
-        return r { srMemReads = mrs }
+-- | The fetch offset: an instruction that reads operand words spends exec cycle 0
+-- fetching its opcode on the single code port (the decoder latches it), then reads
+-- operands on cycles @1..nCode@ — so all its data cycles shift by one.  An
+-- instruction with no code operand reads decodes combinationally on cycle 0 and
+-- needs no separate fetch cycle, so it is offset 0 (single-word timing unchanged).
+fetchOffset :: SynthResult s dom -> Int
+fetchOffset r = if not (null (srCodeReads r)) then 1 else 0
 
-    -- Execution sequencer: drives read-result wires, supplies the per-access
-    -- cycle gate ('esGate') and the architectural-commit enable ('esCommit').
-    sq <- buildExecSequencer domInfo wordBits stallWireId allResults
-    let nAccOf r = max (length (srMemReads r)) (length (srMemWrites r))
+-- | The exec cycle on which an instruction commits.  With the single code port,
+-- operand word @j@ is read on cycle @fetchOffset + j@ and latched, so all operand
+-- words are readable from cycle @fetchOffset + nCode@; data reads\/writes then run
+-- on cycles @fetchOffset + nCode .. fetchOffset + nCode + nData - 1@.  Commit is
+-- the last of those, with one settle cycle for a pure code-read instruction.
+commitCycleOf :: SynthResult s dom -> Int
+commitCycleOf r =
+    let nCode = length (srCodeReads r)
+        nData = length (srMemReads r) + length (srMemWrites r)
+    in fetchOffset r + nCode + max nData 1 - 1
 
-    -- -----------------------------------------------------------------------
-    -- Write arbiters — register files
-    -- -----------------------------------------------------------------------
+-- | The execution-cycle counter.  Split out from the read latches so it can be
+-- built /before/ the alias override (which forces the operand words that hang off
+-- @ecExecCyc@) — see 'synthHarvardCPU''.  It depends only on per-instruction
+-- access counts and match wires, both unchanged by the override.
+data ExecCounter s dom = ExecCounter
+    { ecCommit  :: s dom Bool
+      -- ^ gate every architectural-state write enable; high on the instruction's
+      --   final cycle and only when the bus is not stalling.
+    , ecGate    :: Int -> s dom Bool -> Int -> s dom Bool
+      -- ^ @ecGate nAcc match i@ — select for the @i@-th access of an instruction
+      --   with @nAcc@ accesses and match signal @match@.
+    , ecExecCyc :: s dom (Unsigned 16)
+      -- ^ the current exec cycle (0 for single-access instructions).  Code operand
+      --   word @j@ is fetched from @PC + 1 + j@, so the code operand address is
+      --   @PC + 1 + ecExecCyc@ — no dependency on which instruction is live.
+    , ecNotWait :: s dom Bool
+      -- ^ bus not stalling this cycle (the latch capture-enable qualifier).
+    }
 
-    let allRegWrites = concatMap srRegWrites allResults
+-- | Run a continuation with a value-level width reflected to a type.
+reflectNat :: Int -> (forall n. KnownNat n => Proxy n -> r) -> r
+reflectNat n k = case someNatVal (fromIntegral (max 1 n)) of
+    Just (SomeNat p) -> k p
+    Nothing          -> error "reflectNat: impossible"
 
-    let regWritesByRf :: Map String [RegWriteReq]
-        regWritesByRf = foldl' (\m r -> Map.insertWith (++) (rwRfName r) [r] m)
-                                Map.empty allRegWrites
+-- | The data-read result resolver (wrapped so the polymorphic read type can be
+-- returned from @m@): @runSeqReadRes r instrIdx tok@ is the value a body consumed.
+newtype SeqReadRes s dom =
+    SeqReadRes { runSeqReadRes :: Int -> (forall a. HdlType a => ReadTok -> s dom a) }
 
-    -- Collect the set of rf names that appear in reads (without flattening order).
-    let readRfNames :: [String]
-        readRfNames = nub [ rrRfName rr | r <- allResults, rr <- srRegReads r ]
+-- | Build the data-read result latches: the per-(instruction, read) value each
+-- body consumed, sequenced onto the counter's cycles.  Data reads follow the code
+-- operand reads, so data read @j@ of an instruction is on cycle @nCode + j@.  Runs
+-- on the OVERRIDDEN results (their bus values are the alias-decoded reads), after
+-- the counter is already built.
+buildDataLatches
+    :: forall s m dom. (Hdl s m, Signal s, KnownDom dom)
+    => Int                                  -- ^ data-read width (wordW)
+    -> ExecCounter s dom
+    -> [SynthResult s dom]
+    -> m (SeqReadRes s dom)
+buildDataLatches dataW ec results =
+    reflectNat dataW $ \(Proxy :: Proxy wW) -> do
+      let dataBusOf :: Int -> ReadTok -> s dom (Unsigned wW)
+          dataBusOf i tok =
+              case [ sigRetype bus | MemReadReq _ t _ bus <- srMemReads (results !! i), t == tokIndex tok ] of
+                  (b : _) -> b
+                  []      -> litS 0 dataW
+          -- The second tuple element is the instruction's LAST sequenced cycle + 1
+          -- (so @latchReads@' @cyc == nAcc-1@ test means "this read is on the final
+          -- cycle"): it MUST include @fetchOffset@, because @cyc@ does.  Omitting it
+          -- mis-classifies a non-final read (e.g. POP's stack read, consumed one
+          -- cycle later by its aliased write) as final, so it goes UNLATCHED and the
+          -- external bus is re-sampled on the write cycle — when its address is no
+          -- longer driven.  (An aliased read survives regardless, being combinational.)
+          dataReads = [ (i, fetchOffset r + seqNAcc r, fetchOffset r + length (srCodeReads r) + j, t, match, sigRetype bus :: s dom (Unsigned wW))
+                      | (i, r) <- zip [0 ..] results
+                      , (j, MemReadReq match t _ bus) <- zip [0 ..] (srMemReads r) ]
+      dLatched <- latchReads dataW (ecExecCyc ec) 16 (ecNotWait ec) (ecGate ec) dataReads
+      let readRes :: forall a. HdlType a => Int -> ReadTok -> s dom a
+          readRes i tok = sigRetype (Map.findWithDefault (dataBusOf i tok) (i, tokIndex tok) dLatched)
+      pure (SeqReadRes readRes)
+  where
+    tokIndex (ReadTok t) = t
 
-    let involvedRfs = Map.keys regWritesByRf
-                   ++ filter (`Map.notMember` regWritesByRf) readRfNames
-
-    -- A register file is a register bank that lives as an array field of the
-    -- cpu_state record (e.g. @cpu_state.GPR@): one indexed write port per
-    -- simultaneous-write slot, and indexed combinational reads.  An instruction's
-    -- writes go to distinct ports (and distinct indices), so they all commit in
-    -- the same cycle — e.g. MUL writes R0 and R1 at once.  Not block RAM.
-    forM_ involvedRfs $ \rfname -> do
-        let (rfCount, rfWidth) = case Map.lookup rfname rfInfoMap of
-                Just p  -> p
-                Nothing -> (1, wordBits)
-            aBits = addrBitsFor rfCount
-
-        -- Writes grouped per instruction; write j of an instruction is driven by
-        -- write port j.  nPorts = the most writes any one instruction makes to
-        -- this file (1 normally, 2 for MUL/MULS).
-        let perInstr =
-                [ (m, filter ((== rfname) . rwRfName) (srRegWrites r))
-                | r <- allResults
-                , any ((== rfname) . rwRfName) (srRegWrites r)
-                , Just m <- [srMatchWire r] ]
-            nPorts = maximum (1 : map (length . snd) perInstr)
-
-        -- One muxed write port per slot: (address, data, enable@commit).
-        ports <- forM [0 .. nPorts - 1] $ \p -> do
-            let contribs = [ (m, ws Prelude.!! p) | (m, ws) <- perInstr, length ws > p ]
-            addrW <- buildMuxTree [(m, rwIdxWire w)  | (m, w) <- contribs]
-                        =<< litWire 0 aBits
-            datW  <- buildMuxTree [(m, rwDataWire w) | (m, w) <- contribs]
-                        =<< litWire 0 rfWidth
-            enRaw <- buildOrTree (map fst contribs)
-            enW   <- andGate enRaw (esCommit sq)
-            return (addrW, datW, enW)
-
-        -- The register file: an array field of cpu_state, written by indexed
-        -- multi-port writes in the clock process.
-        defer $ emit $ N.NRegFile "cpu_state" rfname rfCount rfWidth ports domInfo
-
-        -- Per-instruction reads for this rf, preserving slot order within each
-        -- instruction.  Slot k = the k-th readReg call on rfname; each slot is an
-        -- indexed combinational read @cpu_state.<rfname>(addr)@.
-        let instrSlots :: [(WireId, [RegReadReq])]
-            instrSlots =
-                [ (matchW, filter ((== rfname) . rrRfName) (srRegReads r))
-                | r <- allResults
-                , any ((== rfname) . rrRfName) (srRegReads r)
-                , Just matchW <- [srMatchWire r]
-                ]
-            maxSlots = maximum (0 : map (length . snd) instrSlots)
-
-        forM_ [0 .. maxSlots - 1] $ \slot -> do
-            let slotEntries = [ (matchW, rr)
-                              | (matchW, rrs) <- instrSlots
-                              , (k, rr) <- zip [0 ..] rrs
-                              , k == slot ]
-            rdAddrW <- buildMuxTree
-                           [(matchW, rrIdxWire rr) | (matchW, rr) <- slotEntries]
-                           =<< litWire 0 aBits
-            hintWire rdAddrW (rfname ++ "_rd" ++ show slot ++ "_addr")
-            rdOutW <- freshWire
-            emit $ N.NRegFileRead rdOutW "cpu_state" rfname rdAddrW rfCount
-            hintWire rdOutW (rfname ++ "_rd" ++ show slot)
-            -- Forward shared output to each instruction's pre-allocated wire.
-            forM_ slotEntries $ \(_, rr) ->
-                emit $ NComb (rrOutWire rr) N.POr [rdOutW, rdOutW]
-
-    -- -----------------------------------------------------------------------
-    -- Alias register write decode
-    -- When writeMem targets an aliased data-space address, route it to the
-    -- aliased architectural register via a ScalarWriteReq.
-    -- Status registers (e.g. SREG at 0x5F) are now plain scalar registers,
-    -- so they are handled here too — the combined flag+scalar arbiter below
-    -- merges whole-register writes with individual flag writes.
-    -- -----------------------------------------------------------------------
-
-    let allMemWrites = concatMap srMemWrites allResults
-
-    aliasScalarWriteReqs <- fmap concat $ forM (schAliasRegs schema) $
-        \(regName, aliasAddr) ->
-            case Map.lookup regName scalarRegMap of
-                Nothing -> return []
-                Just (regW, regOutW, _, _) -> forM allMemWrites $ \mw -> do
-                    addrLitW <- litWire aliasAddr addrBits
-                    cmpW  <- freshWire
-                    emit  $ NComb cmpW N.PEq [mwAddrWire mw, addrLitW]
-                    gated <- freshWire
-                    emit  $ NComb gated N.PAnd [mwMatchWire mw, cmpW]
-                    if regW == wordBits
-                        then return (ScalarWriteReq gated regName (mwDataWire mw))
-                        else do
-                            hiW   <- freshWire
-                            emit  $ NComb hiW (N.PSlice (regW - 1) wordBits) [regOutW]
-                            fullW <- freshWire
-                            emit  $ NComb fullW N.PConcat [hiW, mwDataWire mw]
-                            return (ScalarWriteReq gated regName fullW)
-
-    -- -----------------------------------------------------------------------
-    -- Write arbiters — scalar registers and status registers
-    --
-    -- Status registers (in statusRegMap) use a combined bit-level arbiter:
-    -- each bit is driven by either a flag write (setFlag) or a whole-register
-    -- write (writeReg / alias write), whichever fires.  Regular scalar
-    -- registers use the standard mux-tree arbiter.
-    -- -----------------------------------------------------------------------
-
-    let allScalarWrites = concatMap srScalarWrites allResults ++ aliasScalarWriteReqs
-    let allFlagWrites   = concatMap srFlagWrites allResults
-    let scalarWritesByReg :: Map String [ScalarWriteReq]
-        scalarWritesByReg = foldl' (\m r -> Map.insertWith (++) (swRegName r) [r] m)
-                                    Map.empty allScalarWrites
-
-    pcName <- extractPcName aluRec isaDef
-
-    forM_ scalarRegs $ \(name, w, regOutW, nxtW, enW) -> do
-        let scWrites = Map.findWithDefault [] name scalarWritesByReg
-
-        if name == pcName
-            then do
-                litOneW  <- litWire 1 w
-                pcIncW   <- do { o <- freshWire
-                               ; emit $ NComb o N.PAdd [regOutW, litOneW]
-                               ; hintWire o "pc_inc"
-                               ; return o }
-                pcNxtW   <- buildMuxTree
-                                [(swMatchWire r, swDataWire r) | r <- scWrites]
-                                pcIncW
-                -- The PC advances/jumps only on the instruction's final cycle.
-                driveWire nxtW pcNxtW
-                driveWire enW  (esCommit sq)
-
-        else case Map.lookup name statusRegMap of
-            Just (_, flagNames) -> do
-                -- Combined arbiter: per-bit mux merging flag writes and
-                -- whole-register scalar writes.  Flag writes take priority
-                -- (they appear first in buildMuxTree).
-                let bitAssigns = zip (reverse [0 .. w - 1]) flagNames
-                bitNextWires <- forM bitAssigns $ \(bitPos, _) -> do
-                    curBitW <- freshWire
-                    emit $ NComb curBitW (N.PSlice bitPos bitPos) [regOutW]
-                    -- Flag writes at this bit position.
-                    -- Normalize value wires to 1-bit (MonadALU callers may pass
-                    -- a wider Word wire, e.g. 8-bit litC 0; bit 0 is what matters).
-                    fwPairs <- forM [ fw | fw <- allFlagWrites
-                                        , fwRegName fw == name
-                                        , fwBitPos  fw == bitPos ] $ \fw -> do
-                        normW <- freshWire
-                        emit $ NComb normW (N.PSlice 0 0) [fwValueWire fw]
-                        return (fwMatchWire fw, normW)
-                    -- Scalar writes: extract this bit from the written word
-                    scPairs <- forM scWrites $ \sw -> do
-                        bitExtW <- freshWire
-                        emit $ NComb bitExtW (N.PSlice bitPos bitPos) [swDataWire sw]
-                        return (swMatchWire sw, bitExtW)
-                    buildMuxTree (fwPairs ++ scPairs) curBitW
-                -- Concatenate bits MSB-first into new register value
-                sregNextW <- case bitNextWires of
-                    [] -> litWire 0 w
-                    (msbW : restBits) -> foldl' (\accM bw -> do
-                        acc <- accM
-                        out <- freshWire
-                        emit $ NComb out N.PConcat [acc, bw]
-                        return out) (return msbW) restBits
-                -- Enable if any write (flag or scalar) fired
-                let allMatchWires = map fwMatchWire (filter ((== name) . fwRegName) allFlagWrites)
-                                 ++ map swMatchWire scWrites
-                enOrW   <- buildOrTree allMatchWires
-                enGated <- andGate enOrW (esCommit sq)
-                driveWire enW  enGated
-                driveWire nxtW sregNextW
-
-            Nothing -> do
-                -- Regular scalar register arbiter
-                case scWrites of
-                    [] -> do
-                        litZeroEn <- litWire 0 1
-                        litZeroD  <- litWire 0 w
-                        driveWire enW  litZeroEn
-                        driveWire nxtW litZeroD
-                    ws -> do
-                        enOrW   <- buildOrTree (map swMatchWire ws)
-                        enGated <- andGate enOrW (esCommit sq)
-                        defW    <- litWire 0 w
-                        nxtMux  <- buildMuxTree
-                                      [(swMatchWire r, swDataWire r) | r <- ws]
-                                      defW
-                        driveWire enW  enGated
-                        driveWire nxtW nxtMux
-
-    -- -----------------------------------------------------------------------
-    -- Data memory read address mux
-    -- -----------------------------------------------------------------------
-
-    -- Each access is gated by its cycle within the instruction (esGate), so the
-    -- i-th read drives the read-address port only while exec_cycle = i.
-    let readsIndexed  = [ (nAccOf r, idx, rr)
-                        | r <- allResults, (idx, rr) <- zip [0 ..] (srMemReads r) ]
-    gatedReads <- forM readsIndexed $ \(nAcc, idx, rr) -> do
-        sel <- esGate sq nAcc (mrMatchWire rr) idx
-        return (sel, mrAddrWire rr)
-    dmemRdAddrW <- case gatedReads of
-        [] -> litWire 0 addrBits
-        rs -> buildMuxTree rs =<< litWire 0 addrBits
-
-    -- -----------------------------------------------------------------------
-    -- Data memory write arbiter (each write gated by its cycle)
-    -- -----------------------------------------------------------------------
-
-    let writesIndexed = [ (nAccOf r, idx, mw)
-                        | r <- allResults, (idx, mw) <- zip [0 ..] (srMemWrites r) ]
-    gatedWrites <- forM writesIndexed $ \(nAcc, idx, mw) -> do
-        sel <- esGate sq nAcc (mwMatchWire mw) idx
-        return (sel, mw)
-    (dmemWrEnW, dmemWrAddrW, dmemWrDatW) <- case gatedWrites of
-        [] -> (,,) <$> litWire 0 1
-                   <*> litWire 0 addrBits
-                   <*> litWire 0 wordBits
-        ws -> do
-            enW  <- buildOrTree (map fst ws)
-            defA <- litWire 0 addrBits
-            defD <- litWire 0 wordBits
-            adW  <- buildMuxTree [(sel, mwAddrWire mw) | (sel, mw) <- ws] defA
-            daW  <- buildMuxTree [(sel, mwDataWire mw) | (sel, mw) <- ws] defD
-            return (enW, adW, daW)
-
-    -- -----------------------------------------------------------------------
-    -- PC → code address (resize if PC register width ≠ codeAddrW)
-    -- -----------------------------------------------------------------------
-
-    let pcOutWire = case Map.lookup pcName scalarRegMap of
-            Just (_, outW, _, _) -> outW
-            Nothing              -> instrWireId
-
-    let pcRegWidth = case Map.lookup pcName scalarRegMap of
-            Just (w, _, _, _) -> w
-            Nothing            -> 0
-    pcAddrW <- if codeAddrBits == pcRegWidth
-        then return pcOutWire
-        else do
-            w <- freshWire
-            emit $ NComb w (N.PSlice 0 (codeAddrBits - 1)) [pcOutWire]
-            return w
-
-    return CpuMemIface
-        { cmiInstrWord  = instrWireId
-        , cmiDataRdData = dmemRdDataW
-        , cmiCodeRdAddr = pcAddrW
-        , cmiDataRdAddr = dmemRdAddrW
-        , cmiDataWrEn   = dmemWrEnW
-        , cmiDataWrAddr = dmemWrAddrW
-        , cmiDataWrData = dmemWrDatW
-        , cmiCodeAddrW  = codeAddrBits
-        , cmiDataAddrW  = addrBits
-        , cmiWordW      = wordBits
-        , cmiCodeWordW  = codeBits
-        , cmiIrqPending = fmap (\(p,_,_) -> p) irqData
-        , cmiIrqVector  = fmap (\(_,v,_) -> v) irqData
-        }
-
--- | Standalone wrapper: synthesises the CPU with all memory interface signals
--- exposed as top-level input/output ports.  Suitable for unit testing the CPU
--- in isolation.  For SoC integration use 'synthHarvardCPU'' instead.
-synthHarvardCPU :: forall dom wordW addrW codeWordW codeAddrW alu.
-                   ( KnownDom dom
-                   , KnownNat wordW, KnownNat addrW
-                   , KnownNat codeWordW, KnownNat codeAddrW )
-                => CPUDef alu
-                -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
-                -> NetM ()
-synthHarvardCPU cpuDef isaDef = do
-    let domInfo  = domId (Proxy @dom)
-    let wordBits = fromIntegral (natVal (Proxy @wordW))     :: Int
-    let codeBits = fromIntegral (natVal (Proxy @codeWordW)) :: Int
-
-    instrWireId <- freshWire
-    emit $ NInput instrWireId "instr_word"   codeBits domInfo
-    dmemRdDataW <- freshWire
-    emit $ NInput dmemRdDataW "data_rd_data" wordBits domInfo
-    cmemRdDataW <- freshWire
-    emit $ NInput cmemRdDataW "code_rd_data" codeBits domInfo
-    stallWireId <- freshWire
-    emit $ NInput stallWireId "stall" 1 domInfo
-
-    cmi <- synthHarvardCPU' @dom @wordW @addrW @codeWordW @codeAddrW
-               cpuDef isaDef instrWireId dmemRdDataW cmemRdDataW stallWireId
-
-    emit $ NOutput (cmiCodeRdAddr cmi) "code_rd_addr" (cmiCodeAddrW cmi) domInfo
-    emit $ NOutput (cmiDataRdAddr cmi) "data_rd_addr" (cmiDataAddrW cmi) domInfo
-    emit $ NOutput (cmiDataWrEn   cmi) "data_wr_en"  1                  domInfo
-    emit $ NOutput (cmiDataWrAddr cmi) "data_wr_addr" (cmiDataAddrW cmi) domInfo
-    emit $ NOutput (cmiDataWrData cmi) "data_wr_data" (cmiWordW     cmi) domInfo
+-- | Holding latches for sequenced reads whose value outlives their cycle (all but
+-- the final access).  Keyed @(instrIdx, token)@.
+latchReads :: forall s m dom w cy. (Hdl s m, Signal s, KnownDom dom, HdlType w, HdlType cy)
+           => Int -> s dom cy -> Int -> s dom Bool
+           -> (Int -> s dom Bool -> Int -> s dom Bool)
+           -> [(Int, Int, Int, Int, s dom Bool, s dom w)]   -- (i, nAcc, cycle, tok, match, bus)
+           -> m (Map (Int, Int) (s dom w))
+latchReads width execCyc cwBits notWait gate reads =
+    fmap Map.fromList $ mapM latch1 [ r | r@(_, nAcc, cyc, _, _, _) <- reads, cyc /= nAcc - 1 ]
+  where
+    latch1 (i, nAcc, cyc, tok, match, bus) = do
+        let capEn = andS (gate nAcc match cyc) notWait
+        l <- registerW width 0 capEn bus
+        let onCyc = eqS execCyc (litS (fromIntegral cyc) cwBits :: s dom cy)
+        pure ((i, tok), muxS onCyc bus l)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Extract the PC register name from 'isaPc' by running it in a dummy
--- 'SynthM' context.  'isaPc' always reduces to @cpu sel@, which only reads
--- the ALU record — no 'NetM' nodes are emitted.
-extractPcName :: alu
-              -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW)
-              -> NetM String
+-- | The PC register name, from 'isaPc' (reads only the ALU record).
+extractPcName :: alu -> ISADef (ISABuild alu wordW addrW codeWordW codeAddrW) -> String
 extractPcName aluRec isaDef =
-    let SomeCPURegister (CPURegister n) = evalISABuild aluRec (isaPc isaDef)
-    in return n
-
--- -----------------------------------------------------------------------
--- Netlist building utilities
--- -----------------------------------------------------------------------
-
--- | Emit a literal constant wire.
-litWire :: Integer -> Int -> NetM WireId
-litWire val w = do
-    out <- freshWire
-    emit $ NComb out (N.PLit val w) []
-    return out
-
--- | Connect (reuse) a pre-allocated wire by emitting a combinational
--- identity buffer node.  Used to drive the pre-allocated NReg input wires
--- ('nxtWire', 'enWire') from the arbiter result.
-driveWire :: WireId -> WireId -> NetM ()
-driveWire dst src
-    | dst == src = return ()    -- already the same wire, no node needed
-    | otherwise  = emit $ NComb dst N.POr [src, src]
-    -- POr(x, x) = x: a no-cost identity in synthesis.
-    -- The VHDL emitter can optimise this to a direct assignment.
-
--- | Build a left-folded OR tree over a list of wire IDs.
--- Returns a constant-0 wire when the list is empty.
-buildOrTree :: [WireId] -> NetM WireId
-buildOrTree []     = litWire 0 1
-buildOrTree (w:ws) = foldl' step (return w) ws
-  where
-    step mAcc next = do
-        acc <- mAcc
-        out <- freshWire
-        emit $ NComb out N.POr [acc, next]
-        return out
-
--- | Build a right-to-left priority mux tree: the /first/ (head) pair wins.
--- @buildMuxTree [(sel0, val0), (sel1, val1)] def@ →
---   @if sel0 then val0 else if sel1 then val1 else def@
-buildMuxTree :: [(WireId, WireId)] -> WireId -> NetM WireId
-buildMuxTree []            def = return def
-buildMuxTree ((sel, v):rest) def = do
-    restW <- buildMuxTree rest def
-    out   <- freshWire
-    emit $ NComb out N.PMux [sel, v, restW]
-    return out
+    let SomeCPURegister (CPURegister n _ _) = evalISABuild aluRec (isaPc isaDef) in n
 
 -- | Number of bits needed to address @count@ entries.
 addrBitsFor :: Int -> Int
@@ -622,136 +649,3 @@ addrBitsFor n
     | n <= 1    = 1
     | otherwise = ceiling (logBase 2 (fromIntegral n) :: Double)
 
--- ---------------------------------------------------------------------------
--- Execution sequencer
--- ---------------------------------------------------------------------------
-
--- | Cycles an instruction needs on its busiest single-ported resource: the max
--- of (data reads, data writes).  Register files are register banks with
--- independent per-entry writes (see the bank lowering in 'synthHarvardCPU'), so
--- multiple register-file writes in one instruction (MUL → R0 and R1) commit in
--- the same cycle and do not extend the instruction.
-seqNAcc :: SynthResult -> Int
-seqNAcc r = max (length (srMemReads r)) (length (srMemWrites r))
-
--- | Per-instruction multi-cycle execution sequencer.
---
--- An instruction takes one cycle per access to a contended port: with a single
--- data read port and a single data write port, an instruction needs as many
--- cycles as its largest of (number of reads, number of writes).  The @stall@
--- input extends each individual transaction (bus latency / backpressure): the
--- cycle @stall = 0@ is when the read data is valid / the write is accepted.
-data ExecSeq = ExecSeq
-    { esCommit :: WireId
-      -- ^ 1-bit: gate every architectural-state write enable (registers,
-      --   register-file, flags, PC) with this.  Asserted only on the
-      --   instruction's final cycle, and only when the bus is not stalling.
-    , esGate   :: Int -> WireId -> Int -> NetM WireId
-      -- ^ @esGate nAcc matchW i@ — the select for the @i@-th access of an
-      --   instruction whose match is @matchW@ with @nAcc@ accesses to one port.
-      --   Single-access instructions return @matchW@ unchanged (their access
-      --   only ever fires while @exec_cycle = 0@, since matches are exclusive).
-    }
-
--- | 1-bit AND / NOT helpers.
-andGate :: WireId -> WireId -> NetM WireId
-andGate a b = do { o <- freshWire; emit $ NComb o N.PAnd [a, b]; return o }
-
-notGate :: WireId -> NetM WireId
-notGate a = do { o <- freshWire; emit $ NComb o N.PNot [a]; return o }
-
--- | Build the execution sequencer from all per-instruction results and the
--- stall input, and drive every read's result wire.
---
--- A read's value is taken straight from the bus on the cycle it completes; if
--- the value must survive to a later cycle (only @retFromStack@'s @lo@ byte in
--- the AVR set), it is captured into a holding latch — a sequencer-internal
--- register, deliberately outside the architectural @cpu_state@.
-buildExecSequencer
-    :: DomId
-    -> Int        -- ^ data width (bits) for read latches
-    -> WireId     -- ^ stall input
-    -> [SynthResult]
-    -> NetM ExecSeq
-buildExecSequencer domInfo dataW stallW results = do
-    let nAccOf      = seqNAcc
-        -- An instruction is "active" on the shared transaction sequencer if it
-        -- touches data memory; pure register-file multi-writes (MUL) advance the
-        -- exec cycle but never stall, so they are excluded from mem_active.
-        memMatches  = [ m | r <- results
-                          , max (length (srMemReads r)) (length (srMemWrites r)) >= 1
-                          , Just m <- [srMatchWire r] ]
-        maxAcc      = maximum (1 : map nAccOf results)
-
-    comment "execution sequencer: stall + multi-cycle memory transactions"
-    memActiveW <- buildOrTree memMatches
-    hintWire memActiveW "mem_active"
-
-    if maxAcc < 2
-      then do
-        -- No multi-cycle instruction: commit whenever the single transaction
-        -- (if any) is not stalled.  Read results come straight off the bus.
-        waitW   <- andGate memActiveW stallW;  hintWire waitW   "mem_wait"
-        commitW <- notGate waitW;              hintWire commitW "commit"
-        forM_ results $ \r ->
-            forM_ (srMemReads r) $ \rr ->
-                driveWire (mrResultWire rr) (mrBusWire rr)
-        return ExecSeq { esCommit = commitW, esGate = \_ m _ -> return m }
-      else do
-        let cw = addrBitsFor maxAcc
-        execW    <- freshWire
-        execNxtW <- freshWire
-        defer $ emit $ NReg execW execNxtW Nothing (SomeBits 0 cw) domInfo
-        hintWire execW    "exec_cycle"
-        hintWire execNxtW "exec_cycle_nxt"
-        -- cycles_needed = (nAcc - 1) of the selected multi-cycle instruction.
-        cyclesNeededW <- do
-            pairs <- sequence
-                [ do { lw <- litWire (fromIntegral (nAccOf r - 1)) cw; return (m, lw) }
-                | r <- results, nAccOf r >= 2, Just m <- [srMatchWire r] ]
-            buildMuxTree pairs =<< litWire 0 cw
-        hintWire cyclesNeededW "cycles_needed"
-        isLastW <- freshWire
-        emit $ NComb isLastW N.PEq [execW, cyclesNeededW]
-        hintWire isLastW "is_last_cycle"
-        waitW    <- andGate memActiveW stallW;  hintWire waitW "mem_wait"
-        notWaitW <- notGate waitW;              hintWire notWaitW "not_stall"
-        commitW  <- andGate isLastW notWaitW;   hintWire commitW "commit"
-        -- exec_cycle_nxt = wait ? exec_cycle : (is_last ? 0 : exec_cycle + 1)
-        oneW   <- litWire 1 cw
-        incW   <- freshWire; emit $ NComb incW   N.PAdd [execW, oneW]
-        zeroW  <- litWire 0 cw
-        afterW <- freshWire; emit $ NComb afterW N.PMux [isLastW, zeroW, incW]
-        nxtW   <- freshWire; emit $ NComb nxtW   N.PMux [waitW, execW, afterW]
-        driveWire execNxtW nxtW
-
-        let gate nAcc m i
-                | nAcc < 2  = return m
-                | otherwise = do
-                    iLit <- litWire (fromIntegral i) cw
-                    eqW  <- freshWire; emit $ NComb eqW N.PEq [execW, iLit]
-                    andGate m eqW
-
-        -- Drive read result wires (latch reads whose value outlives their cycle).
-        forM_ results $ \r -> do
-            let rds  = srMemReads r
-                nRds = length rds
-            forM_ (zip [0 ..] rds) $ \(i, rr) ->
-                if nRds < 2 || i == nRds - 1
-                    then driveWire (mrResultWire rr) (mrBusWire rr)
-                    else do
-                        sel    <- gate nRds (mrMatchWire rr) i
-                        capEnW <- andGate sel notWaitW
-                        latchW <- freshWire
-                        defer $ emit $ NReg latchW (mrBusWire rr) (Just capEnW)
-                                            (SomeBits 0 dataW) domInfo
-                        -- Unique per read (index alone collides when several
-                        -- instructions latch a read at the same slot, e.g.
-                        -- RET and RETI both latching retFromStack's lo byte).
-                        hintWire latchW ("rd_latch_" ++ show i ++ "_" ++ show (mrResultWire rr))
-                        iLit <- litWire (fromIntegral i) cw
-                        eqW  <- freshWire; emit $ NComb eqW  N.PEq  [execW, iLit]
-                        muxW <- freshWire; emit $ NComb muxW N.PMux [eqW, mrBusWire rr, latchW]
-                        driveWire (mrResultWire rr) muxW
-
-        return ExecSeq { esCommit = commitW, esGate = gate }

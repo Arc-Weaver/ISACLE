@@ -1,18 +1,16 @@
-{-# LANGUAGE GADTs               #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE TypeApplications    #-}
--- | The synthesis renderer's expression lowering: 'IExpr' → netlist wire.
+{-# LANGUAGE GADTs                     #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE FlexibleContexts           #-}
+-- | The synthesis renderer's expression lowering: 'IExpr' → a typed 'Signal'.
 --
--- This is where 'Hdl.Net.WireId's are born — never in the IR itself.  Because
--- every value carries its annotations, lowering can /inject/ a name onto each
--- materialised wire and /follow/ names through derived operations, so the
--- generated VHDL reads as @SP@, @ADD_d@, @sp_sub@ … instead of anonymous @wN@.
---
--- Register reads, field extractions and read results are resolved through a
--- 'LowerCtx' supplied by the CPU synthesis pass; this module owns only the
--- expression-tree lowering and the naming strategy.
-{-# LANGUAGE ExistentialQuantification #-}
+-- Written entirely against the 'Hdl'/'Signal' interface — no 'NetM', no
+-- 'WireId'.  Combinational structure is pure 'Signal' composition; the monad
+-- @m@ is used only to /bind named signals/ ('named'), so derived operations can
+-- carry a readable name (the generated VHDL reads @sp_sub@, @ADD_d@, … instead
+-- of @wN@).  Register reads, field extractions and read results are resolved
+-- through a 'LowerCtx' supplied by the CPU synthesis pass.
 module Isacle.ISA.Backend.Lower
     ( LowerCtx(..)
     , Named(..)
@@ -21,6 +19,9 @@ module Isacle.ISA.Backend.Lower
       -- * Statement-level rendering
     , Rendered(..)
     , RegWrite(..)
+    , MemWrite(..)
+    , MemRead(..)
+    , FlagWrite(..)
     , Jump(..)
     , emptyRendered
     , renderInstr
@@ -28,143 +29,96 @@ module Isacle.ISA.Backend.Lower
 
 import Prelude
 import Control.Monad (foldM)
+import Data.List (intercalate)
+import Data.Proxy (Proxy(..))
+import GHC.TypeLits (someNatVal, SomeNat(..))
+import Hdl.Prim (Unsigned)
 
-import Hdl.Net (WireId, NetM, NetNode(..), PrimOp, freshWire, emit, hintWire)
+import Hdl.Net (PrimOp)
 import qualified Hdl.Net as N
+import Hdl.Types (Signal(..), HdlType)
+import Hdl.Monad (Hdl, named)
 import Isacle.ISA.Types (ALUPrim(..), CPUFlag)
 import Isacle.ISA.IR
 
 -- | Resolution callbacks for the leaves an 'IExpr' can reference.  Supplied by
 -- the CPU synthesis pass (which owns the register file, the field decoder and
--- the per-cycle read-result wires).
-data LowerCtx = LowerCtx
-    { lcReadReg   :: forall a. RegRef a -> NetM WireId
-    , lcField     :: FieldRef -> NetM WireId
-    , lcReadRes   :: ReadTok -> NetM WireId
-    , lcReadFlag  :: CPUFlag -> NetM WireId
-    , lcIrqVector :: NetM WireId
-    , lcMnemonic  :: Maybe String   -- ^ instruction mnemonic, for field-wire naming
+-- the per-cycle read-result signals).  All leaves resolve to a (combinational)
+-- signal already; lowering only composes and names them.
+data LowerCtx s m dom = LowerCtx
+    { lcReadReg   :: forall a. HdlType a => RegRef a -> m (s dom a)
+    , lcField     :: forall a. HdlType a => FieldRef -> m (s dom a)
+    , lcReadRes   :: forall a. HdlType a => ReadTok -> m (s dom a)
+    , lcReadFlag  :: CPUFlag -> m (s dom Bool)
+    , lcIrqVector :: forall a. HdlType a => m (s dom a)
+    , lcMnemonic  :: Maybe String   -- ^ instruction mnemonic, for field naming
     }
 
--- | A lowered wire together with the name it carries, if any.  The name is what
--- lets derived operations be named after their inputs ("following").
-data Named = Named
-    { nWire :: WireId
+-- | A lowered signal together with the name it carries, if any.  Indexed by the
+-- expression's value type @a@ so the width/representation survives lowering.
+data Named s dom a = Named
+    { nSig  :: s dom a
     , nName :: Maybe String
     }
 
--- | Lower an expression, returning the wire and its propagated name.
-lowerExpr :: forall a. LowerCtx -> IExpr a -> NetM Named
+-- | Lower an expression, returning the (typed) signal and its propagated name.
+lowerExpr :: forall s m dom a. (Hdl s m, Signal s)
+          => LowerCtx s m dom -> IExpr a -> m (Named s dom a)
 lowerExpr ctx = go
   where
-    go :: forall k. IExpr k -> NetM Named
-    go (INamed nm e) = do
-        Named w _ <- go e
-        hintWire w nm
-        pure (Named w (Just nm))
+    go :: forall k. IExpr k -> m (Named s dom k)
+    go (INamed nm e)   = do { Named s _ <- go e; nameAs (Just nm) s }
+    go (IReadReg ref)  = nameAs (Just (regName ref))            =<< lcReadReg ctx ref
+    go (IField fr)     = nameAs (Just (mnem (frKey fr)))        =<< lcField ctx fr
+    go (IReadRes t@(ReadTok i)) = nameAs (Just ("rd" ++ show i)) =<< lcReadRes ctx t
+    go (IFlagRead f)   = (\s -> Named s Nothing) <$> lcReadFlag ctx f
+    go IIrqVector      = nameAs (Just "irq_vector")            =<< lcIrqVector ctx
+    go e@(ILit v)      = pure (Named (sigLitW v (exprWidth e)) Nothing)  -- no name
 
-    go e@(ILit v) = do
-        let bw = exprWidth e
-        w <- freshWire
-        emit $ NComb w (N.PLit v bw) []
-        pure (Named w Nothing)               -- literals carry no propagated name
+    go (IBin op a b) = bin (sigPrim2 (toPrim op)) (followName (opTag op)) a b
+    go (IUn op a)    = un  (sigPrim1 (toPrim op)) (tagWith (opTag op))   a
+    go (IMux c t f)  = do
+        Named sc _ <- go c
+        bin (sigPrim3 N.PMux sc) (followName "sel") t f
+    go (IIsZero a)   = do
+        Named sa na <- go a
+        nameAs (tagSuffix "_isZero" na) (isZ sa (exprWidth a))
 
-    go (IReadReg ref) = do
-        w <- lcReadReg ctx ref
-        let nm = regName ref
-        hintWire w nm
-        pure (Named w (Just nm))
+    go e@(IResize a)      = un (sigPrim1 (N.PResize (exprWidth e)))       keep a
+    go e@(IZeroExt a)     = un (sigPrim1 (N.PResize (exprWidth e)))       keep a
+    go e@(ITrunc a)       = un (sigPrim1 (N.PSlice (exprWidth e - 1) 0))  keep a
+    go e@(ISignExt a)     = un (sigPrim1 (N.PSignedResize (exprWidth e))) keep a
+    go e@(IReinterpret a) = un (sigPrim1 (N.PReinterpret (exprRepr e)))   keep a
+    go (ISlice hi lo a)   = un (sigPrim1 (N.PSlice hi lo))                keep a
 
-    go (IField fr) = do
-        w <- lcField ctx fr
-        let nm = maybe id (\m s -> m ++ "_" ++ s) (lcMnemonic ctx) (frKey fr)
-        hintWire w nm
-        pure (Named w (Just nm))
+    -- A unary op (child type @x@ → result @k@) carrying the child's name.
+    un :: forall x k. (s dom x -> s dom k)
+       -> (Maybe String -> Maybe String) -> IExpr x -> m (Named s dom k)
+    un f nameOf a = do { Named sa na <- go a; nameAs (nameOf na) (f sa) }
+    -- A binary op (children @x@,@y@ → result @k@) named from both children.
+    bin :: forall x y k. (s dom x -> s dom y -> s dom k)
+        -> (Maybe String -> Maybe String -> Maybe String)
+        -> IExpr x -> IExpr y -> m (Named s dom k)
+    bin f nameOf a b = do
+        Named sa na <- go a; Named sb nb <- go b
+        nameAs (nameOf na nb) (f sa sb)
+    -- Bind a signal under an optional name and wrap as 'Named'.
+    nameAs :: forall k. Maybe String -> s dom k -> m (Named s dom k)
+    nameAs (Just nm) s = do { s' <- named nm s; pure (Named s' (Just nm)) }
+    nameAs Nothing   s = pure (Named s Nothing)
 
-    go (IReadRes tok@(ReadTok i)) = do
-        w <- lcReadRes ctx tok
-        let nm = "rd" ++ show i
-        hintWire w nm
-        pure (Named w (Just nm))
+    -- @x == 0@ with the zero literal at the operand's own type @x@.
+    isZ :: forall x. HdlType x => s dom x -> Int -> s dom Bool
+    isZ sa w = sigPrim2 N.PEq sa (sigLitW 0 w :: s dom x)
 
-    go (IBin op a b) = do
-        Named wa na <- go a
-        Named wb nb <- go b
-        w <- freshWire
-        emit $ NComb w (toPrim op) [wa, wb]
-        let nm = followName (opTag op) na nb
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
-
-    go (IUn op a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (toPrim op) [wa]
-        let nm = fmap (\s -> opTag op ++ "_" ++ s) na
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
-
-    go e@(IResize a)  = resizeLike (exprWidth e) a
-    go e@(IZeroExt a) = resizeLike (exprWidth e) a
-    go e@(ITrunc a)   = do
-        let dst = exprWidth e
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSlice (dst - 1) 0) [wa]
-        propagate w na
-    go e@(ISignExt a) = do
-        let dst = exprWidth e
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSignedResize dst) [wa]
-        propagate w na
-    -- | Same-width reinterpretation: a real signed()/unsigned() cast carrying
-    -- the *target* representation, recovered from the result value type.
-    go e@(IReinterpret a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PReinterpret (exprRepr e)) [wa]
-        propagate w na
-    go (IIsZero a) = do
-        let bw = exprWidth a
-        Named wa na <- go a
-        zw <- freshWire
-        emit $ NComb zw (N.PLit 0 bw) []
-        w  <- freshWire
-        emit $ NComb w N.PEq [wa, zw]
-        let nm = fmap (\s -> s ++ "_isZero") na
-        maybe (pure ()) (hintWire w) nm
-        pure (Named w nm)
-
-    go (ISlice hi lo a) = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PSlice hi lo) [wa]
-        propagate w na
-
-    go (IFlagRead flag) = do
-        w <- lcReadFlag ctx flag
-        pure (Named w Nothing)
-
-    go IIrqVector = do
-        w <- lcIrqVector ctx
-        hintWire w "irq_vector"
-        pure (Named w (Just "irq_vector"))
-
-    resizeLike :: forall j. Int -> IExpr j -> NetM Named
-    resizeLike dst a = do
-        Named wa na <- go a
-        w <- freshWire
-        emit $ NComb w (N.PResize dst) [wa]
-        propagate w na
-
-    propagate w na = do
-        maybe (pure ()) (hintWire w) na
-        pure (Named w na)
+    keep na          = na                            -- propagate name unchanged
+    tagWith tag      = fmap (\x -> tag ++ "_" ++ x)
+    tagSuffix suf    = fmap (++ suf)
+    mnem             = maybe id (\m x -> m ++ "_" ++ x) (lcMnemonic ctx)
 
 -- | Lower an expression, discarding the propagated name.
-lowerExpr_ :: LowerCtx -> IExpr w -> NetM WireId
-lowerExpr_ ctx e = nWire <$> lowerExpr ctx e
+lowerExpr_ :: (Hdl s m, Signal s) => LowerCtx s m dom -> IExpr a -> m (s dom a)
+lowerExpr_ ctx e = nSig <$> lowerExpr ctx e
 
 -- ---------------------------------------------------------------------------
 -- Naming helpers
@@ -172,10 +126,13 @@ lowerExpr_ ctx e = nWire <$> lowerExpr ctx e
 
 regName :: RegRef w -> String
 regName (RegScalar n)              = n
-regName (RegFile f (FieldRef k) o)
+regName (RegEntries f _ idxs)      = f ++ "_" ++ intercalate "_" (map show idxs)
+regName (RegFile f (FieldRef k) s o)
     | null k    = f ++ "_r" ++ show o          -- constant index Rn
-    | o /= 0    = f ++ "_" ++ k ++ "_p" ++ show o
-    | otherwise = f ++ "_" ++ k
+    | otherwise = f ++ "_" ++ k ++ sTag ++ oTag
+  where
+    sTag = if s /= 1 then "_x" ++ show s else ""
+    oTag = if o /= 0 then "_p" ++ show o else ""
 
 -- | Name a binary result after its operands, e.g. @sp \"sub\" => sp_sub@.
 -- Only names when at least one operand carries a name, to avoid noise.
@@ -215,34 +172,40 @@ toPrim PMulSigned   = N.PMul
 -- Statement-level rendering: InstrIR -> lowered write/read requests
 -- ---------------------------------------------------------------------------
 
--- | A register write, lowered: the (annotated) destination plus the data wire.
-data RegWrite = forall w. RegWrite (RegRef w) WireId
+-- | A register write: the destination and its data, at the register's type @w@
+-- (existential — a rendered instruction writes registers of different widths).
+data RegWrite s dom = forall w. HdlType w => RegWrite (RegRef w) (s dom w)
 
--- | A conditional jump, lowered: the PC register, the condition wire, the
--- target wire.
-data Jump = forall w. Jump (RegRef w) WireId WireId
+-- | A memory write: (address, data), each at its own value type.
+data MemWrite s dom = forall aw dw. (HdlType aw, HdlType dw) => MemWrite (s dom aw) (s dom dw)
 
--- | One instruction's effects, lowered to wires.  This is the synth-side
--- analogue of the old @SynthResult@, but produced from the 'InstrIR' source of
--- truth instead of a leaky interpreter — the CPU pass assembles these into the
--- register file, memory ports and the execution sequencer.
-data Rendered = Rendered
-    { rRegWrites  :: [RegWrite]
-    , rMemWrites  :: [(WireId, WireId)]    -- ^ (address, data) in program order
-    , rMemReads   :: [(ReadTok, WireId)]   -- ^ (token, address) in program order
-    , rCodeReads  :: [(ReadTok, WireId)]
-    , rFlagWrites :: [(CPUFlag, WireId)]
-    , rJumps      :: [Jump]
+-- | A memory/code read: its token and the (typed) address it reads.
+data MemRead s dom = forall aw. HdlType aw => MemRead ReadTok (s dom aw)
+
+-- | A status-flag write (always 1-bit).
+data FlagWrite s dom = FlagWrite CPUFlag (s dom Bool)
+
+-- | A conditional jump: the PC register, the (1-bit) condition and the target.
+data Jump s dom = forall w. HdlType w => Jump (RegRef w) (s dom Bool) (s dom w)
+
+-- | One instruction's effects, lowered to signals.  The CPU pass assembles
+-- these into the register file, memory ports and the execution sequencer.
+data Rendered s dom = Rendered
+    { rRegWrites  :: [RegWrite s dom]
+    , rMemWrites  :: [MemWrite s dom]   -- ^ program order
+    , rMemReads   :: [MemRead s dom]    -- ^ program order
+    , rCodeReads  :: [MemRead s dom]
+    , rFlagWrites :: [FlagWrite s dom]
+    , rJumps      :: [Jump s dom]
     }
 
-emptyRendered :: Rendered
+emptyRendered :: Rendered s dom
 emptyRendered = Rendered [] [] [] [] [] []
 
--- | Lower every statement of an instruction's IR to wires, preserving program
--- order (which the sequencer relies on for memory transactions).  Each
--- expression is lowered through 'lowerExpr', so annotation-driven naming
--- applies throughout.
-renderInstr :: LowerCtx -> InstrIR -> NetM Rendered
+-- | Lower every statement of an instruction's IR to signals, preserving program
+-- order (which the sequencer relies on for memory transactions).
+renderInstr :: forall s m dom. (Hdl s m, Signal s)
+            => LowerCtx s m dom -> InstrIR -> m (Rendered s dom)
 renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
   where
     -- accumulate in reverse, restore order at the end
@@ -255,22 +218,35 @@ renderInstr ctx ir = finish <$> foldM step emptyRendered (iirStmts ir)
         , rJumps      = reverse (rJumps r)
         }
 
+    step r (SWriteReg (RegEntries file ew idxs) e) = do
+        -- A view-register write fans out to one register-file write per entry:
+        -- entry p (low first) gets bits [p*ew .. p*ew+ew-1] of the value.  The
+        -- entry width @ew@ is a runtime value; reflect it to a type for the slice.
+        w <- lowerExpr_ ctx e
+        let entryWrite p idx = case someNatVal (fromIntegral ew) of
+                Just (SomeNat (_ :: Proxy n)) ->
+                    RegWrite (RegFile file (FieldRef "") 1 idx)
+                             (sigPrim1 (N.PSlice ((p + 1) * ew - 1) (p * ew)) w
+                                 :: s dom (Unsigned n))
+                Nothing -> error "renderInstr: negative entry width"
+            ws = [ entryWrite p idx | (p, idx) <- zip [0 :: Int ..] idxs ]
+        pure r { rRegWrites = reverse ws ++ rRegWrites r }
     step r (SWriteReg ref e) = do
         w <- lowerExpr_ ctx e
         pure r { rRegWrites = RegWrite ref w : rRegWrites r }
     step r (SWriteMem a d) = do
         wa <- lowerExpr_ ctx a
         wd <- lowerExpr_ ctx d
-        pure r { rMemWrites = (wa, wd) : rMemWrites r }
+        pure r { rMemWrites = MemWrite wa wd : rMemWrites r }
     step r (SReadMem tok a) = do
         wa <- lowerExpr_ ctx a
-        pure r { rMemReads = (tok, wa) : rMemReads r }
+        pure r { rMemReads = MemRead tok wa : rMemReads r }
     step r (SReadCode tok a) = do
         wa <- lowerExpr_ ctx a
-        pure r { rCodeReads = (tok, wa) : rCodeReads r }
+        pure r { rCodeReads = MemRead tok wa : rCodeReads r }
     step r (SWriteFlag f e) = do
         w <- lowerExpr_ ctx e
-        pure r { rFlagWrites = (f, w) : rFlagWrites r }
+        pure r { rFlagWrites = FlagWrite f w : rFlagWrites r }
     step r (SJumpIf pc cond tgt) = do
         wc <- lowerExpr_ ctx cond
         wt <- lowerExpr_ ctx tgt

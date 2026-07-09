@@ -1,4 +1,8 @@
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE UndecidableInstances #-}
 -- | TinyCPU — a minimal 8-bit Harvard CPU for synthesis smoke-testing.
 --
 -- Architecture:
@@ -19,12 +23,15 @@
 -- dd = 2-bit dest register index, ss = 2-bit src register index.
 module Isacle.ISA.Example.Tiny
     ( TinyAlu(..)
+    , TinyCore(..)
     , tinyCPUDef
     , tinyISA
     ) where
 
 import Prelude hiding (Word)
+import GHC.Generics (Generic, Rep)
 import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce, add, mul)
+import Hdl.Types (HdlType(..), GWidth, genericToBits, genericFromBits)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -37,6 +44,19 @@ data TinyAlu = TinyAlu
     , zero :: CPUFlag   -- bit 0 of the 1-bit "FLAGS" status register
     }
 
+-- | The raw storage /core/: the scalar state (PC + the 1-bit FLAGS register)
+-- the synthesiser clocks as one register.  GPR stays a separate 'regBank'.
+-- Field names map to schema register names by dropping the @core@ prefix.
+data TinyCore = TinyCore
+    { corePC    :: Unsigned 8
+    , coreFLAGS :: Unsigned 1
+    } deriving (Generic)
+
+instance HdlType TinyCore where
+    type Width TinyCore = GWidth (Rep TinyCore)
+    toBits   = genericToBits
+    fromBits = genericFromBits
+
 -- ---------------------------------------------------------------------------
 -- CPU definition
 -- ---------------------------------------------------------------------------
@@ -47,8 +67,9 @@ tinyCPUDef = do
     g      <- newRegFile "GPR"
     p      <- newReg "PC"
     (_, zs)  <- flagPack @1 "FLAGS" ["Z"]
-    let z    =  head zs
-    pure TinyAlu { gpr = g, pc = p, zero = z }
+    case zs of
+      z : _ -> pure TinyAlu { gpr = g, pc = p, zero = z }
+      []    -> error "TinyAlu: FLAGS pack yielded no Z flag"
 
 -- ---------------------------------------------------------------------------
 -- Instruction bodies

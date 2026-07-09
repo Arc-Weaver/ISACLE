@@ -7,8 +7,9 @@ module Hdl.Emit.Vhdl
     ) where
 
 import Prelude
+import Data.Bits (testBit, xor, (.&.))
 import Data.Char (toLower)
-import Data.List (foldl', intercalate, nub, partition, sort)
+import Data.List (dropWhileEnd, foldl', intercalate, nub, partition, sort, tails)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -376,9 +377,9 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
             in (Map.insert wid nm m, Set.insert nm used)
         uniqueName base used
             | not (Set.member base used) = base
-            | otherwise = head [ c | i <- [(2 :: Int) ..]
-                                   , let c = base ++ "_" ++ show i
-                                   , not (Set.member c used) ]
+            | otherwise                  = go (2 :: Int)
+          where go i = let c = base ++ "_" ++ show i
+                       in if Set.member c used then go (i + 1) else c
 
     -- VHDL identifiers are case-insensitive, so a reserved word must be matched
     -- regardless of case (e.g. "PORT" is as reserved as "port"); vhdlReserved is
@@ -400,12 +401,13 @@ buildNameMap nodes = Map.unions [inputMap, groupMap, hintMap, litMap, regMap, in
         , Just pname <- [Map.lookup (nOut n) outputDrivers]
         ]
 
-    namedWids = Map.keysSet (Map.unions [inputMap, groupMap, hintMap, litMap, regMap])
-    internalMap = Map.fromList
-        [ (wid, "w" ++ show wid)
-        | wid <- nub $ concatMap drivenWires nodes
-        , not (Set.member wid namedWids)
-        ]
+    realNames = Map.unions [inputMap, groupMap, hintMap, litMap, regMap]
+    namedWids = Map.keysSet realNames
+    internalWids = sort [ wid | wid <- nub (concatMap drivenWires nodes)
+                              , not (Set.member wid namedWids) ]
+    destBase = destinationNames nodes realNames (Set.fromList internalWids)
+    internalMap = deriveInternalNames nodes realNames destBase
+                    (Set.fromList (Map.elems realNames)) internalWids
 
     drivenWires (NReg    out _ _ _ _) = [out]
     drivenWires (NComb   out _ _)     = [out]
@@ -425,6 +427,313 @@ isLitWire wid = any $ \case
 
 lookupWire :: NameMap -> WireId -> String
 lookupWire nm wid = fromMaybe ("w" ++ show wid) (Map.lookup wid nm)
+
+-- ---------------------------------------------------------------------------
+-- Readable names for internal wires (derived from op + operands)
+-- ---------------------------------------------------------------------------
+
+-- | Give every un-hinted internal wire a name built from its driver op and its
+-- operands' names, rather than an opaque @wN@.  Processed in wire-id order (a
+-- node's operands have smaller ids, so they are already named); de-duplicated
+-- against real names and each other, length-capped, and reserved-word-safe.
+deriveInternalNames :: [NetNode] -> Map.Map WireId String -> Map.Map WireId String
+                    -> Set.Set String -> [WireId] -> Map.Map WireId String
+deriveInternalNames nodes realNames destBase reserved0 wids =
+    fst $ foldl' step (Map.empty, reserved0) wids
+  where
+    combMap = Map.fromList [ (o, (op, ins))         | NComb o op ins       <- nodes ]
+    rfrMap  = Map.fromList [ (o, g ++ "_" ++ f ++ "_rd") | NRegFileRead o g f _ _ <- nodes ]
+    subMap  = Map.fromList [ (w, inst ++ "_" ++ pn)
+                           | NSubInst inst _ _ outs <- nodes, (pn, w, _) <- outs ]
+    step (m, used) wid =
+        let nameOf w = case Map.lookup w realNames of
+                         Just s  -> s
+                         Nothing -> Map.findWithDefault ("w" ++ show w) w m
+            content = case Map.lookup wid combMap of
+                        Just (op, ins) -> deriveOp nameOf op ins
+                        Nothing -> case Map.lookup wid rfrMap of
+                                     Just s  -> s
+                                     Nothing -> Map.findWithDefault ("w" ++ show wid) wid subMap
+            -- A content name built from a long chain (a wide mux head, an
+            -- orReduce accumulator) reads worse than @wN@; fall back to the
+            -- destination it feeds (e.g. @cpu_core_next@) when one is known.
+            base | length content > 45, Just d <- Map.lookup wid destBase = d
+                 | otherwise                                              = content
+            nm'  = uniqueName (reservedSafe (capIdent base)) used
+        in (Map.insert wid nm' m, Set.insert nm' used)
+    uniqueName base used
+        | not (Set.member base used) = base
+        | otherwise                  = go (2 :: Int)
+      where go i = let c = base ++ "_" ++ show i
+                   in if Set.member c used then go (i + 1) else c
+
+-- | Propagate a destination name (the register next-state, register-file port,
+-- or output a wire ultimately feeds) backward through single-fanout
+-- combinational cones.  Used only when a wire's own content name is unwieldy.
+destinationNames :: [NetNode] -> Map.Map WireId String -> Set.Set WireId
+                 -> Map.Map WireId String
+destinationNames nodes realNames internal =
+    foldl' step direct (reverse (sort (Set.toList internal)))
+  where
+    combMap = Map.fromList [ (o, ins) | NComb o _ ins <- nodes ]
+    fanout  = Map.fromListWith (+) [ (w, 1 :: Int) | n <- nodes, (w, _) <- consumerRefs n ]
+    single v = Map.findWithDefault 0 v fanout == 1
+    direct = Map.fromList $ concat $
+        [ regInputs r                                   | r@NReg{}    <- nodes ]
+        ++ [ [(nIn o, nPortName o ++ "_o")]             | o@NOutput{} <- nodes ]
+        ++ [ rfPorts r                                  | r@NRegFile{} <- nodes ]
+    regInputs r = case Map.lookup (nOut r) realNames of
+        Just rn -> (nIn r, rn ++ "_next") : maybe [] (\e -> [(e, rn ++ "_en")]) (nEn r)
+        Nothing -> []
+    rfPorts (NRegFile g f _ _ wr _) =
+        concat [ [ (a, base ++ "_waddr"), (d, base ++ "_wdata"), (e, base ++ "_wen") ]
+               | (a, d, e) <- wr ]
+      where base = g ++ "_" ++ f
+    rfPorts _ = []
+    step m w = case Map.lookup w m of
+        Nothing   -> m
+        Just base -> foldl' (add base) m (Map.findWithDefault [] w combMap)
+    add base m v
+        | Set.member v internal, single v, not (Map.member v m) = Map.insert v base m
+        | otherwise                                             = m
+
+-- | Trim a derived name to a sane length (VHDL identifiers can't end in @_@).
+capIdent :: String -> String
+capIdent s
+    | length s <= 64 = s
+    | otherwise      = dropWhileEnd (== '_') (take 64 s)
+
+reservedSafe :: String -> String
+reservedSafe h | Set.member (map toLower h) vhdlReserved = h ++ "_s"
+               | otherwise                               = h
+
+-- | A readable name fragment for a combinational op applied to named operands.
+deriveOp :: (WireId -> String) -> PrimOp -> [WireId] -> String
+deriveOp nm op ins = case (op, ins) of
+    (PNot, [a])            -> "not_" ++ nm a
+    (PSlice hi lo, [a])    -> nm a ++ "_" ++ (if hi == lo then "b" ++ show hi
+                                              else show hi ++ "_" ++ show lo)
+    (PResize _, [a])       -> nm a                 -- resize/cast: transparent, keep operand name
+    (PSignedResize _, [a]) -> nm a
+    (PReinterpret _, [a])  -> nm a
+    (PConcat, xs)          -> intercalate "_" (map nm xs)
+    (PMux, [_, t, f])      -> nm t ++ "_mux_" ++ nm f
+    (PLit v bw, [])        -> litConstName v bw
+    (_, [a, b])            -> nm a ++ "_" ++ opTok op ++ "_" ++ nm b
+    _                      -> opTok op
+
+opTok :: PrimOp -> String
+opTok op = case op of
+    PAdd -> "add"; PSub -> "sub"; PMul -> "mul"
+    PAnd -> "and"; POr -> "or";  PXor -> "xor"; PNot -> "not"
+    PEq  -> "eq";  PLt -> "lt"
+    PShiftL -> "shl"; PShiftR -> "shr"
+    PResize _ -> "rsz"; PSignedResize _ -> "srsz"; PReinterpret _ -> "cast"
+    PConcat -> "cat"; PSlice _ _ -> "bits"; PMux -> "mux"; PLit _ _ -> "c"
+
+-- ---------------------------------------------------------------------------
+-- Expression inlining — collapse one-off @wN@ nets into their consumer
+-- ---------------------------------------------------------------------------
+
+-- | How a wire is consumed (only 'NComb'/'NOutput' consumers render operands
+-- through 'mkRender', so only they can absorb an inlined wire).
+data ConsumerTag = CComb | COutput | COther deriving Eq
+
+consumerRefs :: NetNode -> [(WireId, ConsumerTag)]
+consumerRefs (NComb _ _ ins)             = [ (w, CComb)   | w <- ins ]
+consumerRefs (NOutput inp _ _ _)         = [ (inp, COutput) ]
+consumerRefs (NReg _ i en _ _)           = [ (w, COther) | w <- i : maybe [] pure en ]
+consumerRefs (NMem _ a wa wd we _ _ _ _) = [ (w, COther) | w <- [a, wa, wd, we] ]
+consumerRefs (NRom _ a _ _ _)            = [ (a, COther) ]
+consumerRefs (NRegFileRead _ _ _ a _)    = [ (a, COther) ]
+consumerRefs (NRegFile _ _ _ _ wr _)     = [ (w, COther) | (x, y, z) <- wr, w <- [x, y, z] ]
+consumerRefs (NSubInst _ _ inp _)        = [ (w, COther) | (_, w) <- inp ]
+consumerRefs _                            = []
+
+-- | Wires safe to inline into their single consumer's expression: an internal
+-- (auto-named @wN@) wire, driven by a pure /operator/ op (renders as a plain
+-- sub-expression), used exactly once, by an 'NComb' or 'NOutput'.  This collapses
+-- the sea of one-off @wN <= …@ signals into readable nested expressions.  Ops
+-- that render as @… when … else …@ (mux/compare) are excluded — that form is a
+-- statement RHS, not a pre-2008 sub-expression; shifts are excluded (their
+-- @is_x@ guard lives in the statement wrapper, not the expression).
+inlinableWires :: Set.Set WireId -> [NetNode] -> Set.Set WireId
+inlinableWires named nodes = inlineSet
+  where
+    -- Base eligibility: a pure-operator, internal, single-use wire.
+    base w op = inlinableOp op
+             && not (Set.member w named)                  -- internal (not design-named)
+             && not (Set.member w slicedOperands)         -- can't slice an expression
+             && not (Set.member w shiftAmounts)           -- named in the shift's is_x guard
+             && case Map.findWithDefault [] w consumers of
+                  [CComb]   -> True
+                  [COutput] -> True
+                  _         -> False
+
+    -- Bound the size of an inlined expression: inline a candidate only while its
+    -- collapsed operator count stays within 'cap', so short datapath ops fold into
+    -- one readable line but long reduction chains (orReduce, big priority muxes)
+    -- keep named intermediates instead of a wall of nested parens.  Processed in
+    -- wire-id order (defs precede uses) so operand sizes are known first.
+    cap = 6 :: Int
+    combMap = Map.fromList [ (o, (op, ins)) | NComb o op ins <- nodes ]
+    (inlineSet, _) = foldl' step (Set.empty, Map.empty) (sort (Map.keys combMap))
+    step acc@(inl, szMap) w = case Map.lookup w combMap of
+        Just (op, ins) | base w op ->
+            let s = 1 + sum [ Map.findWithDefault 0 i szMap | i <- ins, Set.member i inl ]
+            in if s <= cap then (Set.insert w inl, Map.insert w s szMap)
+                           else (inl, Map.insert w 0 szMap)
+        _ -> acc
+
+    consumers = Map.fromListWith (++) [ (w, [tag]) | n <- nodes, (w, tag) <- consumerRefs n ]
+    -- VHDL slicing/indexing @X(hi downto lo)@ requires @X@ to be a name, not an
+    -- expression — so a wire fed into a slice (or a /shrinking/ resize, which
+    -- also slices) must keep its own signal.
+    slicedOperands = Set.fromList $
+        [ a | NComb _ (PSlice _ _) [a]  <- nodes, inferWidth a nodes > 1 ]
+        ++ [ a | NComb _ (PResize tgt) [a] <- nodes, tgt < inferWidth a nodes ]
+    -- The shift-amount operand is named again in the statement's @is_x@ guard.
+    shiftAmounts = Set.fromList
+        [ b | NComb _ op [_, b] <- nodes, op == PShiftL || op == PShiftR ]
+    inlinableOp op = case op of
+        PAdd -> True; PSub -> True; PMul -> True
+        PAnd -> True; POr  -> True; PXor -> True; PNot -> True
+        PSlice _ _ -> True; PConcat -> True
+        PResize _ -> True; PSignedResize _ -> True; PReinterpret _ -> True
+        _ -> False
+
+-- | Priority-mux chains: a 'PMux' whose false branch is another /single-use/
+-- 'PMux' folds into one cascaded @… when … else … when … else …@ conditional
+-- signal assignment (legal VHDL — the cascade lives in the false branch; the
+-- nested-expression form is not).  These are the false-branch mux wires to
+-- absorb into their parent's cascade (dropping their own signal + statement).
+muxTailWires :: Set.Set WireId -> [NetNode] -> Set.Set WireId
+muxTailWires named nodes = Set.fromList
+    [ f
+    | NComb _ PMux [_, _, f] <- nodes
+    , Just (PMux, _) <- [Map.lookup f combMap]
+    , [CComb] == Map.findWithDefault [] f consumers   -- used only as this false branch
+    , not (Set.member f named)                         -- internal (not design-named)
+    ]
+  where
+    combMap   = Map.fromList [ (o, (op, ins)) | NComb o op ins <- nodes ]
+    consumers = Map.fromListWith (++) [ (w, [tag]) | n <- nodes, (w, tag) <- consumerRefs n ]
+
+-- | Wires the design names explicitly (ports, hints, group fields, literals,
+-- output-register aliases) — everything else is an auto-named internal wire
+-- eligible for inlining / mux-folding.  Mirrors the keysets 'buildNameMap' uses.
+designNamedWids :: [NetNode] -> Set.Set WireId
+designNamedWids nodes = Set.unions
+    [ Set.fromList [ nOut n | n@NInput{} <- nodes ]
+    , grouped
+    , Set.fromList [ nHintWire n | n@NHint{} <- nodes
+                   , not (isLitWire (nHintWire n) nodes)
+                   , not (Set.member (nHintWire n) grouped) ]
+    , Set.fromList [ nOut n | n@(NComb _ (PLit _ _) []) <- nodes ]
+    , Set.fromList [ nOut n | n@NReg{} <- nodes, Set.member (nOut n) outDriven ] ]
+  where
+    grouped   = Set.fromList [ w | NGroup _ fs <- nodes, (_, w) <- fs ]
+    outDriven = Set.fromList [ nIn n | n@NOutput{} <- nodes ]
+
+-- ---------------------------------------------------------------------------
+-- Instruction-decode recovery: @(sel and mask) = value@ → a VHDL-2008 case?
+-- ---------------------------------------------------------------------------
+
+-- | A group of mask/value matches on one common selector, recovered from the
+-- @(sel and mask) = value@ netlist idiom that ISA decoders lower to.
+data DecodeGroup = DecodeGroup
+    { dgSel     :: WireId
+    , dgWidth   :: Int
+    , dgMatches :: [(WireId, Integer, Integer)]  -- (match output wire, mask, value)
+    }
+
+-- | Recover decode groups whose match patterns are pairwise non-overlapping —
+-- the precondition for a VHDL @case?@ (matching case), whose choices may not
+-- overlap.  Overlapping / non-idiom decoders are left as plain comparisons.
+decodeGroups :: [NetNode] -> [DecodeGroup]
+decodeGroups nodes =
+    [ DecodeGroup sel (inferWidth sel nodes) ms
+    | (sel, ms) <- Map.toList grouped
+    , length ms >= 2
+    , nonOverlapping ms
+    ]
+  where
+    combMap = Map.fromList [ (o, (op, ins)) | NComb o op ins <- nodes ]
+    litOf w = case Map.lookup w combMap of
+                Just (PLit v _, []) -> Just v
+                _                   -> Nothing
+    hits =
+        [ (sel, (out, mask, val))
+        | (out, (PEq, ins2)) <- Map.toList combMap
+        , (andW, val)        <- pickLit ins2
+        , Just (PAnd, ins1)  <- [Map.lookup andW combMap]
+        , (sel, mask)        <- pickLit ins1
+        ]
+    -- of two operands, if exactly one is a literal, yield (otherWire, litVal).
+    pickLit [a, b] = case (litOf a, litOf b) of
+                       (Nothing, Just v) -> [(a, v)]
+                       (Just v, Nothing) -> [(b, v)]
+                       _                 -> []
+    pickLit _ = []
+    grouped = Map.fromListWith (++) [ (sel, [m]) | (sel, m) <- hits ]
+    -- two patterns overlap iff they agree on every commonly-fixed bit.
+    nonOverlapping ms = and [ ((v1 `xor` v2) .&. (m1 .&. m2)) /= 0
+                            | ((_,m1,v1):rest) <- tails ms, (_,m2,v2) <- rest ]
+
+-- | Match-output wires absorbed into a decode process (their comparison
+-- statement is replaced, but the signal itself is still declared/read).
+decodeMatchOuts :: [DecodeGroup] -> Set.Set WireId
+decodeMatchOuts dgs = Set.fromList [ o | DecodeGroup _ _ ms <- dgs, (o,_,_) <- ms ]
+
+-- | The @sel and mask@ intermediate wires that become dead once the matches are
+-- absorbed (every remaining reference is an absorbed match) — dropped entirely.
+decodeDeadWires :: [NetNode] -> [DecodeGroup] -> Set.Set WireId
+decodeDeadWires nodes dgs = Set.fromList
+    [ andW
+    | andW <- Set.toList candidateAnds
+    , not (any (\n -> andW `elem` refWires n && not (isAbsorbed n)) nodes) ]
+  where
+    matchOuts = decodeMatchOuts dgs
+    combMap   = Map.fromList [ (o, (op, ins)) | NComb o op ins <- nodes ]
+    candidateAnds = Set.fromList
+        [ andW | o <- Set.toList matchOuts
+               , Just (PEq, ins) <- [Map.lookup o combMap]
+               , andW <- ins, Just (PAnd, _) <- [Map.lookup andW combMap] ]
+    refWires = map fst . consumerRefs
+    isAbsorbed (NComb o PEq _) = Set.member o matchOuts
+    isAbsorbed _               = False
+
+-- | Render a decode group as one @case?@ process driving all its match outputs.
+renderDecodeProcess :: NameMap -> DecodeGroup -> [String]
+renderDecodeProcess nm (DecodeGroup sel w ms) =
+    [ "", "  -- instruction decode (" ++ show (length ms) ++ " patterns)"
+    , "  process(all)"
+    , "  begin" ]
+    ++ [ "    " ++ lookupWire nm o ++ " <= '0';" | (o,_,_) <- ms ]
+    ++ [ "    case? " ++ lookupWire nm sel ++ " is" ]
+    ++ [ "      when \"" ++ pattern mask val ++ "\" => " ++ lookupWire nm o ++ " <= '1';"
+       | (o, mask, val) <- ms ]
+    ++ [ "      when others => null;"
+       , "    end case?;"
+       , "  end process;" ]
+  where
+    pattern mask val =
+        [ if testBit mask i then (if testBit val i then '1' else '0') else '-'
+        | i <- [w - 1, w - 2 .. 0] ]
+
+-- | An operand renderer that inlines 'inlinableWires' recursively (parenthesised)
+-- and expands 'muxTailWires' as a bare cascade tail (no parens), otherwise
+-- falling back to the wire's signal name.
+mkRender :: NameMap -> [NetNode] -> Set.Set WireId -> Set.Set WireId -> (WireId -> String)
+mkRender nm nodes inlineSet muxTails = render
+  where
+    combMap = Map.fromList [ (o, (op, ins)) | NComb o op ins <- nodes ]
+    render w
+        | Set.member w inlineSet
+        , Just (op, ins) <- Map.lookup w combMap = "(" ++ combExpr render nodes op ins ++ ")"
+        | Set.member w muxTails
+        , Just (PMux, ins) <- Map.lookup w combMap = combExpr render nodes PMux ins
+        | otherwise = lookupWire nm w
 
 -- ---------------------------------------------------------------------------
 -- Entity declaration
@@ -454,9 +763,9 @@ entityDecl design name nodes
 
 -- | Render a port list with semicolons on all but the final entry.
 portLines :: [String] -> [String]
-portLines []  = []
-portLines [p] = ["    " ++ p]
-portLines ps  = ["    " ++ p ++ ";" | p <- init ps] ++ ["    " ++ last ps]
+portLines []         = []
+portLines [p]        = ["    " ++ p]                 -- last port: no trailing ';'
+portLines (p : rest) = ("    " ++ p ++ ";") : portLines rest
 
 -- ---------------------------------------------------------------------------
 -- Architecture
@@ -465,11 +774,22 @@ portLines ps  = ["    " ++ p ++ ";" | p <- init ps] ++ ["    " ++ last ps]
 architectureDecl :: Design -> String -> NameMap -> [NetNode] -> String
 architectureDecl design name nm nodes = unlines $
     [ "architecture rtl of " ++ name ++ " is" ]
-    ++ map ppDecl (archDecls nm nodes)
+    ++ map ppDecl (archDecls nm hidden nodes)
     ++ [ "begin" ]
-    ++ concatMap (toStmt design nm nodes) nodes
+    ++ concatMap (toStmt design nm nodes render stmtSkip) nodes
+    ++ concatMap (renderDecodeProcess nm) dgs
     ++ clockProcesses nm nodes
     ++ [ "end architecture rtl;" ]
+  where
+    named     = designNamedWids nodes
+    inlineSet = inlinableWires named nodes
+    muxTails  = muxTailWires named nodes
+    dgs       = decodeGroups nodes
+    matchOuts = decodeMatchOuts dgs             -- driven by a case? process; keep decl
+    deadWires = decodeDeadWires nodes dgs        -- dead @sel and mask@ intermediates
+    hidden    = Set.unions [inlineSet, muxTails, deadWires]  -- no own signal
+    stmtSkip  = Set.union hidden matchOuts        -- + skip the replaced comparisons
+    render    = mkRender nm nodes inlineSet muxTails
 
 -- | Structured TYPE declarations that must be package-visible (so they can be
 -- used in entity ports, not just internal signals): record types (from
@@ -506,8 +826,8 @@ groupArrayTypeName :: String -> String -> String
 groupArrayTypeName grpName fldName = grpName ++ "_" ++ fldName ++ "_t"
 
 -- | All architecture-region declarations: types, constants, signals.
-archDecls :: NameMap -> [NetNode] -> [VDecl]
-archDecls nm nodes =
+archDecls :: NameMap -> Set.Set WireId -> [NetNode] -> [VDecl]
+archDecls nm inlineSet nodes =
     -- NGroup record SIGNALS (the record TYPES are in the package, packageTypeDecls).
     concatMap groupDecls groups
     ++
@@ -546,6 +866,7 @@ archDecls nm nodes =
     , not (isInputWire wid nodes)
     , not (isLitWire wid nodes)
     , not (Set.member wid groupedWires)
+    , not (Set.member wid inlineSet)          -- inlined into its consumer
     , hasDriver wid nodes
     ]
   where
@@ -591,15 +912,15 @@ regInit wid nodes = case [ nInit n | n@NReg{} <- nodes, nOut n == wid ] of
 -- Concurrent statements
 -- ---------------------------------------------------------------------------
 
-toStmt :: Design -> NameMap -> [NetNode] -> NetNode -> [String]
-toStmt _      _  _  NInput{}                = []
-toStmt _      _  _  NHint{}                 = []
-toStmt _      _  _  NRepr{}                 = []
-toStmt _      _  _  NGroup{}               = []
-toStmt _      _  _  (NComment txt)          = ["", "  -- " ++ txt]
-toStmt _      _  _  NReg{}                  = []  -- handled by clockProcesses
-toStmt _      _  _  NRegFile{}              = []  -- writes handled by clockProcesses
-toStmt _      nm _  (NRegFileRead out g fld rdA cnt) =
+toStmt :: Design -> NameMap -> [NetNode] -> (WireId -> String) -> Set.Set WireId -> NetNode -> [String]
+toStmt _      _  _  _ _ NInput{}                = []
+toStmt _      _  _  _ _ NHint{}                 = []
+toStmt _      _  _  _ _ NRepr{}                 = []
+toStmt _      _  _  _ _ NGroup{}               = []
+toStmt _      _  _  _ _ (NComment txt)          = ["", "  -- " ++ txt]
+toStmt _      _  _  _ _ NReg{}                  = []  -- handled by clockProcesses
+toStmt _      _  _  _ _ NRegFile{}              = []  -- writes handled by clockProcesses
+toStmt _      nm _  _ _ (NRegFileRead out g fld rdA cnt) =
     -- Indexed combinational read of a register-file record field.
     let addr  = lookupWire nm rdA
         nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
@@ -607,7 +928,7 @@ toStmt _      nm _  (NRegFileRead out g fld rdA cnt) =
     in [ "  " ++ lookupWire nm out ++ " <= "
              ++ g ++ "." ++ fld ++ "(to_integer(" ++ raddr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
+toStmt _      nm _  _ _ (NMem out rdA _ _ _ sz _ _ _) =
     -- Truncate addr to the minimum bits that can index sz entries before to_integer
     -- so that out-of-range addresses (e.g. 0xFFFFFE00) don't overflow INTEGER.
     let addr  = lookupWire nm rdA
@@ -616,22 +937,23 @@ toStmt _      nm _  (NMem out rdA _ _ _ sz _ _ _) =
     in [ "  " ++ lookupWire nm out ++ " <= "
              ++ memSigName out nm ++ "(to_integer(" ++ raddr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      nm _  (NRom out rdA _ _ _) =
+toStmt _      nm _  _ _ (NRom out rdA _ _ _) =
     let addr = lookupWire nm rdA
     in [ "  " ++ lookupWire nm out ++ " <= "
              ++ romSigName out ++ "(to_integer(" ++ addr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      _  _  (NComb _ (PLit _ _) []) = []  -- handled by archDecls
-toStmt _      nm _  (NOutput inp pname _ _) =
-    [ "  " ++ pname ++ " <= " ++ lookupWire nm inp ++ ";" ]
-toStmt _      nm ns (NComb out op ins) =
-    let expr = combExpr nm ns op ins
+toStmt _      _  _  _ _ (NComb _ (PLit _ _) []) = []  -- handled by archDecls
+toStmt _      _  _  render _ (NOutput inp pname _ _) =
+    [ "  " ++ pname ++ " <= " ++ render inp ++ ";" ]
+toStmt _      _  _  _ inlineSet (NComb out _ _) | Set.member out inlineSet = []  -- inlined into consumer
+toStmt _      nm ns render _ (NComb out op ins) =
+    let expr = combExpr render ns op ins
         stmt = case (op, ins) of
             (PShiftL, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
             (PShiftR, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
             _                  -> expr
     in [ "  " ++ lookupWire nm out ++ " <= " ++ stmt ++ ";" ]
-toStmt design nm _  (NSubInst instNm entRef inPorts outPorts) =
+toStmt design nm _  _ _ (NSubInst instNm entRef inPorts outPorts) =
     let (libName, entName) = case entRef of
             LocalEntity  e   -> ("work", e)
             ExternEntity l e -> (l, e)
@@ -723,8 +1045,8 @@ clockProcesses nm nodes = concatMap emitProc (Map.toAscList domGroups)
 -- Combinational expressions
 -- ---------------------------------------------------------------------------
 
-combExpr :: NameMap -> [NetNode] -> PrimOp -> [WireId] -> String
-combExpr nm ns op ins = case (op, ins) of
+combExpr :: (WireId -> String) -> [NetNode] -> PrimOp -> [WireId] -> String
+combExpr w ns op ins = case (op, ins) of
     (POr,   [a,b]) | a == b -> w a   -- identity: hinted a or a → a
     (PAnd,  [a,b]) | a == b -> w a   -- identity: hinted a and a → a
     -- 1-bit unsigned arithmetic is mod-2: a+b = a-b = a xor b, a*b = a and b.
@@ -756,7 +1078,9 @@ combExpr nm ns op ins = case (op, ins) of
                 | sw == 1   = "resize(unsigned'(0 => " ++ w src ++ "), " ++ show ow ++ ")"
                 | ow > 1    = "resize(" ++ castLit r src ++ ", " ++ show ow ++ ")"
                 | otherwise = w src
-        in fit tw t ++ " when " ++ w s ++ " = '1' else " ++ fit fw f
+        -- Break each branch onto its own line: a priority-mux chain (folded via
+        -- 'muxTailWires') then reads as an aligned @… when … else …@ cascade.
+        in fit tw t ++ " when " ++ w s ++ " = '1' else\n           " ++ fit fw f
     (PEq,   [a,b]) -> let r = dataRepr [a,b]
                       in "'1' when " ++ castLit r a ++ " = " ++ castLit r b ++ " else '0'"
     (PLt,   [a,b]) -> let r = dataRepr [a,b]
@@ -787,7 +1111,6 @@ combExpr nm ns op ins = case (op, ins) of
     (PShiftR, [a,b]) -> "shift_right(" ++ w a ++ ", to_integer(" ++ w b ++ "))"
     _ -> "/* unhandled " ++ show op ++ " */"
   where
-    w = lookupWire nm
     reprCast RSigned   = "signed"
     reprCast RUnsigned = "unsigned"
     reprCast (REnum _) = "unsigned"  -- enums are not numerically reinterpret-cast
@@ -883,13 +1206,22 @@ inferOpWidth _              []       _  = 1
 
 ppLit :: SomeBits -> String
 ppLit (SomeBits v 1) = if v == 0 then "'0'" else "'1'"
-ppLit (SomeBits v w) = "to_unsigned(" ++ show v ++ ", " ++ show w ++ ")"
+ppLit (SomeBits v w)
+    -- VHDL's @to_unsigned@ takes an @integer@ (32-bit), so a value wider than 31
+    -- bits overflows it.  Emit a qualified bit-string literal for wide constants.
+    | w > 31    = "unsigned'(\"" ++ bitString v w ++ "\")"
+    | otherwise = "to_unsigned(" ++ show v ++ ", " ++ show w ++ ")"
+
+-- | The low @w@ bits of @v@ as a VHDL bit-string (MSB first).
+bitString :: Integer -> Int -> String
+bitString v w = [ if odd (v `div` (2 ^ i)) then '1' else '0' | i <- [w - 1, w - 2 .. 0] ]
 
 -- | Repr-aware literal: a signed wire's constant\/init must be @to_signed@ (with
 -- the bit pattern reinterpreted as a signed value), not @to_unsigned@.
 ppLitR :: Repr -> SomeBits -> String
 ppLitR RSigned (SomeBits v w)
-    | w > 1 = "to_signed(" ++ show signedVal ++ ", " ++ show w ++ ")"
+    | w > 31 = "signed'(\"" ++ bitString v w ++ "\")"   -- raw two's-complement bits
+    | w > 1  = "to_signed(" ++ show signedVal ++ ", " ++ show w ++ ")"
   where signedVal = if v >= 2 ^ (w - 1) then v - 2 ^ w else v
 ppLitR (REnum lits) (SomeBits v _)
     | fromInteger v < length lits = lits !! fromInteger v   -- enum value → literal

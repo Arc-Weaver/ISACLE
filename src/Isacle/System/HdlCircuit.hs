@@ -41,6 +41,7 @@ hdlOps :: forall dom dat.
 hdlOps = PeriphOps
     { sigReg      = hdlSigReg
     , sigBlockMem = hdlSigBlockMem
+    , sigRom      = hdlSigRom
     , sigAddrLt   = \addr lim -> addr .<. fromIntegral lim
     , sigZero     = litSig 0
     , sigAnd      = (.&&.)
@@ -85,6 +86,17 @@ hdlOps = PeriphOps
             emit $ NMem out raW waW wdW enW size datW initVals domInf
         pure out
 
+    -- Combinational ROM: a purely combinational 'NRom' lookup (readAddr → data
+    -- the same cycle), for instruction/code memory.
+    hdlSigRom :: Int -> [Integer] -> Sig dom (Unsigned 32) -> Sig dom dat
+    hdlSigRom size initVals rdAddr = SExpr $ do
+        out <- freshWire
+        let datW = fromIntegral (natVal (Proxy @(Width dat)))
+        defer $ do
+            raW <- materialize rdAddr
+            emit $ NRom out raW size datW initVals
+        pure out
+
 -- ---------------------------------------------------------------------------
 -- Named physical-output bundles
 -- ---------------------------------------------------------------------------
@@ -115,26 +127,29 @@ deriving instance KnownDom dom => HdlPorts (TimerPhys dom)
 deriving instance KnownDom dom => PortRef  (TimerPhys dom)
 
 instance (KnownDom dom, HdlType dat) => HdlPhys (GpioPhys dom dat) where
-    emitPhysOuts _dom _datW phys = do
+    emitPhysOuts names _dom _datW phys = do
         wires <- toWireIds phys
         let specs = portSpecs (Proxy @(GpioPhys dom dat))
-        zipWithM_ (\ps w -> emit $ NOutput w (portName ps) (portWidth ps) (portDom ps)) specs wires
+        sequence_ [ emit $ NOutput w nm (portWidth ps) (portDom ps)
+                  | (nm, ps, w) <- zip3 names specs wires ]
     fromPhysWires = fromWireIds
     physOutCount _ = portCount (Proxy @(GpioPhys dom dat))
 
 instance KnownDom dom => HdlPhys (UartPhys dom) where
-    emitPhysOuts _dom _datW phys = do
+    emitPhysOuts names _dom _datW phys = do
         wires <- toWireIds phys
         let specs = portSpecs (Proxy @(UartPhys dom))
-        zipWithM_ (\ps w -> emit $ NOutput w (portName ps) (portWidth ps) (portDom ps)) specs wires
+        sequence_ [ emit $ NOutput w nm (portWidth ps) (portDom ps)
+                  | (nm, ps, w) <- zip3 names specs wires ]
     fromPhysWires = fromWireIds
     physOutCount _ = portCount (Proxy @(UartPhys dom))
 
 instance KnownDom dom => HdlPhys (TimerPhys dom) where
-    emitPhysOuts _dom _datW phys = do
+    emitPhysOuts names _dom _datW phys = do
         wires <- toWireIds phys
         let specs = portSpecs (Proxy @(TimerPhys dom))
-        zipWithM_ (\ps w -> emit $ NOutput w (portName ps) (portWidth ps) (portDom ps)) specs wires
+        sequence_ [ emit $ NOutput w nm (portWidth ps) (portDom ps)
+                  | (nm, ps, w) <- zip3 names specs wires ]
     fromPhysWires = fromWireIds
     physOutCount _ = portCount (Proxy @(TimerPhys dom))
 
@@ -206,32 +221,35 @@ busPortIface req we addr wdata base = BusIface
 -- @datW@ is passed explicitly because 'Sig' type parameters are phantoms.
 -- @physOutCount@ gives the number of physical outputs without running the body.
 class HdlPhys a where
-    -- | Emit one 'NOutput' per signal component inside a sub-entity body.
-    emitPhysOuts  :: DomId -> Int -> a -> NetM ()
+    -- | Promote each signal component to a top-level 'NOutput', named by the
+    -- supplied list (one name per component, in bundle order).
+    emitPhysOuts  :: [String] -> DomId -> Int -> a -> NetM ()
     -- | Reconstruct @a@ from parent output-port wire IDs (positional).
     fromPhysWires :: [WireId] -> a
     -- | Number of physical output ports (without running the body).
     physOutCount  :: proxy a -> Int
 
 instance HdlPhys () where
-    emitPhysOuts _ _ () = return ()
+    emitPhysOuts _ _ _ () = return ()
     fromPhysWires _     = ()
     physOutCount  _     = 0
 
 instance HdlPhys (Sig dom Bool, Sig dom Bool, Sig dom Bool) where
-    emitPhysOuts dom _ (s0, s1, s2) = do
-        w0 <- materialize s0; emit $ NOutput w0 "p0" 1 dom
-        w1 <- materialize s1; emit $ NOutput w1 "p1" 1 dom
-        w2 <- materialize s2; emit $ NOutput w2 "p2" 1 dom
+    emitPhysOuts (n0:n1:n2:_) dom _ (s0, s1, s2) = do
+        w0 <- materialize s0; emit $ NOutput w0 n0 1 dom
+        w1 <- materialize s1; emit $ NOutput w1 n1 1 dom
+        w2 <- materialize s2; emit $ NOutput w2 n2 1 dom
+    emitPhysOuts ns _ _ _ = errNames "Bool,Bool,Bool" ns
     fromPhysWires (w0:w1:w2:_) = (SWire w0, SWire w1, SWire w2)
     fromPhysWires ws            =
         error $ "HdlPhys (Bool,Bool,Bool): expected ≥3 wires, got " ++ show (length ws)
     physOutCount _ = 3
 
 instance HdlPhys (Sig dom Bool, Sig dom Bool) where
-    emitPhysOuts dom _ (s0, s1) = do
-        w0 <- materialize s0; emit $ NOutput w0 "p0" 1 dom
-        w1 <- materialize s1; emit $ NOutput w1 "p1" 1 dom
+    emitPhysOuts (n0:n1:_) dom _ (s0, s1) = do
+        w0 <- materialize s0; emit $ NOutput w0 n0 1 dom
+        w1 <- materialize s1; emit $ NOutput w1 n1 1 dom
+    emitPhysOuts ns _ _ _ = errNames "Bool,Bool" ns
     fromPhysWires (w0:w1:_) = (SWire w0, SWire w1)
     fromPhysWires ws         =
         error $ "HdlPhys (Bool,Bool): expected ≥2 wires, got " ++ show (length ws)
@@ -240,9 +258,10 @@ instance HdlPhys (Sig dom Bool, Sig dom Bool) where
 -- | Instance for two dat-width outputs (e.g. GPIO PORT + DDR).
 -- Marked OVERLAPPABLE so the (Bool,Bool) instance takes priority when dat=Bool.
 instance {-# OVERLAPPABLE #-} HdlPhys (Sig dom dat, Sig dom dat) where
-    emitPhysOuts dom datW (s0, s1) = do
-        w0 <- materialize s0; emit $ NOutput w0 "p0" datW dom
-        w1 <- materialize s1; emit $ NOutput w1 "p1" datW dom
+    emitPhysOuts (n0:n1:_) dom datW (s0, s1) = do
+        w0 <- materialize s0; emit $ NOutput w0 n0 datW dom
+        w1 <- materialize s1; emit $ NOutput w1 n1 datW dom
+    emitPhysOuts ns _ _ _ = errNames "dat,dat" ns
     fromPhysWires (w0:w1:_) = (SWire w0, SWire w1)
     fromPhysWires ws         =
         error $ "HdlPhys (dat,dat): expected ≥2 wires, got " ++ show (length ws)
@@ -252,11 +271,17 @@ instance {-# OVERLAPPABLE #-} HdlPhys (Sig dom dat, Sig dom dat) where
 -- (e.g. UART TX + GPIO PORT + DDR when mixed on a single bus).
 -- Marked OVERLAPPABLE so the (Bool,Bool,Bool) instance wins when dat=Bool.
 instance {-# OVERLAPPABLE #-} HdlPhys (Sig dom Bool, Sig dom dat, Sig dom dat) where
-    emitPhysOuts dom datW (s0, s1, s2) = do
-        w0 <- materialize s0; emit $ NOutput w0 "p0" 1    dom
-        w1 <- materialize s1; emit $ NOutput w1 "p1" datW dom
-        w2 <- materialize s2; emit $ NOutput w2 "p2" datW dom
+    emitPhysOuts (n0:n1:n2:_) dom datW (s0, s1, s2) = do
+        w0 <- materialize s0; emit $ NOutput w0 n0 1    dom
+        w1 <- materialize s1; emit $ NOutput w1 n1 datW dom
+        w2 <- materialize s2; emit $ NOutput w2 n2 datW dom
+    emitPhysOuts ns _ _ _ = errNames "Bool,dat,dat" ns
     fromPhysWires (w0:w1:w2:_) = (SWire w0, SWire w1, SWire w2)
     fromPhysWires ws            =
         error $ "HdlPhys (Bool,dat,dat): expected ≥3 wires, got " ++ show (length ws)
     physOutCount _ = 3
+
+-- | Shared error for an under-length name list passed to 'emitPhysOuts'.
+errNames :: String -> [String] -> a
+errNames who ns =
+    error $ "HdlPhys (" ++ who ++ "): too few phys-output names: " ++ show ns

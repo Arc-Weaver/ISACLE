@@ -1,78 +1,28 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 module Hdl.Class
-    ( -- * Hdl — the stateful hardware arrow
-      Hdl(..)
-      -- * NetBuilder: the synthesis interpreter
-    , NetBuilder(..)
-      -- * Entity instantiation
-    , instEntity
+    ( -- * Entity instantiation
+      instEntity
       -- * Primitive circuit operations
     , regS
     , regEnS
-    , ramS
-    , romS
-    , primS
+    , ram
+    , rom
     , inputS
     , outputS
       -- * Optional wire naming
     , named
-      -- * Structured (record) signal grouping
-    , mkGroup
+      -- * Forward-declared signals (typed alias for feedback wiring)
+    , freshSig
+    , connectSig
     ) where
 
-import Prelude hiding ((.), id)
-import Control.Category (Category(..))
-import Control.Arrow (Arrow(..), ArrowChoice(..))
-import Control.Monad ((>=>))
-import Data.Kind (Type)
+import Prelude
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
 import Hdl.Net
 import Hdl.Types
 import Hdl.Entity
-
--- ---------------------------------------------------------------------------
--- Hdl — the stateful hardware arrow
--- ---------------------------------------------------------------------------
-
--- | The class of stateful hardware operations: an arrow @c i o@ from input
--- signal-bundle @i@ to output @o@.  'register' is the fundamental member; the
--- 'Category' / 'Arrow' structure (below) gives composition (@>>>@) and
--- input-space expansion (@first@/@***@/@&&&@) — "monadic, but able to expand its
--- input space".  'NetBuilder' is the synthesis interpreter; sim / doc are future
--- instances.
-class Category c => Hdl (c :: Type -> Type -> Type) where
-    -- | A clocked register: @register initVal@ is the arrow from the input
-    -- signal to its registered value.
-    register :: forall dom a.
-                (HdlType a, KnownDom dom)
-             => a -> c (Sig dom a) (Sig dom a)
-
-    -- | A register with a write-enable.
-    registerEn :: forall dom a.
-                  (HdlType a, KnownDom dom)
-               => a -> c (Sig dom Bool, Sig dom a) (Sig dom a)
-
--- | The synthesis interpreter: a Kleisli arrow over 'NetM' (builds the graph).
-newtype NetBuilder i o = NetBuilder { runNetBuilder :: i -> NetM o }
-
-instance Category NetBuilder where
-    id = NetBuilder pure
-    NetBuilder g . NetBuilder f = NetBuilder (f >=> g)
-
-instance Arrow NetBuilder where
-    arr f = NetBuilder (pure . f)
-    first  (NetBuilder f) = NetBuilder (\(b, d) -> do c <- f b; pure (c, d))
-    second (NetBuilder f) = NetBuilder (\(d, b) -> do c <- f b; pure (d, c))
-
-instance ArrowChoice NetBuilder where
-    left  (NetBuilder f) = NetBuilder (either (fmap Left . f)  (pure . Right))
-    right (NetBuilder f) = NetBuilder (either (pure . Left)    (fmap Right . f))
-
-instance Hdl NetBuilder where
-    register   initVal = NetBuilder $ regS   initVal
-    registerEn initVal = NetBuilder $ uncurry (regEnS initVal)
 
 -- ---------------------------------------------------------------------------
 -- Entity instantiation
@@ -93,7 +43,7 @@ instEntity ent instLabel inputs = do
         oSpecs = zipWith setN (portNames (Proxy @o)) (portSpecs (Proxy @o))
         body   = do
             subIns  <- mapM allocIn iSpecs
-            outputs <- runHDL (entityBody ent) (fromWireIds subIns)
+            outputs <- entityBody ent (fromWireIds subIns)
             subOuts <- toWireIds outputs
             mapM_ (uncurry emitOut) (zip oSpecs subOuts)
     (_, outPorts) <- inBlock instLabel (entityName ent) inWids body
@@ -164,22 +114,26 @@ named hint sig = do
     hintWire wid hint
     pure (SWire wid)
 
--- | Group a record of signals into a named VHDL record signal.
---
--- @a@ is any @deriving (Generic, HdlPorts)@ record whose fields are 'Sig' (or
--- other 'HdlPorts' bundles).  The field wires are materialized and emitted as an
--- 'NGroup', so the emitter declares @\<name\>_t@ as a record type and rewrites
--- references to those wires as @\<name\>.\<field\>@.  This is the generic form of
--- the hand-rolled @NGroup "cpu_state"@ in the CPU backend.
-mkGroup :: forall a. HdlPorts a => String -> a -> NetM ()
-mkGroup name a = do
-    wids <- toWireIds a
-    let names = map portName (portSpecs (Proxy @a))
-    emit $ NGroup name (zip names wids)
+-- | A forward-declared signal: a fresh wire with no driver yet, to be driven
+-- later by 'connectSig'.  The typed replacement for a bare @freshWire@ placeholder
+-- when wiring feedback/cross-entity loops at the system layer (e.g. a bus master's
+-- read-data input, driven by the fabric after the master is elaborated).
+freshSig :: NetM (Sig dom a)
+freshSig = SWire <$> freshWire
+
+-- | Drive a forward-declared signal ('freshSig') from another signal — the typed
+-- form of a netlist alias.  @connectSig dst src@ connects @dst@ (which must be a
+-- placeholder wire) to @src@; emits an identity buffer so the placeholder carries
+-- @src@'s value.  Use only on placeholders created by 'freshSig'.
+connectSig :: Sig dom a -> Sig dom a -> NetM ()
+connectSig dst src = do
+    dw <- materialize dst
+    sw <- materialize src
+    emit $ NComb dw POr [sw, sw]
 
 -- | Synchronous-write / asynchronous-read block RAM.
 -- Emits a single 'NMem' node; all ports are materialized immediately.
-ramS :: forall dom a addr.
+ram :: forall dom a addr.
         (HdlType a, KnownDom dom)
      => Int            -- ^ number of entries
      -> [Integer]      -- ^ initial contents (padded with 0)
@@ -188,7 +142,7 @@ ramS :: forall dom a addr.
      -> Sig dom a      -- ^ write data
      -> Sig dom Bool   -- ^ write enable
      -> NetM (Sig dom a)
-ramS size initVals rdAddr wrAddr wrData wrEn = do
+ram size initVals rdAddr wrAddr wrData wrEn = do
     outWid <- freshWire
     rdA    <- materialize rdAddr
     wrA    <- materialize wrAddr
@@ -201,21 +155,15 @@ ramS size initVals rdAddr wrAddr wrData wrEn = do
 
 -- | Purely combinational ROM lookup.
 -- Emits a single 'NRom' node.
-romS :: forall dom a addr.
+rom :: forall dom a addr.
         HdlType a
      => Int            -- ^ number of entries
      -> [Integer]      -- ^ ROM contents (padded with 0)
      -> Sig dom addr   -- ^ read address
      -> NetM (Sig dom a)
-romS size initVals rdAddr = do
+rom size initVals rdAddr = do
     outWid <- freshWire
     rdA    <- materialize rdAddr
     let datW = fromIntegral (natVal (Proxy @(Width a)))
     emit $ NRom outWid rdA size datW initVals
     pure (SWire outWid)
-
-primS :: PrimOp -> [WireId] -> NetM WireId
-primS op ins = do
-    outWid <- freshWire
-    emit $ NComb outWid op ins
-    pure outWid

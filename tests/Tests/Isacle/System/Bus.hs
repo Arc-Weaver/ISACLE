@@ -36,10 +36,10 @@ gpioBase = 0x60
 
 gpioBusSys
     :: Sig Clk (Unsigned 8)
-    -> SysDSL Clk (Unsigned 8) (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
+    -> SysDSL (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 gpioBusSys gpioIn = do
     gpio <- createGpio "gpio" gpioIn
-    ((port, ddr), _rdData) <- createBus "databus" $ do
+    (_bus, (port, ddr)) <- createBus @SimpleBus "databus" $ do
         gpio' <- attachPeripheral gpioBase gpio
         return (gpioPort gpio', gpioDdr gpio')
     return (port, ddr)
@@ -109,7 +109,7 @@ runBusTests = do
     -- solver), so the SoC simulates and its gpio outputs resolve — at reset both
     -- the port and DDR registers read 0.
     putStrLn "\n-- whole-SoC simulation --"
-    let design = execSystemDSL @Clk @(Unsigned 8) "top" (gpioBusSys pinSig)
+    let design = execSystemDSL "top" (gpioBusSys pinSig)
         socOut = head (simulateSystem design "top" M.empty 1)
     assert "whole-SoC sim resolves gpio port output"
         (M.lookup "gpio_GpioPhys_gpioPort" socOut == Just 0)
@@ -119,10 +119,10 @@ runBusTests = do
     -- Typed peripheral → C header, end to end: the ramp's signed registers
     -- (declared via regField/roField @(Signed 8)) surface as int8_t.
     putStrLn "\n-- signed peripheral C header --"
-    let rampSys :: SysDSL Clk (Unsigned 8) ()
+    let rampSys :: SysDSL ()
         rampSys = do
-            r <- createRamp "ramp0" (SExpr (pure 1))
-            _ <- createBus "rbus" (attachPeripheral 0x40 r >> return ())
+            r  <- createRamp "ramp0" (SExpr (pure 1) :: Sig Clk Bool)
+            _  <- createBus @SimpleBus "rbus" (attachPeripheral 0x40 r >> return ())
             return ()
         rampHdr = reduceToCHeader "ramphdr" rampSys
     assert "ramp SETPOINT is int8_t in the C header"

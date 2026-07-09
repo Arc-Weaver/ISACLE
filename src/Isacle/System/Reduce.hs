@@ -47,7 +47,7 @@ data SysReductions a = SysReductions
     }
 
 -- | Reduce a system to all of its targets at once. @name@ guards the C header.
-reduceSystem :: forall dom dat a. String -> SysDSL dom dat a -> SysReductions a
+reduceSystem :: forall a. String -> SysDSL a -> SysReductions a
 reduceSystem name dsl =
     let (a, nodes, doc) = runSystemDSL dsl
     in SysReductions
@@ -61,25 +61,25 @@ reduceSystem name dsl =
 
 -- | A system reduces to Hdl I/O: its exposed result plus the flat netlist (SY7).
 -- The result and the nodes are /not/ the system — they are what it reduces to.
-reduceToHdl :: SysDSL dom dat a -> (a, [NetNode])
+reduceToHdl :: SysDSL a -> (a, [NetNode])
 reduceToHdl dsl = let (a, nodes, _) = runSystemDSL dsl in (a, nodes)
 
 -- | Reduce to the full 'Design' (top entity + sub-entities) for VHDL emission.
-reduceToDesign :: forall dom dat a. String -> SysDSL dom dat a -> Design
+reduceToDesign :: forall a. String -> SysDSL a -> Design
 reduceToDesign = execSystemDSL
 
 -- | Reduce to the introspectable topology document (BU5).
-reduceToDoc :: SysDSL dom dat a -> SysDoc
+reduceToDoc :: SysDSL a -> SysDoc
 reduceToDoc dsl = let (_, _, doc) = runSystemDSL dsl in doc
 
 -- | Reduce to memory-map text (SY6).
-reduceToMemoryMap :: SysDSL dom dat a -> String
+reduceToMemoryMap :: SysDSL a -> String
 reduceToMemoryMap = sysExtractMemoryMap . reduceToDoc
 
 -- | Reduce to a C header guarded by the given name (SY6).
-reduceToCHeader :: String -> SysDSL dom dat a -> String
+reduceToCHeader :: String -> SysDSL a -> String
 reduceToCHeader name = sysGenCHeader name . reduceToDoc
 
 -- | Reduce to a GNU LD linker script (SY6).
-reduceToLinkerScript :: SysDSL dom dat a -> String
+reduceToLinkerScript :: SysDSL a -> String
 reduceToLinkerScript = sysGenLinkerScript . reduceToDoc

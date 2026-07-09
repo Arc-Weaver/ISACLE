@@ -16,13 +16,13 @@ instance KnownDom Clk where
                     , domEdge = Rising, domReset = ActiveHigh, domResetName = "rst" }
 
 mySystem :: (Sig Clk Bool, Sig Clk (Unsigned 8))
-         -> SysDSL Clk (Unsigned 8)
+         -> SysDSL
                    (Sig Clk Bool, Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 mySystem (uart0Rx, gpio0In) = do
     uart0 <- createUart "uart0" uart0Rx
     gpio0 <- createGpio "gpio0" gpio0In
 
-    ((uart0Tx, gpio0Port, gpio0Ddr), _rdData) <- createBus "databus" $ do
+    (_dataBus, (uart0Tx, gpio0Port, gpio0Ddr)) <- createBus @SimpleBus "databus" $ do
         uart0' <- attachPeripheral 0x100 uart0
         gpio0' <- attachPeripheral 0x300 gpio0
         return (uartTxLine uart0', gpioPort gpio0', gpioDdr gpio0')

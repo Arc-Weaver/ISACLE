@@ -69,6 +69,8 @@ library isacle-hdl
     Hdl.Class
     Hdl.Emit.Vhdl
     Hdl.Entity
+    Hdl.IO
+    Hdl.Monad
     Hdl.Net
     Hdl.Prim
     Hdl.Reduce
@@ -106,6 +108,8 @@ library
     Isacle.ISA.Backend.Synth
     Isacle.ISA.Backend.SynthCPU
     Isacle.ISA.Backend.SynthVnCPU
+    Isacle.ISA.Backend.Wire
+    Isacle.ISA.Chip
     Isacle.ISA.CPUDef
     Isacle.ISA.Def
     Isacle.ISA.Encoding
@@ -124,14 +128,15 @@ library
     Isacle.Periph.DMA
     Isacle.Periph.GPIO
     Isacle.Periph.Interrupt
+    Isacle.Periph.InterruptController
     Isacle.Periph.Ramp
     Isacle.Periph.Timer
     Isacle.Periph.UART
     Isacle.System
+    Isacle.System.Bus
     Isacle.System.BusArch
     Isacle.System.BusCap
     Isacle.System.BusDef
-    Isacle.System.BusHandle
     Isacle.System.Generate
     Isacle.System.HdlCircuit
     Isacle.Layout

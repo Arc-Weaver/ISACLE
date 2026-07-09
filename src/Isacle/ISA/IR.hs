@@ -79,6 +79,7 @@ module Isacle.ISA.IR
     , (.|.)
     , xor
     , inv
+    , ifexp
     , shiftL
     , shiftR
     , arithShiftR
@@ -112,9 +113,18 @@ newtype FieldRef = FieldRef { frKey :: String }
 -- for signal naming.  Indexed by the register's value type @a@.
 data RegRef (a :: Type)
     = RegScalar String              -- ^ scalar register (e.g. @"SP"@, @"PC"@)
-    | RegFile   String FieldRef Int -- ^ register-file slot: file name, index field,
-                                    --   and a constant added to the index (for
-                                    --   sub-range encodings, e.g. AVR R16–R31 → +16)
+    | RegFile   String FieldRef Int Int
+                                    -- ^ register-file slot: file name, index field,
+                                    --   index /scale/ and /offset/ — the runtime index
+                                    --   is @scale * field + offset@.  Scale 1 is the
+                                    --   plain case; sub-range encodings add an offset
+                                    --   (e.g. AVR R16–R31 → +16) and register-/pair/
+                                    --   encodings use scale 2 (e.g. ADIW 24+2·d).
+    | RegEntries String Int [Int]   -- ^ a /view/ register: a value spanning several
+                                    --   register-file entries (file name, element
+                                    --   width, indices low entry first), e.g. AVR
+                                    --   X = GPR[26]:GPR[27].  Reads concatenate the
+                                    --   entries; writes split across them.
     deriving (Eq, Show)
 
 -- | Identifies one ordered memory/code read so its result expression
@@ -140,6 +150,9 @@ data IExpr (a :: Type) where
     IIrqVector :: HdlType a => IExpr a             -- ^ external interrupt-vector input
     IBin      :: HdlType a => ALUPrim -> IExpr a -> IExpr a -> IExpr a
     IUn       :: HdlType a => ALUPrim -> IExpr a -> IExpr a
+    -- | Multiplexer: @IMux c t f@ is @t@ when the 1-bit @c@ is set, else @f@.
+    -- Lowers to a real mux (@… when … else …@), not a bit-mask.
+    IMux      :: HdlType a => IExpr Bool -> IExpr a -> IExpr a -> IExpr a
     -- | Same-width reinterpretation: keep the bits, change the representation
     -- (e.g. @Unsigned 8 → Signed 8@).  Lowers to a real VHDL @signed()@\/
     -- @unsigned()@ cast (the HDL layer's @PReinterpret@).
@@ -280,6 +293,11 @@ xor a b = IBin PXor a b
 inv :: HdlType a => IExpr a -> IExpr a
 inv = IUn PNot
 
+-- | @ifexp c t f@ — a value-typed conditional expression (multiplexer): @t@ when
+-- the 1-bit @c@ is set, else @f@.  A first-class mux in the expression system.
+ifexp :: HdlType a => IExpr Bool -> IExpr a -> IExpr a -> IExpr a
+ifexp = IMux
+
 shiftL :: HdlType a => IExpr a -> IExpr a -> IExpr a
 shiftL a n = IBin PShiftL a n
 
@@ -303,12 +321,12 @@ isZeroE = IIsZero
 -- reads are statements (not just expressions) because their order drives the
 -- execution sequencer; their results are referred to via 'IReadRes' / 'ReadTok'.
 data IStmt where
-    SReadMem  :: ReadTok -> IExpr aw -> IStmt
-    SReadCode :: ReadTok -> IExpr aw -> IStmt
-    SWriteReg :: RegRef a -> IExpr a -> IStmt
-    SWriteMem :: IExpr aw -> IExpr ww -> IStmt
+    SReadMem  :: HdlType aw => ReadTok -> IExpr aw -> IStmt
+    SReadCode :: HdlType aw => ReadTok -> IExpr aw -> IStmt
+    SWriteReg :: HdlType a => RegRef a -> IExpr a -> IStmt
+    SWriteMem :: (HdlType aw, HdlType ww) => IExpr aw -> IExpr ww -> IStmt
     SWriteFlag :: CPUFlag -> IExpr Bool -> IStmt
-    SJumpIf   :: RegRef a -> IExpr Bool -> IExpr a -> IStmt
+    SJumpIf   :: HdlType a => RegRef a -> IExpr Bool -> IExpr a -> IStmt
 
 deriving instance Show IStmt
 

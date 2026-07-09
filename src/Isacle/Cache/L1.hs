@@ -29,21 +29,28 @@ import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..))
+import Hdl.Types (KnownDom(..), Sig(..), HdlType, mux)
 import Hdl.Prim (Unsigned)
+import Hdl.Class (connectSig)
 import Isacle.Cache.Config (CacheConfig(..))
-import Isacle.ISA.Backend.SynthVnCPU (VnMemIface(..))
-import Isacle.System.BusHandle (BusHandle(..))
+import Isacle.System.Bus (Bus, BusMaster(..))
+import Isacle.System.BusArch (MasterReq(..), SlaveResp(..))
 
--- | Opaque handle returned by 'synthL1Cache' / 'createL1Cache'.
---
--- Pass to 'createCachedCPU' to connect the CPU's two-port interface to the
--- cache output.  The wire IDs embedded here are valid in the 'NetM' context
--- in which 'synthL1Cache' was called.
-newtype CacheHandle = CacheHandle
-    { chVnIface :: VnMemIface
-      -- ^ Wire IDs for the CPU ↔ cache signals.  The CPU drives the address
-      --   outputs; the cache drives the data inputs and the stall signal.
+-- | The CPU ↔ cache boundary wires (valid in the 'NetM' context 'synthL1Cache'
+-- ran in).  The cache /drives/ the CPU-input wires (instr word, read data,
+-- stall); the CPU drives the address/store wires which the cache /reads/.
+-- 'createCachedCPU' connects the von Neumann CPU's signals to these.
+data CacheHandle = CacheHandle
+    { chInstrWord  :: WireId  -- ^ cache → CPU: fetched instruction word
+    , chDataRdData :: WireId  -- ^ cache → CPU: loaded data word
+    , chStall      :: WireId  -- ^ cache → CPU: 1 = miss, freeze pipeline
+    , chFetchAddr  :: WireId  -- ^ CPU → cache: instruction fetch address
+    , chDataRdAddr :: WireId  -- ^ CPU → cache: data load address
+    , chDataWrEn   :: WireId  -- ^ CPU → cache: data store enable
+    , chDataWrAddr :: WireId  -- ^ CPU → cache: data store address
+    , chDataWrData :: WireId  -- ^ CPU → cache: data store word
+    , chAddrW      :: Int
+    , chWordW      :: Int
     }
 
 -- | Synthesise an L1 cache that bridges a CPU two-port interface to a
@@ -58,12 +65,12 @@ newtype CacheHandle = CacheHandle
 -- has no caching effect.  Replace the body of this function with a real
 -- tag/data-array implementation to add actual caching.
 synthL1Cache
-    :: forall dom wordW addrW busAddrW dat.
-       ( KnownDom dom, KnownNat wordW, KnownNat addrW )
+    :: forall proto dom wordW addrW dat.
+       ( KnownDom dom, KnownNat wordW, KnownNat addrW, HdlType dat, BusMaster proto )
     => CacheConfig
-    -> BusHandle busAddrW dat  -- ^ unified system bus (cache acts as sole bus master)
+    -> Bus proto dom (Unsigned 32) dat  -- ^ unified system bus (cache is sole master)
     -> NetM CacheHandle
-synthL1Cache _cfg busH = do
+synthL1Cache _cfg busNode = do
     let domInfo  = domId (Proxy @dom)
     let wordBits = fromIntegral (natVal (Proxy @wordW)) :: Int
     let addrBits = fromIntegral (natVal (Proxy @addrW)) :: Int
@@ -75,34 +82,41 @@ synthL1Cache _cfg busH = do
     dataWrAddrW <- freshWire
     dataWrDataW <- freshWire
 
-    -- Pass-through: forward CPU write signals to the system bus.
-    emit $ NComb (bhWrAddr busH) N.POr [fetchAddrW, fetchAddrW]  -- instruction fetches use fetch addr
-    emit $ NComb (bhWrEn   busH) N.POr [dataWrEnW,  dataWrEnW]
-    emit $ NComb (bhWrAddr busH) N.POr [dataWrAddrW, dataWrAddrW]
-    emit $ NComb (bhWrData busH) N.POr [dataWrDataW, dataWrDataW]
-    emit $ NComb (bhRdAddr busH) N.POr [dataRdAddrW, dataRdAddrW]
+    -- The cache is the bus's master: build its single-channel request from the
+    -- CPU's outputs and hand it to the bus's protocol master logic ('driveBus').
+    -- Stub: the data write port owns the write channel; instruction fetches share
+    -- the read channel.
+    reqTrueW <- freshWire; emit $ NComb reqTrueW (N.PLit 1 1) []
+    let cacheReq = MasterReq
+            { mqReq   = SWire reqTrueW
+            , mqWe    = SWire dataWrEnW
+            , mqAddr  = mux (SWire dataWrEnW) (SWire dataWrAddrW) (SWire dataRdAddrW)
+                          :: Sig dom (Unsigned 32)
+            , mqWData = SWire dataWrDataW
+            }
+    resp <- driveBus busNode cacheReq
 
-    -- Pass-through read data from bus to CPU.
+    -- Pass-through read data from bus to CPU (drive the CPU-facing placeholders).
     instrWordW  <- freshWire
     dataRdDataW <- freshWire
-    emit $ NComb instrWordW  N.POr [bhRdData busH, bhRdData busH]
-    emit $ NComb dataRdDataW N.POr [bhRdData busH, bhRdData busH]
+    connectSig (SWire instrWordW  :: Sig dom dat) (srRData resp)
+    connectSig (SWire dataRdDataW :: Sig dom dat) (srRData resp)
 
     -- stall = 0 permanently (pass-through never stalls).
     stallW <- freshWire
     emit $ NComb stallW (N.PLit 0 1) []
 
-    let _ = (domInfo, wordBits, addrBits)  -- suppress unused warnings
+    let _ = (domInfo, wordBits, addrBits, fetchAddrW)  -- suppress unused warnings
 
-    return $ CacheHandle $ VnMemIface
-        { vniFetchAddr  = fetchAddrW
-        , vniDataRdAddr = dataRdAddrW
-        , vniDataWrEn   = dataWrEnW
-        , vniDataWrAddr = dataWrAddrW
-        , vniDataWrData = dataWrDataW
-        , vniInstrWord  = instrWordW
-        , vniDataRdData = dataRdDataW
-        , vniStall      = stallW
-        , vniAddrW      = addrBits
-        , vniWordW      = wordBits
+    return CacheHandle
+        { chInstrWord  = instrWordW
+        , chDataRdData = dataRdDataW
+        , chStall      = stallW
+        , chFetchAddr  = fetchAddrW
+        , chDataRdAddr = dataRdAddrW
+        , chDataWrEn   = dataWrEnW
+        , chDataWrAddr = dataWrAddrW
+        , chDataWrData = dataWrDataW
+        , chAddrW      = addrBits
+        , chWordW      = wordBits
         }

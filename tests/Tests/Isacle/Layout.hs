@@ -21,7 +21,7 @@ import Hdl.Types (HdlType(..), GWidth, genericToBits, genericFromBits)
 import Hdl.Bits  (Bit, Vec)
 import Hdl.Prim  (Unsigned)
 import Isacle.Layout
-import Isacle.ISA.CPUDef (flagRec, regsFromRecord, runCPUDef, CPUSchema(..))
+import Isacle.ISA.CPUDef (flagRec, regsFromRecord, runCPUDef, CPUSchema(..), rdName, rdWidth)
 import Isacle.ISA.Types  (CPUFlag(..))
 
 assert :: String -> Bool -> IO ()
@@ -75,7 +75,7 @@ runLayoutTests = do
     -- record derives its flags from the same layout the peripheral path uses.
     let ((_reg, flags), sch) = runCPUDef (flagRec @Sreg "SREG")
     assert "flagRec declares an 8-bit SREG"
-        (schRegisters sch == [("SREG", 8)])
+        (map (\d -> (rdName d, rdWidth d)) (schRegisters sch) == [("SREG", 8)])
     assert "flagRec records flag names MSB-first"
         (schStatusRegs sch == [("SREG", 8, ["fI","fT","fH","fS","fV","fN","fZ","fC"])])
     -- Bit positions match the record layout: fI=7 … fC=0, all in SREG.
@@ -89,6 +89,6 @@ runLayoutTests = do
     -- (the array field's width is count*element = 4*8 = 32).
     let (_, coreSch) = runCPUDef (regsFromRecord (Proxy @CoreSt))
     assert "regsFromRecord derives (name,width) from the record fields"
-        (schRegisters coreSch == [("csGPR", 32), ("csSP", 16), ("csPC", 12)])
+        (map (\d -> (rdName d, rdWidth d)) (schRegisters coreSch) == [("csGPR", 32), ("csSP", 16), ("csPC", 12)])
   where
     find' n = foldr (\p acc -> if plName p == n then Just p else acc) Nothing

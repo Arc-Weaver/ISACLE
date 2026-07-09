@@ -34,7 +34,7 @@ avrCPUDef = do
     (sreg, fs) <- flagPack @8 "SREG" ["I","T","H","S","V","N","Z","C"]
     let i = fs!!0; t = fs!!1; h = fs!!2; s = fs!!3
         v = fs!!4; n = fs!!5; z = fs!!6; c = fs!!7
-    aliasFile g   "0x00 + regIndex"
+    aliasFile g   0x00
     aliasReg  sp' 0x5D
     aliasReg  sreg 0x5F
     pure AVRAlu

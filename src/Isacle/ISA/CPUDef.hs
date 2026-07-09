@@ -6,10 +6,9 @@ module Isacle.ISA.CPUDef where
 
 import Prelude
 import Control.Monad.Writer
-import Data.List (sortBy)
-import Data.Maybe (fromMaybe)
+import Data.List (sortBy, find)
 import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal)
+import GHC.TypeLits (natVal, someNatVal, SomeNat(..))
 import GHC.Generics (Generic, Rep)
 import Hdl.Bits
 import Hdl.Types (HdlType, Width, GFields, recordFields)
@@ -26,14 +25,27 @@ import Isacle.ISA.Types
 newtype CPUDef a = CPUDef (Writer CPUSchema a)
     deriving newtype (Functor, Applicative, Monad)
 
+-- | A register declaration that keeps its HDL value /type/ (not just a width):
+-- @newReg \@(Unsigned 16) "SP"@ records @RegDecl "SP" (Proxy \@(Unsigned 16))@, so
+-- the synthesis backend can create a typed @register \@t@ whose width /is/
+-- @'Width' t@ — the type drives the width, and the two can't disagree.
+data RegDecl = forall t. HdlType t => RegDecl String (Proxy t)
+
+rdName :: RegDecl -> String
+rdName (RegDecl n _) = n
+
+rdWidth :: RegDecl -> Int
+rdWidth (RegDecl _ (_ :: Proxy t)) = fromIntegral (natVal (Proxy @(Width t)))
+
 data CPUSchema = CPUSchema
     { schEndianness :: Endianness
     , schRegFiles   :: [(String, Int, Int)]          -- name, count, element width
-    , schRegisters  :: [(String, Int)]               -- name, width (includes status registers)
+    , schRegisters  :: [RegDecl]                      -- typed register declarations (incl. status regs)
     , schStatusRegs :: [(String, Int, [String])]     -- name, width, flag names MSB-first
     , schAliasRegs  :: [(String, Integer)]           -- reg name, data address
-    , schAliasFiles :: [(String, String)]            -- regfile name, address function desc
+    , schAliasFiles :: [(String, Integer)]           -- regfile name, data base address (entry i → base+i)
     , schFlags      :: [(String, Int, String)]       -- individual flags: reg, bit, flag name
+    , schRegViews   :: [(String, String, [Int])]     -- view name, file, entry indices (low→high)
     }
 
 instance Semigroup CPUSchema where
@@ -45,10 +57,11 @@ instance Semigroup CPUSchema where
         , schAliasRegs  = schAliasRegs  a <> schAliasRegs  b
         , schAliasFiles = schAliasFiles a <> schAliasFiles b
         , schFlags      = schFlags      a <> schFlags      b
+        , schRegViews   = schRegViews   a <> schRegViews   b
         }
 
 instance Monoid CPUSchema where
-    mempty = CPUSchema LittleEndian [] [] [] [] [] []
+    mempty = CPUSchema LittleEndian [] [] [] [] [] [] []
 
 -- | Run a core definition, folding any individually-declared flags ('newFlag')
 -- into the status-register bit maps ('schStatusRegs') so the synthesis backend
@@ -65,7 +78,7 @@ derivedStatusRegs sch =
     | rn <- regsWithFlags ]
   where
     regsWithFlags = nubOrd [ r | (r, _, _) <- schFlags sch ]
-    regWidthOf rn = fromMaybe 8 (lookup rn (schRegisters sch))
+    regWidthOf rn = maybe 8 rdWidth (find ((== rn) . rdName) (schRegisters sch))
     -- MSB-first: highest bit position first.
     namesMsbFirst rn =
         [ nm | (_, _, nm) <- sortByBitDesc [ f | f@(r,_,_) <- schFlags sch, r == rn ] ]
@@ -98,8 +111,8 @@ newRegFile name = CPUDef $ do
 -- value type explicitly when it cannot be inferred from the result.
 newReg :: forall t. HdlType t => String -> CPUDef (CPURegister t)
 newReg name = CPUDef $ do
-    tell mempty { schRegisters = [(name, fromIntegral (natVal (Proxy @(Width t))))] }
-    pure (CPURegister name)
+    tell mempty { schRegisters = [RegDecl name (Proxy @t)] }
+    pure (mkReg name)
 
 -- | Declare a plain unsigned register by giving its width directly:
 -- @reg \"PC\" (width \@22)@ → @CPURegister (Unsigned 22)@. A convenience over
@@ -126,10 +139,10 @@ flagPack regName flagNames = CPUDef $ do
                         (reverse [0 .. length flagNames - 1])
                         flagNames
     tell mempty
-        { schRegisters  = [(regName, w)]
+        { schRegisters  = [RegDecl regName (Proxy @(Unsigned n))]
         , schStatusRegs = [(regName, w, flagNames)]
         }
-    pure (CPURegister regName, flags)
+    pure (mkReg regName, flags)
 
 -- | Declare a status register from a record 'HdlType' — the core-side mirror of
 -- the peripheral 'Isacle.System.Periph.fieldRec'. The register width and each
@@ -148,10 +161,10 @@ flagRec regName = CPUDef $ do
         flagNames = map plName places
         flags     = [ CPUFlag regName (plPos p) | p <- places ]
     tell mempty
-        { schRegisters  = [(regName, w)]
+        { schRegisters  = [RegDecl regName (Proxy @a)]
         , schStatusRegs = [(regName, w, flagNames)]
         }
-    pure (CPURegister regName, flags)
+    pure (mkReg regName, flags)
 
 -- | Declare every field of a record 'HdlType' as a CPU register, single-sourcing
 -- each register's name (the field selector) and width (the field's 'Width') from
@@ -161,14 +174,39 @@ flagRec regName = CPUDef $ do
 -- fields, so they cannot drift from the Haskell type. Status registers still use
 -- 'flagRec' (for the bit-fields); this covers the plain scalar/array registers.
 regsFromRecord :: forall a. (Generic a, GFields (Rep a)) => Proxy a -> CPUDef ()
-regsFromRecord _ = CPUDef $ tell mempty { schRegisters = recordFields (Proxy @a) }
+regsFromRecord _ = CPUDef $ tell mempty { schRegisters = map declOfField (recordFields (Proxy @a)) }
+  where
+    -- Unused by the real cores (they use hand @reg@/@flagRec@ declarations);
+    -- reflect each field's width to an @Unsigned@ decl so the schema still types.
+    declOfField (nm, w) = case someNatVal (fromIntegral (max 0 w)) of
+        Just (SomeNat (_ :: Proxy k)) -> RegDecl nm (Proxy @(Unsigned k))
+        Nothing                       -> RegDecl nm (Proxy @(Unsigned 0))
 
 -- Declare that a register is readable/writable via a data space address.
 -- The pipeline uses these to detect hazards across the register/memory boundary.
 aliasReg :: CPURegister w -> Integer -> CPUDef ()
-aliasReg (CPURegister name) addr = CPUDef $
-    tell mempty { schAliasRegs = [(name, addr)] }
+aliasReg r addr = CPUDef $
+    tell mempty { schAliasRegs = [(crName r, addr)] }
 
-aliasFile :: CPURegFile count w -> String -> CPUDef ()
-aliasFile (CPURegFile name) addrDesc = CPUDef $
-    tell mempty { schAliasFiles = [(name, addrDesc)] }
+-- | Map a register file into the data address space at an explicit base
+-- address: entry @i@ is at data address @base + i@ (the file is assumed
+-- sequentially addressed).  The synthesis backend consumes this to route data
+-- reads/writes in @[base, base+count)@ to the register file — so e.g. a read of
+-- data address @base+5@ reaches @GPR[5]@.
+aliasFile :: CPURegFile count w -> Integer -> CPUDef ()
+aliasFile (CPURegFile name) base = CPUDef $
+    tell mempty { schAliasFiles = [(name, base)] }
+
+-- | A register that is a /view/ over consecutive register-file entries, low byte
+-- first — the register-file analogue of 'newFlag' projecting a bit.  E.g.
+-- @regView "X" gpr [26, 27]@ makes X the 16-bit pair @GPR[26]:GPR[27]@ (R27:R26),
+-- with no storage of its own: reads concatenate the entries (first index = least
+-- significant), writes split the value back across them.  The composite width
+-- @w@ must equal @length idxs * elementWidth@.
+regView :: forall w count t. (KnownNat w, HdlType t)
+        => String -> CPURegFile count t -> [Int] -> CPUDef (CPURegister (Unsigned w))
+regView name (CPURegFile fileName) idxs = CPUDef $ do
+    tell mempty { schRegViews = [(name, fileName, idxs)] }
+    pure (mkReg (encodeRegView fileName elemW idxs))
+  where
+    elemW = fromIntegral (natVal (Proxy @(Width t)))

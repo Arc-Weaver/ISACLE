@@ -32,13 +32,14 @@ instance KnownDom Clk where
 mySystem
     :: Sig Clk Bool
     -> Sig Clk (Unsigned 8)
-    -> SysDSL Clk (Unsigned 8)
+    -> SysDSL
               (Sig Clk Bool, Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 mySystem rxPin gpioIn = do
     uart <- createUart "uart" rxPin
     gpio <- createGpio "gpio" gpioIn
 
-    ((tx, port, ddr), _rdData) <- createBus "databus" $ do
+    bh <- orphanBusMaster @SimpleBus
+    (tx, port, ddr) <- createBus "databus" bh $ do
         uart' <- attachPeripheral 0x0100 uart
         gpio' <- attachPeripheral 0x0300 gpio
         return (uartTxLine uart', gpioPort gpio', gpioDdr gpio')

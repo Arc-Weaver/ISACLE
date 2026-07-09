@@ -91,7 +91,7 @@ uartDef stat rxData = do
 infixr 3 .&.
 
 -- | 'mux' with the branches swapped for readability (if cond then t else f).
-ifSig :: Sig dom Bool -> Sig dom a -> Sig dom a -> Sig dom a
+ifSig :: HdlType a => Sig dom Bool -> Sig dom a -> Sig dom a -> Sig dom a
 ifSig = mux
 
 -- | @sigEqLit n s@ — True when signal @s@ (treated as unsigned integer) equals
@@ -126,7 +126,7 @@ sigResizeN bw s = SExpr $ do
     pure out
 
 -- | Extract a single data bit at a dynamic index: bit 0 of (val >> idx).
-sigBitDyn' :: Sig dom a -> Sig dom b -> Sig dom Bool
+sigBitDyn' :: (HdlType a, HdlType b) => Sig dom a -> Sig dom b -> Sig dom Bool
 sigBitDyn' val idx = sigBit 0 (sigShiftRDyn val idx)
 
 -- | OR two signals of the same type.
@@ -139,7 +139,7 @@ sigOrV a b = SExpr $ do
     pure out
 
 -- | Set bit @idx@ in a value: val .|. (1 << idx).
-sigSetBit :: Sig dom a -> Sig dom b -> Sig dom a
+sigSetBit :: (HdlType a, HdlType b) => Sig dom a -> Sig dom b -> Sig dom a
 sigSetBit val idx =
     let one = SExpr $ do
             out <- freshWire

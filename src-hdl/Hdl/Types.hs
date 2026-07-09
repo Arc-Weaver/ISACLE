@@ -50,6 +50,9 @@ module Hdl.Types
       -- * Record field extraction (bit-maps)
     , GFields(..)
     , recordFields
+    , recordFieldPos
+    , projectField
+    , updateField
       -- * Clock domain typeclass
     , KnownDom(..)
     ) where
@@ -59,7 +62,7 @@ import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import System.Mem.StableName (makeStableName, hashStableName)
+import System.Mem.StableName (makeStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
     ( Generic, Rep, from, to
@@ -82,8 +85,8 @@ data Sig (dom :: k) (a :: Type)
 
 materialize :: Sig dom a -> NetM WireId
 materialize (SWire wid) = pure wid
-materialize (SExpr m)   = memoSExpr m key
-  where key = unsafePerformIO (hashStableName <$> makeStableName m)
+materialize (SExpr m)   = memoSExpr m sn
+  where sn = unsafePerformIO (makeStableName m)
 
 -- ---------------------------------------------------------------------------
 -- Num instance — combinational arithmetic
@@ -114,14 +117,31 @@ primSig1 op a = SExpr $ do
 -- deliberately /not/ methods: they belong to the wire/synthesis model, not to a
 -- backend-agnostic signal.
 class Signal (sig :: k -> Type -> Type) where
-    -- | Apply a unary primitive operation.
-    sigPrim1 :: PrimOp -> sig dom a -> sig dom b
+    -- | Apply a unary primitive operation.  Every signal type must be an
+    -- 'HdlType' — so a phantom-erased @sig dom ()@ (no 'HdlType' instance) is a
+    -- compile error: a signal always carries a real representation and width.
+    sigPrim1 :: (HdlType a, HdlType b) => PrimOp -> sig dom a -> sig dom b
     -- | Apply a binary primitive operation.
-    sigPrim2 :: PrimOp -> sig dom a -> sig dom b -> sig dom c
+    sigPrim2 :: (HdlType a, HdlType b, HdlType c)
+             => PrimOp -> sig dom a -> sig dom b -> sig dom c
     -- | Apply a ternary primitive operation (e.g. mux).
-    sigPrim3 :: PrimOp -> sig dom a -> sig dom b -> sig dom c -> sig dom d
-    -- | A raw bit-pattern literal of the given value and width.
+    sigPrim3 :: (HdlType a, HdlType b, HdlType c, HdlType d)
+             => PrimOp -> sig dom a -> sig dom b -> sig dom c -> sig dom d
+    -- | A raw bit-pattern literal of the given value and width.  The low-level
+    -- escape (genuinely value-level widths only, e.g. inside the emitter); typed
+    -- code uses 'sigLit', whose width comes from the type and so cannot disagree.
     sigLitW  :: Integer -> Int -> sig dom a
+    -- | A typed literal: its width is @'Width' a@, taken from the type — the
+    -- type-driven replacement for 'sigLitW' (a literal can't disagree with the
+    -- representation it's used at).
+    sigLit   :: HdlType a => Integer -> sig dom a
+    default sigLit :: forall dom a. HdlType a => Integer -> sig dom a
+    sigLit v = sigLitW v (fromIntegral (natVal (Proxy @(Width a))))
+    -- | Re-tag a signal's phantom representation type (same wire) — the lowering
+    -- bridge where a fixed backend signal is viewed at a caller-demanded type.
+    -- Sound only where the widths coincide; used at a few instruction-decode
+    -- seams (instruction word / bus wires viewed at the demanded width).
+    sigRetype :: (HdlType a, HdlType b) => sig dom a -> sig dom b
 
 instance Signal Sig where
     sigPrim1 = primSig1
@@ -132,6 +152,8 @@ instance Signal Sig where
         wc <- materialize c
         lookupOrEmit op [wa, wb, wc]
     sigLitW v w = SExpr (lookupOrEmit (PLit v w) [])
+    sigRetype (SWire w) = SWire w
+    sigRetype (SExpr m) = SExpr m
 
 -- | Tag a typed signal's wire with its representation (from 'hdlRepr'), so the
 -- emitter declares it with the right VHDL signal type.  Apply where a typed
@@ -183,36 +205,36 @@ sigNot :: Signal sig => sig dom Bool -> sig dom Bool
 sigNot = sigPrim1 PNot
 
 -- | Multiplexer: @mux sel t f@ chooses @t@ when @sel@ is high, @f@ otherwise.
-mux :: Signal sig => sig dom Bool -> sig dom a -> sig dom a -> sig dom a
+mux :: (Signal sig, HdlType a) => sig dom Bool -> sig dom a -> sig dom a -> sig dom a
 mux = sigPrim3 PMux
 
 -- | Logical shift left by a dynamic (runtime) amount signal.
-sigShiftLDyn :: Signal sig => sig dom a -> sig dom b -> sig dom a
+sigShiftLDyn :: (Signal sig, HdlType a, HdlType b) => sig dom a -> sig dom b -> sig dom a
 sigShiftLDyn = sigPrim2 PShiftL
 
 -- | Logical shift right by a dynamic (runtime) amount signal.
-sigShiftRDyn :: Signal sig => sig dom a -> sig dom b -> sig dom a
+sigShiftRDyn :: (Signal sig, HdlType a, HdlType b) => sig dom a -> sig dom b -> sig dom a
 sigShiftRDyn = sigPrim2 PShiftR
 
 -- | Extract a single bit at a dynamic (runtime) index.
-sigBitDyn :: Signal sig => sig dom a -> sig dom b -> sig dom Bool
+sigBitDyn :: (Signal sig, HdlType a, HdlType b) => sig dom a -> sig dom b -> sig dom Bool
 sigBitDyn val idx = sigBit 0 (sigShiftRDyn val idx)
 
 -- | Logical shift left by a compile-time constant.
-sigShiftL :: Signal sig => Int -> sig dom a -> sig dom a
-sigShiftL n s = sigPrim2 PShiftL s (sigLitW (toInteger n) 8)
+sigShiftL :: forall sig dom a. (Signal sig, HdlType a) => Int -> sig dom a -> sig dom a
+sigShiftL n s = sigPrim2 PShiftL s (sigLitW (toInteger n) 8 :: sig dom a)
 
 -- | Logical shift right by a compile-time constant.
-sigShiftR :: Signal sig => Int -> sig dom a -> sig dom a
-sigShiftR n s = sigPrim2 PShiftR s (sigLitW (toInteger n) 8)
+sigShiftR :: forall sig dom a. (Signal sig, HdlType a) => Int -> sig dom a -> sig dom a
+sigShiftR n s = sigPrim2 PShiftR s (sigLitW (toInteger n) 8 :: sig dom a)
 
 -- | Extract a single bit at position @n@ as a Bool signal.
-sigBit :: Signal sig => Int -> sig dom a -> sig dom Bool
+sigBit :: (Signal sig, HdlType a) => Int -> sig dom a -> sig dom Bool
 sigBit n = sigPrim1 (PSlice n n)
 
 infixl 9 !
 -- | Bit-index operator: @sig ! n@ extracts bit @n@ (0 = LSB).
-(!) :: Signal sig => sig dom a -> Int -> sig dom Bool
+(!) :: (Signal sig, HdlType a) => sig dom a -> Int -> sig dom Bool
 (!) = flip sigBit
 
 -- ---------------------------------------------------------------------------
@@ -220,19 +242,19 @@ infixl 9 !
 -- ---------------------------------------------------------------------------
 
 -- | Bitwise AND — works on any HdlType, not just Bool.
-sigBwAnd :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwAnd :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
 sigBwAnd = sigPrim2 PAnd
 
 -- | Bitwise OR.
-sigBwOr :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwOr :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
 sigBwOr = sigPrim2 POr
 
 -- | Bitwise XOR.
-sigBwXor :: Signal sig => sig dom a -> sig dom a -> sig dom a
+sigBwXor :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
 sigBwXor = sigPrim2 PXor
 
 -- | Bitwise NOT.
-sigBwNot :: Signal sig => sig dom a -> sig dom a
+sigBwNot :: (Signal sig, HdlType a) => sig dom a -> sig dom a
 sigBwNot = sigPrim1 PNot
 
 -- ---------------------------------------------------------------------------
@@ -240,14 +262,15 @@ sigBwNot = sigPrim1 PNot
 -- ---------------------------------------------------------------------------
 
 -- | Concatenate two signals: @sigConcat hi lo@ places @hi@ in the upper bits.
-sigConcat :: Signal sig => sig dom a -> sig dom b -> sig dom c
+sigConcat :: (Signal sig, HdlType a, HdlType b, HdlType c)
+          => sig dom a -> sig dom b -> sig dom c
 sigConcat = sigPrim2 PConcat
 
 -- | Resize a signal to @m@ bits (zero-extend or truncate).
 -- The output phantom type @b@ is unconstrained — caller picks it via context
 -- or a type annotation.  Use @TypeApplications@ to supply @m@.
 sigResize :: forall m sig dom (a :: Type) (b :: Type).
-             (Signal sig, KnownNat m) => sig dom a -> sig dom b
+             (Signal sig, KnownNat m, HdlType a, HdlType b) => sig dom a -> sig dom b
 sigResize = sigPrim1 (PResize (fromIntegral (natVal (Proxy @m))))
 
 -- ---------------------------------------------------------------------------
@@ -402,6 +425,43 @@ instance (GFields f, GFields g) => GFields (f :*: g) where
 -- | A record 'HdlType'\'s @(fieldName, bitWidth)@ list, in declaration order.
 recordFields :: forall a. (Generic a, GFields (Rep a)) => Proxy a -> [(String, Int)]
 recordFields _ = gFields @(Rep a)
+
+-- ---------------------------------------------------------------------------
+-- Generic record-field projection (typed, over any 'Signal' backend)
+--
+-- The core-state record is one 'HdlType'; its fields are read and updated by
+-- these plain helper functions over 'Signal' — no backend, no CPU concepts.
+-- Packing is MSB-first in field order (see 'GHdlType'), so a field's LSB offset
+-- is the sum of the widths of the fields declared after it.
+-- ---------------------------------------------------------------------------
+
+-- | @(lo-bit offset, width)@ of the named field within a record's packing.
+recordFieldPos :: forall r. (Generic r, GFields (Rep r)) => Proxy r -> String -> (Int, Int)
+recordFieldPos _ fld =
+    case break ((== fld) . fst) (recordFields (Proxy @r)) of
+        (_, (_, w) : after) -> (sum (map snd after), w)   -- lo = widths below the field
+        (_, [])             -> error ("recordFieldPos: no field " ++ fld)
+
+-- | Read the named field of a record-typed signal, at the field's type @a@.
+projectField :: forall a r sig dom.
+                (Signal sig, HdlType r, HdlType a, Generic r, GFields (Rep r))
+             => String -> sig dom r -> sig dom a
+projectField fld rec =
+    let (lo, w) = recordFieldPos (Proxy @r) fld
+    in sigPrim1 (PSlice (lo + w - 1) lo) rec
+
+-- | Return the record with its named field replaced by @val@ (other fields kept).
+updateField :: forall a r sig dom.
+               (Signal sig, HdlType r, HdlType a, Generic r, GFields (Rep r))
+            => String -> sig dom a -> sig dom r -> sig dom r
+updateField fld val rec =
+    let (lo, w)  = recordFieldPos (Proxy @r) fld
+        total    = fromIntegral (natVal (Proxy @(Width r)))
+        maskVal  = (2 ^ total - 1) - (2 ^ (lo + w) - 2 ^ lo)   -- 1s except [lo, lo+w-1]
+        cleared  = sigPrim2 PAnd rec (sigLit maskVal :: sig dom r) :: sig dom r
+        widened  = sigPrim1 (PResize total) val                    :: sig dom r
+        shifted  = sigPrim2 PShiftL widened (sigLit (fromIntegral lo) :: sig dom r) :: sig dom r
+    in sigPrim2 POr cleared shifted
 
 -- ---------------------------------------------------------------------------
 -- Port bundle typeclass

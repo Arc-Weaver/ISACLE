@@ -10,7 +10,8 @@ import Hdl.Net
 import Hdl.Types
 import Hdl.Prim
 import Hdl.Class
-import Hdl.Entity
+import Hdl.Entity hiding (entity)
+import Hdl.IO (bind, entity)
 import Hdl.Emit.Vhdl
 
 -- ---------------------------------------------------------------------------
@@ -199,10 +200,10 @@ testNamedReg = do
 testLocalEntity :: IO ()
 testLocalEntity = do
     let sub :: Entity (Sig Clk (Unsigned 8)) (Sig Clk (Unsigned 8))
-        sub    = entity "my_sub" (hdl return)
+        sub    = bind "my_sub" (hdl return)
         design = execDesign "top" $ do
             a <- inputS @Clk @(Unsigned 8) "a"
-            b <- instEntity sub "u0" a
+            b <- entity "u0" sub a
             outputS @Clk @(Unsigned 8) "out" b
         vhdl = emitVhdl design "top" (design Map.! "top")
     assert "local: entity work.my_sub in VHDL" ("entity work.my_sub" `isSubstr` vhdl)
