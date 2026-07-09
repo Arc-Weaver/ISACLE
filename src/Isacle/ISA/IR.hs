@@ -321,12 +321,12 @@ isZeroE = IIsZero
 -- reads are statements (not just expressions) because their order drives the
 -- execution sequencer; their results are referred to via 'IReadRes' / 'ReadTok'.
 data IStmt where
-    SReadMem  :: ReadTok -> IExpr aw -> IStmt
-    SReadCode :: ReadTok -> IExpr aw -> IStmt
-    SWriteReg :: RegRef a -> IExpr a -> IStmt
-    SWriteMem :: IExpr aw -> IExpr ww -> IStmt
+    SReadMem  :: HdlType aw => ReadTok -> IExpr aw -> IStmt
+    SReadCode :: HdlType aw => ReadTok -> IExpr aw -> IStmt
+    SWriteReg :: HdlType a => RegRef a -> IExpr a -> IStmt
+    SWriteMem :: (HdlType aw, HdlType ww) => IExpr aw -> IExpr ww -> IStmt
     SWriteFlag :: CPUFlag -> IExpr Bool -> IStmt
-    SJumpIf   :: RegRef a -> IExpr Bool -> IExpr a -> IStmt
+    SJumpIf   :: HdlType a => RegRef a -> IExpr Bool -> IExpr a -> IStmt
 
 deriving instance Show IStmt
 

@@ -40,6 +40,7 @@ module Isacle.System.Periph
       -- * Block memory peripheral defs (isacle-hdl backend)
     , blockRamDef
     , blockRomDef
+    , romCombDef
     ) where
 
 import Prelude
@@ -126,6 +127,11 @@ data PeriphOps (sig :: Type -> Type) dat = PeriphOps
     , sigBlockMem :: Int -> [Integer]
                   -> sig Bool -> sig (Unsigned 32) -> sig dat -> sig (Unsigned 32)
                   -> sig dat
+      -- | Create a read-only ROM with a __combinational__ lookup (0-cycle:
+      -- @readAddr@ → @readData@ the same cycle).  Unlike 'sigBlockMem' (a
+      -- synchronous block memory) this is right for an instruction ROM the CPU
+      -- fetches from combinationally.  @sigRom size initVals readAddr@.
+    , sigRom :: Int -> [Integer] -> sig (Unsigned 32) -> sig dat
       -- | Address less-than: @sigAddrLt addr limit@ is True when @addr < limit@.
     , sigAddrLt :: sig (Unsigned 32) -> Word32 -> sig Bool
       -- | Zero signal (initial read-data accumulator).
@@ -143,6 +149,7 @@ nullOps :: PeriphOps NullSig dat
 nullOps = PeriphOps
     { sigReg      = \_ _ _ -> NullSig
     , sigBlockMem = \_ _ _ _ _ _ -> NullSig
+    , sigRom      = \_ _ _ -> NullSig
     , sigAddrLt   = \_ _ -> NullSig
     , sigZero     = NullSig
     , sigAnd      = \_ _ -> NullSig
@@ -386,8 +393,7 @@ blockRamDef size initVals = PeriphDef $ do
     lift $ modify $ \acc ->
         acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }
 
--- | ROM peripheral for the isacle-hdl path.
--- Read is purely combinational; ignores all writes.
+-- | ROM peripheral for the isacle-hdl path (synchronous block memory).
 blockRomDef :: Int -> [Integer] -> PeriphDef p sig dat ()
 blockRomDef size initVals = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
@@ -395,5 +401,18 @@ blockRomDef size initVals = PeriphDef $ do
         rdSel  = sigAddrLt ops relRd (fromIntegral size)
         noWr   = sigAddrLt ops relRd 0   -- unsigned < 0 is always False
         rdData = sigBlockMem ops size initVals noWr relRd (sigZero ops) relRd
+    lift $ modify $ \acc ->
+        acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }
+
+-- | Combinational ROM peripheral: @readAddr@ → @readData@ the /same/ cycle (via
+-- 'sigRom' → a combinational @NRom@).  This is what an instruction/code ROM must
+-- be — the CPU fetches combinationally (the opcode must be stable the cycle the
+-- address is driven), unlike a data-bus block ROM which may be synchronous.
+romCombDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+romCombDef size initVals = PeriphDef $ do
+    PeriphEnv { peOps = ops, peBus = bus } <- ask
+    let relRd  = biRelRdAddr bus
+        rdSel  = sigAddrLt ops relRd (fromIntegral size)
+        rdData = sigRom ops size initVals relRd
     lift $ modify $ \acc ->
         acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }

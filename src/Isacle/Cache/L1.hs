@@ -29,11 +29,12 @@ import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Types (KnownDom(..), Sig(..), HdlType, mux)
 import Hdl.Prim (Unsigned)
 import Hdl.Class (connectSig)
 import Isacle.Cache.Config (CacheConfig(..))
-import Isacle.System.BusHandle (BusHandle(..))
+import Isacle.System.Bus (Bus, BusMaster(..))
+import Isacle.System.BusArch (MasterReq(..), SlaveResp(..))
 
 -- | The CPU ↔ cache boundary wires (valid in the 'NetM' context 'synthL1Cache'
 -- ran in).  The cache /drives/ the CPU-input wires (instr word, read data,
@@ -64,12 +65,12 @@ data CacheHandle = CacheHandle
 -- has no caching effect.  Replace the body of this function with a real
 -- tag/data-array implementation to add actual caching.
 synthL1Cache
-    :: forall dom wordW addrW dat.
-       ( KnownDom dom, KnownNat wordW, KnownNat addrW )
+    :: forall proto dom wordW addrW dat.
+       ( KnownDom dom, KnownNat wordW, KnownNat addrW, HdlType dat, BusMaster proto )
     => CacheConfig
-    -> BusHandle dom (Unsigned 32) dat  -- ^ unified system bus (cache is sole master)
+    -> Bus proto dom (Unsigned 32) dat  -- ^ unified system bus (cache is sole master)
     -> NetM CacheHandle
-synthL1Cache _cfg busH = do
+synthL1Cache _cfg busNode = do
     let domInfo  = domId (Proxy @dom)
     let wordBits = fromIntegral (natVal (Proxy @wordW)) :: Int
     let addrBits = fromIntegral (natVal (Proxy @addrW)) :: Int
@@ -81,19 +82,25 @@ synthL1Cache _cfg busH = do
     dataWrAddrW <- freshWire
     dataWrDataW <- freshWire
 
-    -- Pass-through: drive the typed master→fabric signals from the CPU's outputs
-    -- ('connectSig' = typed alias).  Stub: the data write port owns the bus write
-    -- channel; instruction fetches share the read channel.
-    connectSig (bhWrEn   busH) (SWire dataWrEnW)
-    connectSig (bhWrData busH) (SWire dataWrDataW)
-    connectSig (bhWrAddr busH) (SWire dataWrAddrW)
-    connectSig (bhRdAddr busH) (SWire dataRdAddrW)
+    -- The cache is the bus's master: build its single-channel request from the
+    -- CPU's outputs and hand it to the bus's protocol master logic ('driveBus').
+    -- Stub: the data write port owns the write channel; instruction fetches share
+    -- the read channel.
+    reqTrueW <- freshWire; emit $ NComb reqTrueW (N.PLit 1 1) []
+    let cacheReq = MasterReq
+            { mqReq   = SWire reqTrueW
+            , mqWe    = SWire dataWrEnW
+            , mqAddr  = mux (SWire dataWrEnW) (SWire dataWrAddrW) (SWire dataRdAddrW)
+                          :: Sig dom (Unsigned 32)
+            , mqWData = SWire dataWrDataW
+            }
+    resp <- driveBus busNode cacheReq
 
     -- Pass-through read data from bus to CPU (drive the CPU-facing placeholders).
     instrWordW  <- freshWire
     dataRdDataW <- freshWire
-    connectSig (SWire instrWordW  :: Sig dom dat) (bhRdData busH)
-    connectSig (SWire dataRdDataW :: Sig dom dat) (bhRdData busH)
+    connectSig (SWire instrWordW  :: Sig dom dat) (srRData resp)
+    connectSig (SWire dataRdDataW :: Sig dom dat) (srRData resp)
 
     -- stall = 0 permanently (pass-through never stalls).
     stallW <- freshWire

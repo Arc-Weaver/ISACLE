@@ -112,7 +112,7 @@ newRegFile name = CPUDef $ do
 newReg :: forall t. HdlType t => String -> CPUDef (CPURegister t)
 newReg name = CPUDef $ do
     tell mempty { schRegisters = [RegDecl name (Proxy @t)] }
-    pure (CPURegister name)
+    pure (mkReg name)
 
 -- | Declare a plain unsigned register by giving its width directly:
 -- @reg \"PC\" (width \@22)@ → @CPURegister (Unsigned 22)@. A convenience over
@@ -142,7 +142,7 @@ flagPack regName flagNames = CPUDef $ do
         { schRegisters  = [RegDecl regName (Proxy @(Unsigned n))]
         , schStatusRegs = [(regName, w, flagNames)]
         }
-    pure (CPURegister regName, flags)
+    pure (mkReg regName, flags)
 
 -- | Declare a status register from a record 'HdlType' — the core-side mirror of
 -- the peripheral 'Isacle.System.Periph.fieldRec'. The register width and each
@@ -164,7 +164,7 @@ flagRec regName = CPUDef $ do
         { schRegisters  = [RegDecl regName (Proxy @a)]
         , schStatusRegs = [(regName, w, flagNames)]
         }
-    pure (CPURegister regName, flags)
+    pure (mkReg regName, flags)
 
 -- | Declare every field of a record 'HdlType' as a CPU register, single-sourcing
 -- each register's name (the field selector) and width (the field's 'Width') from
@@ -185,8 +185,8 @@ regsFromRecord _ = CPUDef $ tell mempty { schRegisters = map declOfField (record
 -- Declare that a register is readable/writable via a data space address.
 -- The pipeline uses these to detect hazards across the register/memory boundary.
 aliasReg :: CPURegister w -> Integer -> CPUDef ()
-aliasReg (CPURegister name) addr = CPUDef $
-    tell mempty { schAliasRegs = [(name, addr)] }
+aliasReg r addr = CPUDef $
+    tell mempty { schAliasRegs = [(crName r, addr)] }
 
 -- | Map a register file into the data address space at an explicit base
 -- address: entry @i@ is at data address @base + i@ (the file is assumed
@@ -207,6 +207,6 @@ regView :: forall w count t. (KnownNat w, HdlType t)
         => String -> CPURegFile count t -> [Int] -> CPUDef (CPURegister (Unsigned w))
 regView name (CPURegFile fileName) idxs = CPUDef $ do
     tell mempty { schRegViews = [(name, fileName, idxs)] }
-    pure (CPURegister (encodeRegView fileName elemW idxs))
+    pure (mkReg (encodeRegView fileName elemW idxs))
   where
     elemW = fromIntegral (natVal (Proxy @(Width t)))

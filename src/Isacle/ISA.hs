@@ -21,6 +21,8 @@ module Isacle.ISA
     , CPUFlag
     , CPURegister
     , CPURegFile
+      -- * CPU chip (CPUDef + ISADef bundle)
+    , Chip(..)
       -- * CPU definition monad
     , CPUDef
     , ISACoreDefinition
@@ -116,10 +118,11 @@ module Isacle.ISA
     , RenderCtx(..)
     , renderSynth
       -- * CPU synthesis
-    , synthHarvardCPU
+    , synthHarvardCPU'
     ) where
 
 import Isacle.ISA.Types
+import Isacle.ISA.Chip
 import Isacle.ISA.CPUDef
 import Isacle.ISA.ALU
 import Isacle.ISA.EncodingDSL

@@ -11,23 +11,21 @@
 -- sequencer), and every register enable gated with @~stall@.
 module Isacle.ISA.Backend.SynthVnCPU
     ( VnMemIface(..)
-    , synthVonNeumannCPU
     , synthVonNeumannCPU'
     ) where
 
 import Prelude hiding (Word)
-import Data.Kind (Type)
 import Data.List (foldl', nub, find)
 import Data.Proxy (Proxy(..))
 import qualified Data.Map.Strict as Map
 import Control.Monad (forM)
 import Data.Bits ((.|.), shiftL)
-import GHC.TypeLits (natVal, KnownNat)
+import GHC.TypeLits (natVal, KnownNat, someNatVal, SomeNat(..))
+import GHC.Generics (Generic, Rep)
 
 import Hdl.Bits (Unsigned(..), Bit(..))
-import Hdl.Net (NetM, freshWire, emit, NetNode(..))
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..), Signal(..), Sig(..), materialize)
+import Hdl.Types (KnownDom(..), Signal(..), HdlType, Width, fromBits, GFields, recordFields, projectField, updateField)
 import Hdl.Monad (Hdl(..))
 import Isacle.ISA.Types
 import Isacle.ISA.CPUDef
@@ -35,19 +33,20 @@ import Isacle.ISA.Def
 import Isacle.ISA.Build (ISABuild, runISABuild)
 import Isacle.ISA.Backend.Synth
 import Isacle.ISA.Backend.SynthCPU
-    ( extractPcName, addrBitsFor
-    , litS, andS, notS, toBool, eqS, muxS, sliceS, resizeS, addS, orReduce, priorityMux )
+    ( extractPcName
+    , litS, andS, notS, toBool, eqS, muxS, sliceS, resizeS, addS, bwAndS, bwOrS
+    , orReduce, priorityMux )
 
 -- ---------------------------------------------------------------------------
 -- VN memory interface (CPU outputs; inputs are signal arguments)
 -- ---------------------------------------------------------------------------
 
-data VnMemIface s dom = VnMemIface
-    { vniFetchAddr  :: s dom ()    -- ^ instruction fetch address (PC value)
-    , vniDataRdAddr :: s dom ()    -- ^ data load address
-    , vniDataWrEn   :: s dom Bool  -- ^ data store enable (1-bit)
-    , vniDataWrAddr :: s dom ()    -- ^ data store address
-    , vniDataWrData :: s dom ()    -- ^ data store word
+data VnMemIface s dom addrW wordW = VnMemIface
+    { vniFetchAddr  :: s dom (Unsigned addrW)  -- ^ instruction fetch address (PC value)
+    , vniDataRdAddr :: s dom (Unsigned addrW)  -- ^ data load address
+    , vniDataWrEn   :: s dom Bool              -- ^ data store enable (1-bit)
+    , vniDataWrAddr :: s dom (Unsigned addrW)  -- ^ data store address
+    , vniDataWrData :: s dom (Unsigned wordW)  -- ^ data store word
     , vniAddrW      :: Int
     , vniWordW      :: Int
     }
@@ -59,16 +58,18 @@ data VnMemIface s dom = VnMemIface
 -- | Synthesise a von Neumann CPU as 'Hdl'.  Inputs (signals): instruction word,
 -- data read data, stall (Hi on a cache miss), irq pending / vector.
 synthVonNeumannCPU'
-    :: forall s m dom wordW addrW alu.
-       ( Hdl s m, Signal s, KnownDom dom, KnownNat wordW, KnownNat addrW )
+    :: forall core s m dom wordW addrW alu.
+       ( Hdl s m, Signal s, KnownDom dom
+       , HdlType core, Generic core, GFields (Rep core)
+       , KnownNat wordW, KnownNat addrW )
     => CPUDef alu
     -> ISADef (ISABuild alu wordW addrW wordW addrW)
-    -> s dom ()   -- ^ instr_word
-    -> s dom ()   -- ^ data_rd_data
-    -> s dom ()   -- ^ stall
-    -> s dom ()   -- ^ irq_pending
-    -> s dom ()   -- ^ irq_vector
-    -> m (VnMemIface s dom)
+    -> s dom (Unsigned wordW)   -- ^ instr_word
+    -> s dom (Unsigned wordW)   -- ^ data_rd_data
+    -> s dom Bool               -- ^ stall
+    -> s dom Bool               -- ^ irq_pending
+    -> s dom (Unsigned addrW)   -- ^ irq_vector
+    -> m (VnMemIface s dom addrW wordW)
 synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVecSig = do
     let (aluRec, schema) = runCPUDef cpuDef
         wordBits = fromIntegral (natVal (Proxy @wordW)) :: Int
@@ -90,23 +91,36 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
         pcName       = extractPcName aluRec isaDef
         notStall     = notS stallSig
 
+        -- The Core record's fields (MSB-first) and its packed reset value.
+        coreFields = recordFields (Proxy @core)
+        coreReset  = fromBits
+            (foldl' (\acc (fn, w) -> (acc `shiftL` w) .|. initOf (drop 4 fn)) 0 coreFields) :: core
+
+        -- A register read: project the named field of the core signal at the
+        -- demanded type.  Kept /outside/ the @mdo@ knot, applied to @coreState@
+        -- inline (a binding in the recursive group would be monomorphised).
+        readScalarOf :: forall a. HdlType a => s dom core -> String -> s dom a
+        readScalarOf cst n = projectField ("core" ++ n) cst
+
     mdo
-        -- Scalar registers (enable from the arbiters, gated with ~stall).
-        scalarOuts <- forM regList $ \decl ->
-            let name = rdName decl
-            in  named name =<< registerW (rdWidth decl) (initOf name) (enOf name) (nxtOf name)
-        let scalarMap    = Map.fromList (zip (map rdName regList) scalarOuts)
-            readScalar n = Map.findWithDefault (litS 0 wordBits) n scalarMap
-            getFlag rn bp = maybe (litS 0 1) (sliceS bp bp) (Map.lookup rn scalarMap)
+        -- The scalar core (SP/PC/SREG) is one clocked register; the arbiter below
+        -- ties its next value.  A register read projects the field at the demanded
+        -- type — no erased signal, no per-name map.
+        coreState <- named "cpu_core" =<< register coreReset nextCore
+        let getFlag :: String -> Int -> s dom Bool
+            getFlag rn bp =
+                case someNatVal (fromIntegral (maybe wordBits fst (Map.lookup rn statusRegMap))) of
+                    Just (SomeNat (_ :: Proxy n)) -> sliceS bp bp (readScalarOf coreState rn :: s dom (Unsigned n))
+                    Nothing                       -> litS 0 1
             mkCtx rcIrq = RenderCtx
-                { rcInstrWire  = instrSig
-                , rcReadScalar = readScalar
-                , rcDataBus    = dmemRdData
-                , rcCodeBus    = dmemRdData   -- VN: unified bus, no separate code port
-                , rcReadRes    = const dmemRdData  -- single-cycle: read result is the bus
+                { rcInstrWire  = sigRetype instrSig
+                , rcReadScalar = readScalarOf coreState
+                , rcDataBus    = sigRetype dmemRdData
+                , rcCodeBus    = sigRetype dmemRdData   -- VN: unified bus, no separate code port
+                , rcReadRes    = const (sigRetype dmemRdData)  -- single-cycle: read result is the bus
                 , rcGetFlag    = getFlag
                 , rcRegCount   = regCount
-                , rcIrqVector  = rcIrq
+                , rcIrqVector  = fmap sigRetype rcIrq
                 , rcWordW      = wordBits
                 }
 
@@ -122,89 +136,93 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
             allMemWrites = concatMap srMemWrites allResults
             allMemReads  = concatMap srMemReads allResults
 
-        -- Register files: indexed writes gated by match AND ~stall.
-        let regWritesByRf = foldl' (\mp r -> Map.insertWith (++) (rwRfName r) [r] mp)
-                                   Map.empty allRegWrites
-            readRfNames   = nub [ rrRfName rr | r <- allResults, rr <- srRegReads r ]
-            involvedRfs   = Map.keys regWritesByRf
-                         ++ filter (`Map.notMember` regWritesByRf) readRfNames
-        mapM_ (\rfname -> do
+        -- Register files: indexed writes gated by match AND ~stall.  The entry
+        -- width is reflected to a type so the ports are typed.
+        let involvedRfs = nub ([ nm | RegWriteReq _ nm _ _ <- allRegWrites ]
+                               ++ map (\(n,_,_) -> n) (schRegFiles schema))
+        mapM_ (\rfname ->
                   let (rfCount, rfWidth) = maybe (1, wordBits) id (Map.lookup rfname rfInfoMap)
-                      writes = [ (rwIdxWire w, rwDataWire w, andS (rwMatchWire w) notStall)
-                               | w <- allRegWrites, rwRfName w == rfname ]
-                  regBank "cpu_state" rfname rfCount rfWidth writes)
+                  in case someNatVal (fromIntegral rfWidth) of
+                       Just (SomeNat (_ :: Proxy ew)) ->
+                         let writes = [ ( sigRetype idx :: s dom (Unsigned 8)
+                                        , sigRetype dat :: s dom (Unsigned ew)
+                                        , andS match notStall )
+                                      | RegWriteReq match nm idx dat <- allRegWrites, nm == rfname ]
+                         in regBank "cpu_state" rfname rfCount rfWidth writes
+                       Nothing -> pure ())
               involvedRfs
 
-        -- Data writes to an aliased register route to a ScalarWriteReq (a store
-        -- to the low word of a 2-word register keeps its high word).
+        -- Data writes to a memory-mapped scalar register → a ScalarWriteReq (a
+        -- store to the low word of a wide register keeps its high words).
         let aliasScalarWrites =
                 [ ScalarWriteReq gated regName full
                 | (regName, aliasAddr) <- schAliasRegs schema
-                , Map.member regName scalarMap
-                , let regW   = widthOf regName
-                      regSig = scalarMap Map.! regName
-                , mw <- allMemWrites
-                , let gated = andS (mwMatchWire mw)
-                                   (eqS (mwAddrWire mw) (litS aliasAddr addrBits))
-                      full  = if regW == wordBits then mwDataWire mw
-                              else sigPrim2 N.PConcat (sliceS (regW - 1) wordBits regSig)
-                                                      (mwDataWire mw)
-                ]
+                , let regW = widthOf regName
+                , MemWriteReq match adr dt <- allMemWrites
+                , Just (SomeNat (_ :: Proxy rw)) <- [someNatVal (fromIntegral (max 1 regW))]
+                , let addr   = sigRetype adr :: s dom (Unsigned addrW)
+                      gated  = andS match (eqS addr (litS aliasAddr addrBits :: s dom (Unsigned addrW)))
+                      regSig = readScalarOf coreState regName :: s dom (Unsigned rw)
+                      datV   = sigRetype dt :: s dom (Unsigned wordW)
+                      highMask = (2 ^ regW - 1) - (2 ^ min regW wordBits - 1) :: Integer
+                      full   = bwOrS (bwAndS regSig (litS highMask regW))
+                                     (resizeS regW datV :: s dom (Unsigned rw)) ]
 
-        -- Scalar / status write arbiters — every enable gated with ~stall.
+        -- Scalar / status write arbiter → the next Core value.  Enables gated ~stall.
         let allScalarWrites = concatMap srScalarWrites allResults ++ aliasScalarWrites
             allFlagWrites   = concatMap srFlagWrites allResults
-            scalarWritesByReg = foldl' (\mp r -> Map.insertWith (++) (swRegName r) [r] mp)
-                                       Map.empty allScalarWrites
-            arbiterOf decl =
-                let name       = rdName decl
-                    w          = rdWidth decl
-                    scWrites   = Map.findWithDefault [] name scalarWritesByReg
-                    writePairs = [ (swMatchWire r, swDataWire r) | r <- scWrites ]
-                    regSig     = scalarMap Map.! name
-                in if name == pcName
-                   then (name, notStall, priorityMux writePairs (addS regSig (litS 1 w)))
-                   else case Map.lookup name statusRegMap of
-                     Just (_, flagNames) ->
-                       let bitNext (bitPos, _) =
-                             let cur     = sliceS bitPos bitPos regSig
-                                 fwPairs = [ (fwMatchWire fw, sliceS 0 0 (fwValueWire fw))
-                                           | fw <- allFlagWrites
-                                           , fwRegName fw == name, fwBitPos fw == bitPos ]
-                                 scPairs = [ (swMatchWire sw, sliceS bitPos bitPos (swDataWire sw))
-                                           | sw <- scWrites ]
-                             in priorityMux (fwPairs ++ scPairs) cur
-                           bits = map bitNext (zip (reverse [0 .. w - 1]) flagNames)
-                           nxt  = case bits of
-                                    []     -> litS 0 w
-                                    (b:bs) -> foldl' (sigPrim2 N.PConcat) b bs
-                           matches = [ fwMatchWire fw | fw <- allFlagWrites, fwRegName fw == name ]
-                                  ++ map swMatchWire scWrites
-                       in (name, andS notStall (orReduce matches), nxt)
-                     Nothing -> case scWrites of
-                       [] -> (name, litS 0 1, litS 0 w)
-                       ws -> ( name
-                             , andS notStall (orReduce (map swMatchWire ws))
-                             , priorityMux writePairs (litS 0 w) )
-            arbiters = map arbiterOf regList
-            enMap  = Map.fromList [ (n, e) | (n, e, _) <- arbiters ]
-            nxtMap = Map.fromList [ (n, x) | (n, _, x) <- arbiters ]
-            enOf  n = Map.findWithDefault (litS 0 1)           n enMap
-            nxtOf n = Map.findWithDefault (litS 0 (widthOf n)) n nxtMap
+            writesOfAt :: forall t. HdlType t => String -> [(s dom Bool, s dom t)]
+            writesOfAt name = [ (m, sigRetype d :: s dom t)
+                              | ScalarWriteReq m nm d <- allScalarWrites, nm == name ]
+            statusBits :: forall t. HdlType t => String -> s dom t -> s dom t
+            statusBits name cur =
+                let w      = fromIntegral (natVal (Proxy @(Width t)))
+                    writes = writesOfAt name :: [(s dom Bool, s dom t)]
+                    bitNext bitPos =
+                        let curBit  = sliceS bitPos bitPos cur :: s dom Bool
+                            fwPairs = [ (fwMatchWire fw, fwValueWire fw)
+                                      | fw <- allFlagWrites
+                                      , fwRegName fw == name, fwBitPos fw == bitPos ]
+                            scPairs = [ (m, sliceS bitPos bitPos d :: s dom Bool) | (m, d) <- writes ]
+                        in priorityMux (fwPairs ++ scPairs) curBit
+                    place i b = sigPrim2 N.PShiftL
+                                  (resizeS w (b :: s dom Bool) :: s dom t)
+                                  (litS (fromIntegral i) w     :: s dom t) :: s dom t
+                in case [ place i (bitNext i) | i <- [0 .. w - 1] ] of
+                     []     -> litS 0 (max 1 w)
+                     (x:xs) -> foldl' (sigPrim2 N.POr) x xs
+            updateReg acc (RegDecl name (_ :: Proxy t)) =
+                let cur     = readScalarOf coreState name :: s dom t
+                    w       = fromIntegral (natVal (Proxy @(Width t)))
+                    writes  = writesOfAt name :: [(s dom Bool, s dom t)]
+                    matches = map fst writes
+                           ++ [ fwMatchWire fw | fw <- allFlagWrites, fwRegName fw == name ]
+                    nxt | name == pcName               = priorityMux writes (addS cur (litS 1 w))
+                        | Map.member name statusRegMap = statusBits name cur
+                        | otherwise                    = priorityMux writes cur
+                    en  | name == pcName = notStall
+                        | otherwise      = andS notStall (orReduce matches)
+                in updateField ("core" ++ name) (muxS en nxt cur) acc
+            nextCore = foldl' updateReg coreState regList
 
         -- Data-memory address muxes (match directly — single-cycle, no gating).
-        let dmemRdAddr = priorityMux [ (mrMatchWire r, mrAddrWire r) | r <- allMemReads ]
-                                     (litS 0 addrBits)
+        let dmemRdAddr = priorityMux [ (mrMatchWire r, sigRetype adr :: s dom (Unsigned addrW))
+                                     | r@(MemReadReq _ _ adr _) <- allMemReads ]
+                                     (litS 0 addrBits) :: s dom (Unsigned addrW)
             dmemWrEn   = orReduce (map mwMatchWire allMemWrites)
-            dmemWrAddr = priorityMux [ (mwMatchWire mw, mwAddrWire mw) | mw <- allMemWrites ]
-                                     (litS 0 addrBits)
-            dmemWrData = priorityMux [ (mwMatchWire mw, mwDataWire mw) | mw <- allMemWrites ]
-                                     (litS 0 wordBits)
+            dmemWrAddr = priorityMux [ (match, sigRetype adr :: s dom (Unsigned addrW))
+                                     | MemWriteReq match adr _ <- allMemWrites ]
+                                     (litS 0 addrBits) :: s dom (Unsigned addrW)
+            dmemWrData = priorityMux [ (match, sigRetype dt :: s dom (Unsigned wordW))
+                                     | MemWriteReq match _ dt <- allMemWrites ]
+                                     (litS 0 wordBits) :: s dom (Unsigned wordW)
 
-        -- PC → fetch address (trim if PC register is wider than addrW).
-        let pcSig     = readScalar pcName
-            fetchAddr = if addrBits == widthOf pcName then pcSig
-                        else sliceS (addrBits - 1) 0 pcSig
+        -- PC → fetch address (trim/extend if PC register width ≠ addrW).
+        let pcRegW    = widthOf pcName
+            fetchAddr = (case someNatVal (fromIntegral (max 1 pcRegW)) of
+                Just (SomeNat (_ :: Proxy pw)) ->
+                    resizeS addrBits (readScalarOf coreState pcName :: s dom (Unsigned pw))
+                Nothing -> litS 0 addrBits) :: s dom (Unsigned addrW)
 
         pure VnMemIface
             { vniFetchAddr  = fetchAddr
@@ -215,33 +233,3 @@ synthVonNeumannCPU' cpuDef isaDef instrSig dmemRdData stallSig irqPendSig irqVec
             , vniAddrW      = addrBits
             , vniWordW      = wordBits
             }
-
--- ---------------------------------------------------------------------------
--- Concrete instantiation boundary (NetM): top-level ports for isolated testing.
--- ---------------------------------------------------------------------------
-
-synthVonNeumannCPU :: forall (dom :: Type) wordW addrW alu.
-                      ( KnownDom dom, KnownNat wordW, KnownNat addrW )
-                   => CPUDef alu
-                   -> ISADef (ISABuild alu wordW addrW wordW addrW)
-                   -> NetM ()
-synthVonNeumannCPU cpuDef isaDef = do
-    let domInfo  = domId (Proxy @dom)
-        wordBits = fromIntegral (natVal (Proxy @wordW)) :: Int
-        addrBits = fromIntegral (natVal (Proxy @addrW)) :: Int
-        inPort name w = do { wid <- freshWire; emit (NInput wid name w domInfo)
-                           ; pure (SWire wid :: Sig dom ()) }
-        outPort :: forall a. String -> Int -> Sig dom a -> NetM ()
-        outPort name w sig = do { wid <- materialize sig; emit (NOutput wid name w domInfo) }
-    instrW <- inPort "instr_word"   wordBits
-    dmemRd <- inPort "data_rd_data" wordBits
-    stall  <- inPort "stall"        1
-    irqP   <- inPort "irq_pending"  1
-    irqV   <- inPort "irq_vector"   addrBits
-    vmi <- synthVonNeumannCPU' @Sig @NetM @dom @wordW @addrW
-               cpuDef isaDef instrW dmemRd stall irqP irqV
-    outPort "fetch_addr"   (vniAddrW vmi) (vniFetchAddr  vmi)
-    outPort "data_rd_addr" (vniAddrW vmi) (vniDataRdAddr vmi)
-    outPort "data_wr_en"   1              (vniDataWrEn   vmi)
-    outPort "data_wr_addr" (vniAddrW vmi) (vniDataWrAddr vmi)
-    outPort "data_wr_data" (vniWordW vmi) (vniDataWrData vmi)

@@ -227,13 +227,13 @@ writeRegFileF sel f e = register sel [fldKey f] >>= \r -> writeReg r e
 readRegFileAt :: forall m count t. (MonadALU m, HdlType t)
               => (AluDef m -> CPURegFile count t) -> Int -> m (IExpr t)
 readRegFileAt sel i = cpu sel >>= \(CPURegFile rf) ->
-    readReg (CPURegister (rf ++ ":" ++ show i) :: CPURegister t)
+    readReg (mkReg (rf ++ ":" ++ show i) :: CPURegister t)
 
 -- | Write a register-file slot at a constant index.
 writeRegFileAt :: forall m count t. (MonadALU m, HdlType t)
                => (AluDef m -> CPURegFile count t) -> Int -> IExpr t -> m ()
 writeRegFileAt sel i e = cpu sel >>= \(CPURegFile rf) ->
-    writeReg (CPURegister (rf ++ ":" ++ show i) :: CPURegister t) e
+    writeReg (mkReg (rf ++ ":" ++ show i) :: CPURegister t) e
 
 -- | 'readRegFileF' with a compile-time index offset (e.g. AVR upper regs R16–R31).
 readRegFileFOffset :: (MonadALU m, HdlType t)

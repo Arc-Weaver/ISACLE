@@ -56,8 +56,11 @@ pipelineStep
        )
 pipelineStep (PipeState slots lat) cpuState inp =
     let depth    = length slots
-        execSlot = head slots
-        rest     = tail slots
+        -- Total destructure (a pipeline always has ≥1 slot; empty degenerates to
+        -- a bubble rather than crashing).
+        (execSlot, rest) = case slots of
+                               (s : ss) -> (s, ss)
+                               []       -> (SEmpty, [])
         newSlot  = maybe SEmpty SReady (pipeInstr inp)
         advance  = rest ++ [newSlot]            -- shift toward head, admit new
         cleared  = replicate depth SEmpty       -- all bubbles

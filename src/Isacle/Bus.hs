@@ -4,7 +4,7 @@ module Isacle.Bus
     ) where
 
 import Prelude
-import Hdl.Types (Sig, mux)
+import Hdl.Types (Sig, mux, HdlType)
 import Hdl.Prim (Unsigned)
 
 -- | Combine read-data outputs from N memory-mapped peripherals by sum.
@@ -19,7 +19,8 @@ busReadMux = sum
 --   When @busy@ is True the DMA signals are routed to the bus;
 --   otherwise the CPU signals are routed.
 busMasterMux
-    :: Sig dom Bool
+    :: HdlType dat
+    => Sig dom Bool
     -> (Sig dom (Unsigned 32), Sig dom dat, Sig dom Bool, Sig dom (Unsigned 32))  -- ^ CPU (wrAddr, wrData, wrEn, rdAddr)
     -> (Sig dom (Unsigned 32), Sig dom dat, Sig dom Bool, Sig dom (Unsigned 32))  -- ^ DMA (wrAddr, wrData, wrEn, rdAddr)
     -> (Sig dom (Unsigned 32), Sig dom dat, Sig dom Bool, Sig dom (Unsigned 32))

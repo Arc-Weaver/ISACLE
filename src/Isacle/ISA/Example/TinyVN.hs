@@ -1,4 +1,8 @@
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE UndecidableInstances #-}
 -- | TinyVN — a minimal 32-bit von Neumann CPU for synthesis smoke-testing.
 --
 -- Architecture:
@@ -24,12 +28,15 @@
 -- 'execSystemDSL' via 'createCachedCPU'.
 module Isacle.ISA.Example.TinyVN
     ( TinyVnAlu(..)
+    , TinyVnCore(..)
     , tinyVnCPUDef
     , tinyVnISA
     ) where
 
 import Prelude hiding (Word)
+import GHC.Generics (Generic, Rep)
 import Hdl.Bits hiding (zeroExtend, signExtend, truncateB, bitCoerce, add, mul)
+import Hdl.Types (HdlType(..), GWidth, genericToBits, genericFromBits)
 import Isacle.ISA
 
 -- ---------------------------------------------------------------------------
@@ -42,6 +49,18 @@ data TinyVnAlu = TinyVnAlu
     , tvZero :: CPUFlag
     }
 
+-- | The raw storage /core/: the scalar state (PC + the 1-bit FLAGS register)
+-- clocked as one register.  GPR stays a separate 'regBank'.
+data TinyVnCore = TinyVnCore
+    { corePC    :: Unsigned 32
+    , coreFLAGS :: Unsigned 1
+    } deriving (Generic)
+
+instance HdlType TinyVnCore where
+    type Width TinyVnCore = GWidth (Rep TinyVnCore)
+    toBits   = genericToBits
+    fromBits = genericFromBits
+
 -- ---------------------------------------------------------------------------
 -- CPU definition
 -- ---------------------------------------------------------------------------
@@ -52,8 +71,9 @@ tinyVnCPUDef = do
     g          <- newRegFile "GPR"
     p          <- newReg "PC"
     (_, zs)    <- flagPack @1 "FLAGS" ["Z"]
-    let z       = head zs
-    pure TinyVnAlu { tvGpr = g, tvPc = p, tvZero = z }
+    case zs of
+      z : _ -> pure TinyVnAlu { tvGpr = g, tvPc = p, tvZero = z }
+      []    -> error "TinyVnAlu: FLAGS pack yielded no Z flag"
 
 -- ---------------------------------------------------------------------------
 -- Instruction bodies

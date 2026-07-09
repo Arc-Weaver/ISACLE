@@ -32,7 +32,7 @@ instance Monad (ResetDef alu) where
 
 resetReg :: HdlType t => (alu -> CPURegister t) -> Unsigned (Width t) -> ResetDef alu ()
 resetReg sel val = ResetDef $ \alu ->
-    let CPURegister name = sel alu
+    let name = crName (sel alu)
     in [ResetRegEntry name val]
 
 resetFlag :: (alu -> CPUFlag) -> Bit -> ResetDef alu ()

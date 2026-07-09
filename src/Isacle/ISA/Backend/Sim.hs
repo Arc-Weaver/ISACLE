@@ -48,10 +48,15 @@ data SimState = SimState
     , ssCodeMem     :: IntMap Integer
     , ssEncoding    :: Maybe EncodingInfo
     , ssIrqGateOpen :: Bool
+    , ssAliasMap    :: IntMap String
+      -- ^ data address → register name for memory-mapped registers ('aliasReg').
+      -- A read/write of an aliased data address routes to the register, matching
+      -- the synthesis backend (SFRs: writing @0xF0@ writes @B@, not RAM).  Empty
+      -- by default; set from @schAliasRegs@ to make the sim datasheet-faithful.
     } deriving (Show)
 
 emptySim :: SimState
-emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing True
+emptySim = SimState (SimCPU Map.empty) IntMap.empty IntMap.empty Nothing True IntMap.empty
 
 -- ---------------------------------------------------------------------------
 -- Expression evaluation
@@ -143,7 +148,12 @@ renderInstrSim instrWord mIrqVec ir st0 =
 
     -- Resolve memory/code reads in program order, building the token map.
     toks = foldl' rd IntMap.empty (iirStmts ir)
-    rd t (SReadMem  (ReadTok i) a) = IntMap.insert i (IntMap.findWithDefault 0 (fromIntegral (evalE (env t) a)) (ssDataMem st0)) t
+    rd t (SReadMem  (ReadTok i) a) =
+        let addr = fromIntegral (evalE (env t) a)
+            val  = case IntMap.lookup addr (ssAliasMap st0) of
+                     Just rn -> Map.findWithDefault 0 rn regs0        -- SFR alias → register
+                     Nothing -> IntMap.findWithDefault 0 addr (ssDataMem st0)
+        in IntMap.insert i val t
     rd t (SReadCode (ReadTok i) a) = IntMap.insert i (IntMap.findWithDefault 0 (fromIntegral (evalE (env t) a)) (ssCodeMem st0)) t
     rd t _                         = t
 
@@ -159,14 +169,19 @@ renderInstrSim instrWord mIrqVec ir st0 =
                              ((v `shiftR` (p * ew)) .&. ((1 `shiftL` ew) - 1)) s)
                   st (zip [0 ..] idxs)
     apply st (SWriteReg ref e)  = putReg (regRefKey ref) (ev e) st
-    apply st (SWriteMem a d)    = st { ssDataMem = IntMap.insert (fromIntegral (ev a)) (ev d) (ssDataMem st) }
+    apply st (SWriteMem a d)    =
+        let addr = fromIntegral (ev a)
+        in case IntMap.lookup addr (ssAliasMap st) of
+             Just rn -> putReg rn (ev d) st                          -- SFR alias → register
+             Nothing -> st { ssDataMem = IntMap.insert addr (ev d) (ssDataMem st) }
     apply st (SWriteFlag f e)   = putFlag f (ev e) st
     apply st (SJumpIf pc c t)   = if ev c /= 0 then putReg (regRefKey pc) (ev t) st else st
     apply st _                  = st  -- reads already resolved
 
     regRefKey :: RegRef w -> String
     regRefKey (RegScalar n)               = n
-    regRefKey (RegEntries file _ idxs)    = file ++ ":" ++ show (head idxs)  -- views write via fan-out
+    regRefKey (RegEntries file _ (i:_))   = file ++ ":" ++ show i  -- views write via fan-out (low entry)
+    regRefKey (RegEntries file _ [])      = file
     regRefKey (RegFile rf (FieldRef k) s o) = rf ++ ":" ++ show (fromIntegral s * evalE (env toks) (IField (FieldRef k) :: IExpr (Unsigned 32)) + fromIntegral o)
 
     putReg n v st = st { ssCPU = (ssCPU st) { scRegs = Map.insert n v (scRegs (ssCPU st)) } }

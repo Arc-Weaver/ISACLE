@@ -62,6 +62,11 @@ class BusArch arch where
     type Cap arch :: Capability
     type Cap arch = 'NonStalling
 
+    -- | The protocol's canonical value, so a bus can realise @synthBus@ from just
+    -- the /type/ @proto@ (pinned by the master's 'BusHandle').  Protocols are
+    -- singletons (no fields), so this is the sole inhabitant.
+    busArch :: arch
+
     synthBus :: (Signal s, HdlType addr, HdlOrd addr, HdlType dat, KnownDom dom)
              => arch
              -> MasterReq s dom addr dat
@@ -78,6 +83,7 @@ class BusArch arch where
 data SimpleBus = SimpleBus
 
 instance BusArch SimpleBus where
+    busArch = SimpleBus
     synthBus _ master children =
         ( SlaveResp { srRData = readData, srStall = sigLitW 0 1 }
         , map childReq children )
@@ -112,4 +118,5 @@ data BurstBus = BurstBus
 
 instance BusArch BurstBus where
     type Cap BurstBus = 'Stalling
+    busArch = BurstBus
     -- synthBus uses the default (error) until the burst interconnect lands.

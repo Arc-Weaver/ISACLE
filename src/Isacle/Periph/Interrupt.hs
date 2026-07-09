@@ -19,7 +19,7 @@ import Hdl.Types
 --   interrupt vector address type.  Pass interrupt vector addresses as
 --   constant signals: @(reqSig, fromInteger 0x20)@.
 interruptArbiter
-    :: Num (Sig dom addr)
+    :: (Num (Sig dom addr), HdlType addr)
     => [(Sig dom Bool, Sig dom addr)]   -- ^ (request, vector address), index 0 = highest priority
     -> Sig dom Bool                     -- ^ global interrupt enable
     -> (Sig dom Bool, Sig dom addr)     -- ^ (valid, selected vector)

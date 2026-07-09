@@ -10,6 +10,7 @@
 {-# LANGUAGE KindSignatures             #-}
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE PolyKinds                  #-}
+{-# LANGUAGE RecursiveDo                #-}
 -- | The HDL monad layer: a true monad capturing clocked hardware, replacing the
 -- (unused) arrow scaffolding in "Hdl.Class".  The fundamental surface is the
 -- 'Hdl' typeclass over a monad — 'register' (the one state primitive),
@@ -23,6 +24,9 @@ module Hdl.Monad
     , erase
       -- * The Hdl typeclass (netlist instance: Hdl Sig NetM)
     , Hdl(..)
+      -- * State-machine combinators
+    , mealy
+    , moore
     ) where
 
 import Prelude
@@ -140,6 +144,35 @@ class (Signal s, Monad m, MonadFix m) => Hdl (s :: Type -> Type -> Type) m | m -
     named        :: String -> s dom a -> m (s dom a)
 
 -- ---------------------------------------------------------------------------
+-- Mealy / Moore — the register fixpoint packaged as the classic combinators
+-- ---------------------------------------------------------------------------
+
+-- | A Mealy machine: @mealy init step out inp@ clocks a state initialised to
+-- @init@, advanced each cycle by @step input state@, with an output
+-- @out input state@ that depends on /both/ the current input and state.  Built
+-- on the one state primitive 'register'; the @mdo@ ties the current-state
+-- feedback (@state -> next -> state@).
+mealy :: forall s m dom st i o. (Hdl s m, HdlType st, KnownDom dom)
+      => st                                  -- ^ reset state
+      -> (s dom i -> s dom st -> s dom st)    -- ^ next-state: input, state → state'
+      -> (s dom i -> s dom st -> s dom o)     -- ^ output:     input, state → out
+      -> s dom i -> m (s dom o)
+mealy initial step out inp = mdo
+    st <- register initial (step inp st)
+    pure (out inp st)
+
+-- | A Moore machine: like 'mealy', but the output is a function of the state
+-- /only/ (@out state@) — so it is one cycle behind the input.
+moore :: forall s m dom st i o. (Hdl s m, HdlType st, KnownDom dom)
+      => st                                  -- ^ reset state
+      -> (s dom i -> s dom st -> s dom st)    -- ^ next-state: input, state → state'
+      -> (s dom st -> s dom o)                -- ^ output:     state → out
+      -> s dom i -> m (s dom o)
+moore initial step out inp = mdo
+    st <- register initial (step inp st)
+    pure (out st)
+
+-- ---------------------------------------------------------------------------
 -- Netlist instance — NetM (builds a NetNode netlist) is the netlist backend's
 -- concrete Hdl instance, paired with Sig (its concrete Signal).  vhdl/verilog/
 -- sim are sibling instances.  There is no concrete "HDL" type.
@@ -166,12 +199,17 @@ instance Hdl Sig NetM where
             let inRange = sigNot (sel .<. litOf lo) .&&. sigNot (litOf hi .<. sel)
             pure (mux inRange b acc)
     regBank = regBankNet
-    -- Eager (fresh wire per call, no SExpr memoisation): two distinct indexed
-    -- reads must never be merged into one wire by 'materialize's CSE.
+    -- Fresh wire per call (no SExpr memoisation): two distinct indexed reads must
+    -- never be merged into one wire by 'materialize's CSE.  The output wire is
+    -- allocated eagerly, but the index is materialised in a DEFERRED action (as
+    -- 'regNetW' does for registers) so an @mdo@ feedback address — e.g. a read
+    -- whose address is a value still being tied by the surrounding @mfix@ — does
+    -- not force that value during elaboration.
     regBankRead group field count addr = do
-        addrW <- materialize addr
-        outW  <- freshWire
-        emit $ NRegFileRead outW group field addrW count
+        outW <- freshWire
+        defer $ do
+            addrW <- materialize addr
+            emit $ NRegFileRead outW group field addrW count
         pure (SWire outW)
     -- Deferred: the hint rides inside the returned signal and fires when it is
     -- materialised, so 'named' does NOT force its argument.  (An eager

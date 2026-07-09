@@ -41,6 +41,7 @@ hdlOps :: forall dom dat.
 hdlOps = PeriphOps
     { sigReg      = hdlSigReg
     , sigBlockMem = hdlSigBlockMem
+    , sigRom      = hdlSigRom
     , sigAddrLt   = \addr lim -> addr .<. fromIntegral lim
     , sigZero     = litSig 0
     , sigAnd      = (.&&.)
@@ -83,6 +84,17 @@ hdlOps = PeriphOps
             wdW  <- materialize wrData
             raW  <- materialize rdAddr
             emit $ NMem out raW waW wdW enW size datW initVals domInf
+        pure out
+
+    -- Combinational ROM: a purely combinational 'NRom' lookup (readAddr → data
+    -- the same cycle), for instruction/code memory.
+    hdlSigRom :: Int -> [Integer] -> Sig dom (Unsigned 32) -> Sig dom dat
+    hdlSigRom size initVals rdAddr = SExpr $ do
+        out <- freshWire
+        let datW = fromIntegral (natVal (Proxy @(Width dat)))
+        defer $ do
+            raW <- materialize rdAddr
+            emit $ NRom out raW size datW initVals
         pure out
 
 -- ---------------------------------------------------------------------------

@@ -7,10 +7,12 @@ module Isacle.ISA.Types where
 import Prelude
 import Data.Kind (Type)
 import Data.List (intercalate)
+import Data.Word (Word32)
 import GHC.OverloadedLabels (IsLabel(..))
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Data.Proxy (Proxy(..))
 import Hdl.Bits
+import Hdl.Types (HdlType(..))
 
 -- | Lets encoding field names be written as overloaded labels at call sites:
 --   @register gpr #dddd@, @immediate #kkkkkkkk@.
@@ -47,10 +49,34 @@ data CPUFlag = CPUFlag
     , cpuFlagBit :: Int      -- ^ bit position within the register (0 = LSB)
     } deriving (Show, Eq)
 
--- | A register handle, typed by the register's /value type/ (e.g.
--- @CPURegister (Unsigned 16)@, @CPURegister Sreg@) — not a bare width. The bit
--- width is @'Width' t@; reading a register yields an @IExpr (Width t)@.
-newtype CPURegister (t :: Type) = CPURegister String
+-- | A register handle /and/ the underlying HDL type of its value: @CPURegister t@
+-- is an 'HdlType' of width @'Width' t@, so a record of registers is itself an
+-- 'HdlType' whose signal holds the live core state (the register definitions
+-- /are/ the core data).  It also carries metadata used for documentation and
+-- synthesis: the register's name, its optional data-space alias address, and its
+-- reset value.
+data CPURegister (t :: Type) = CPURegister
+    { crName  :: String          -- ^ register name (VHDL signal, IR key, docs)
+    , crAlias :: Maybe Word32     -- ^ data-space alias address, if memory-mapped
+    , crReset :: t                -- ^ reset / initial value
+    }
+
+instance HdlType t => HdlType (CPURegister t) where
+    type Width (CPURegister t) = Width t
+    toBits     = toBits . crReset          -- a register's bits are its (reset) value
+    fromBits n = CPURegister "" Nothing (fromBits n)
+    hdlRepr _  = hdlRepr (Proxy @t)
+
+-- | A plain register handle: a name, no alias, zero reset — the common case at
+-- IR/field-access sites (real reset/alias are attached by the core definition).
+mkReg :: HdlType t => String -> CPURegister t
+mkReg n = CPURegister n Nothing (fromBits 0)
+
+-- | A name-only handle whose reset is never inspected (transient register-file
+-- field handles used only to build a 'RegRef' from 'crName').  Avoids an
+-- 'HdlType' constraint where none is available.
+mkRegName :: String -> CPURegister t
+mkRegName n = CPURegister n Nothing (error "CPURegister.crReset: transient handle")
 
 -- | A register-file handle: @count@ registers each of value type @t@.
 newtype CPURegFile  (count :: Nat) (t :: Type) = CPURegFile  String
@@ -61,7 +87,7 @@ type RegisterFile = CPURegFile
 -- | Project a single bit of a register as a flag view: @sreg ! 0@ is bit 0 of
 -- the @sreg@ register. Combine with 'Isacle.ISA.CPUDef.newFlag' to name it.
 (!) :: CPURegister t -> Int -> CPUFlag
-CPURegister name ! bit = CPUFlag name bit
+reg' ! bit = CPUFlag (crName reg') bit
 infixl 9 !
 
 -- | A /view/ register (e.g. AVR X = GPR[26]:GPR[27]) encodes its backing file,

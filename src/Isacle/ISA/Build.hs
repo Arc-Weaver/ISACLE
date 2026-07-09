@@ -121,17 +121,17 @@ instance (KnownNat wordW, KnownNat addrW)
     register sel field = ISABuild $ do
         alu <- ask
         let CPURegFile rfname = sel alu
-        pure (CPURegister (rfname ++ ":" ++ fieldKey field))
+        pure (mkRegName (rfname ++ ":" ++ fieldKey field))
 
     registerWithOffset sel field offset = ISABuild $ do
         alu <- ask
         let CPURegFile rfname = sel alu
-        pure (CPURegister (rfname ++ ":" ++ fieldKey field ++ "@" ++ show offset))
+        pure (mkRegName (rfname ++ ":" ++ fieldKey field ++ "@" ++ show offset))
 
     registerScaled sel field scale offset = ISABuild $ do
         alu <- ask
         let CPURegFile rfname = sel alu
-        pure (CPURegister
+        pure (mkRegName
                 (rfname ++ ":" ++ fieldKey field ++ "*" ++ show scale ++ "@" ++ show offset))
 
     immediate field = pure (IField (FieldRef (fieldKey field)))
@@ -140,8 +140,8 @@ instance (KnownNat wordW, KnownNat addrW)
     doc      d  = ISABuild $ modify $ \s -> s { bsDoc      = Just d  }
     encoding e  = ISABuild $ modify $ \s -> s { bsEncoding = Just e  }
 
-    readReg  (CPURegister key)   = pure (IReadReg (toRegRef key))
-    writeReg (CPURegister key) e = emitStmt (SWriteReg (toRegRef key) e)
+    readReg  r   = pure (IReadReg (toRegRef (crName r)))
+    writeReg r e = emitStmt (SWriteReg (toRegRef (crName r)) e)
 
     readMem  addr = do { tok <- freshRead; emitStmt (SReadMem tok addr); pure (IReadRes tok) }
     writeMem addr val = emitStmt (SWriteMem addr val)
@@ -149,8 +149,8 @@ instance (KnownNat wordW, KnownNat addrW)
     getFlag flag   = pure (IFlagRead flag)
     setFlag flag v = emitStmt (SWriteFlag flag v)
 
-    absJumpIf (CPURegister key) cond tgt =
-        emitStmt (SJumpIf (toRegRef key) cond tgt)
+    absJumpIf r cond tgt =
+        emitStmt (SJumpIf (toRegRef (crName r)) cond tgt)
     -- aluOp / litC / resizeBits / signExtendBits / isZero use the Term-based
     -- class defaults.
 
