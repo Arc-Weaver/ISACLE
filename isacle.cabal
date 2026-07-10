@@ -135,6 +135,10 @@ library
     Isacle.System
     Isacle.System.Bus
     Isacle.System.BusArch
+    Isacle.System.CLI
+    Isacle.System.Emit
+    Isacle.System.MemBanks
+    Isacle.System.Rom
     Isacle.System.BusCap
     Isacle.System.BusDef
     Isacle.System.Generate
@@ -149,6 +153,7 @@ library
     isacle:isacle-hdl,
     base >= 4.12 && < 4.22,
     containers >= 0.6,
+    directory >= 1.3,
     mtl >= 2.2,
     filepath >= 1.4,
     template-haskell >= 2.16,
