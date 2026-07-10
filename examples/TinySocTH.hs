@@ -21,7 +21,8 @@ tinyChip = Chip tinyCPUDef tinyISA
 
 main :: IO ()
 main = systemMain "tiny_soc_th" $ do
-    gpio    <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8))
+    gpioIn  <- sysInput "gpio_in" :: SysDSL (Sig Sys (Unsigned 8))
+    gpio    <- createGpio "gpio0" gpioIn
     coderom <- createRom 256 ($(romBin8 "examples/prog.bin") :: RomImage (Unsigned 8)) "coderom0"
     (codeBus, ()) <- createBus @SimpleBus "codebus" (attachPeripheral 0x0  coderom >> pure ())
     (dataBus, ()) <- createBus @SimpleBus "databus" (attachPeripheral 0x60 gpio    >> pure ())

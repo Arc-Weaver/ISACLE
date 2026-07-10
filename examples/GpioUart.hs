@@ -18,8 +18,10 @@ import Isacle.System.CLI
 
 main :: IO ()
 main = systemMain "gpio_uart" $ do
-    uart0 <- createUart "uart0" sigFalse                    -- RX tied low
-    gpio0 <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8)) -- input pins tied to 0
+    uartRx <- sysInput "uart_rx" :: SysDSL (Sig Sys Bool)          -- RX serial line
+    gpioIn <- sysInput "gpio_in" :: SysDSL (Sig Sys (Unsigned 8))  -- input pins
+    uart0 <- createUart "uart0" uartRx
+    gpio0 <- createGpio "gpio0" gpioIn
     (_dataBus, ()) <- createBus @SimpleBus "databus" $ do
         _ <- attachPeripheral 0x100 uart0
         _ <- attachPeripheral 0x300 gpio0

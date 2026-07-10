@@ -63,6 +63,7 @@ module Isacle.System.SystemDSL
       -- * Utilities
     , sigFalse
     , sigTrue
+    , sysInput
     , sysOutput
       -- * System documentation
     , SysDoc(..)
@@ -89,7 +90,7 @@ import Hdl.Types
 import Hdl.Prim (Unsigned)
 import Hdl.Entity (PortRef, Entity)
 import Hdl.IO (bind, entity)
-import Hdl.Class (outputS, connectSig, freshSig)
+import Hdl.Class (inputS, outputS, connectSig, freshSig)
 import Isacle.System.Periph
 import Isacle.System.Bus (Bus(..), BusMaster(..))
 import Isacle.System.BusArch
@@ -843,6 +844,20 @@ sysOutput :: forall a dom.
              (KnownDom dom, HdlType a)
           => String -> Sig dom a -> SysDSL ()
 sysOutput name sig = SysDSL $ lift $ outputS @dom @a name sig
+
+-- | Declare a top-level __input__ port and return its signal — the dual of
+-- 'sysOutput'.  Wire the result into a peripheral constructor (e.g. GPIO pin
+-- inputs, UART RX) so the SoC actually has data inputs rather than tying them to
+-- constants:
+--
+-- @
+-- gpioIn <- sysInput \"gpio_a_in\"
+-- gpioA  <- createGpio \"gpio_a\" gpioIn
+-- @
+sysInput :: forall a dom.
+            (KnownDom dom, HdlType a)
+         => String -> SysDSL (Sig dom a)
+sysInput name = SysDSL $ lift $ inputS @dom @a name
 
 -- | Constant-false Bool signal (1-bit zero literal).
 sigFalse :: Sig dom Bool
