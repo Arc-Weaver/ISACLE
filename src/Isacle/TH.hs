@@ -13,6 +13,8 @@ module Isacle.TH
     , loadBin8
     , loadBin16LE
     , loadBin32LE
+    , parseWords16LE
+    , parseWords32LE
     , padToPow2
     , nextPow2
     , bitPattern

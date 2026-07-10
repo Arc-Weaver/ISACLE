@@ -9,7 +9,7 @@ module Hdl.Emit.Vhdl
 import Prelude
 import Data.Bits (testBit, xor, (.&.))
 import Data.Char (toLower)
-import Data.List (dropWhileEnd, foldl', intercalate, nub, partition, sort, tails)
+import Data.List (dropWhileEnd, elemIndex, foldl', intercalate, nub, partition, sort, tails)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -148,12 +148,26 @@ memTypeName wid nm = memBaseName wid nm ++ "_t"
 memSigName :: WireId -> NameMap -> String
 memSigName wid nm = memBaseName wid nm
 
--- NRom: constant rom_<wid> : rom_<wid>_t := (...);
-romTypeName :: WireId -> String
-romTypeName wid = "rom_" ++ show wid ++ "_t"
+-- NRom: constant <entity>_rom : <entity>_rom_t := (...);
+--
+-- The ROM array/constant is named after the ENTITY (a peripheral instance, e.g.
+-- @coderom0@), not the transient wire id — a stable, unique name a vendor tool
+-- (Xilinx @updatemem@/@data2mem@, or a Tcl @INIT@ reload) can target to refresh
+-- the memory contents post-synthesis.  An entity with more than one ROM
+-- disambiguates by index (@<entity>_rom0@, @<entity>_rom1@, …).
+romBaseName :: String -> [NetNode] -> WireId -> String
+romBaseName name nodes wid =
+    name ++ "_rom" ++ case roms of
+        [_] -> ""
+        _   -> maybe "" show (elemIndex wid roms)
+  where
+    roms = [ nOut n | n@NRom{} <- nodes ]
 
-romSigName :: WireId -> String
-romSigName wid = "rom_" ++ show wid
+romSigName :: String -> [NetNode] -> WireId -> String
+romSigName = romBaseName
+
+romTypeName :: String -> [NetNode] -> WireId -> String
+romTypeName name nodes wid = romBaseName name nodes wid ++ "_t"
 
 -- | Build a VHDL aggregate initializer for an array of @sz@ elements.
 initAggregate :: Int -> Int -> [Integer] -> String
@@ -774,9 +788,9 @@ portLines (p : rest) = ("    " ++ p ++ ";") : portLines rest
 architectureDecl :: Design -> String -> NameMap -> [NetNode] -> String
 architectureDecl design name nm nodes = unlines $
     [ "architecture rtl of " ++ name ++ " is" ]
-    ++ map ppDecl (archDecls nm hidden nodes)
+    ++ map ppDecl (archDecls name nm hidden nodes)
     ++ [ "begin" ]
-    ++ concatMap (toStmt design nm nodes render stmtSkip) nodes
+    ++ concatMap (toStmt name design nm nodes render stmtSkip) nodes
     ++ concatMap (renderDecodeProcess nm) dgs
     ++ clockProcesses nm nodes
     ++ [ "end architecture rtl;" ]
@@ -826,8 +840,8 @@ groupArrayTypeName :: String -> String -> String
 groupArrayTypeName grpName fldName = grpName ++ "_" ++ fldName ++ "_t"
 
 -- | All architecture-region declarations: types, constants, signals.
-archDecls :: NameMap -> Set.Set WireId -> [NetNode] -> [VDecl]
-archDecls nm inlineSet nodes =
+archDecls :: String -> NameMap -> Set.Set WireId -> [NetNode] -> [VDecl]
+archDecls name nm inlineSet nodes =
     -- NGroup record SIGNALS (the record TYPES are in the package, packageTypeDecls).
     concatMap groupDecls groups
     ++
@@ -838,8 +852,8 @@ archDecls nm inlineSet nodes =
         | n@NMem{} <- nodes ])
     ++
     Map.elems (Map.fromList
-        [ (romTypeName (nOut n),
-           VDType (romTypeName (nOut n)) (VArrayOf (nRomSize n) (wireVType (nRomDatW n))))
+        [ (romTypeName name nodes (nOut n),
+           VDType (romTypeName name nodes (nOut n)) (VArrayOf (nRomSize n) (wireVType (nRomDatW n))))
         | n@NRom{} <- nodes ])
     ++
     -- PLit constants (deduplicated by value×width).
@@ -847,7 +861,7 @@ archDecls nm inlineSet nodes =
     | ((v, bw), _) <- Map.toAscList litMap ]
     ++
     -- ROM contents as constants.
-    [ VDConst (romSigName (nOut n)) (romTypeName (nOut n))
+    [ VDConst (romSigName name nodes (nOut n)) (romTypeName name nodes (nOut n))
               (initAggregate (nRomSize n) (nRomDatW n) (nRomInit n))
     | n@NRom{} <- nodes ]
     ++
@@ -912,15 +926,26 @@ regInit wid nodes = case [ nInit n | n@NReg{} <- nodes, nOut n == wid ] of
 -- Concurrent statements
 -- ---------------------------------------------------------------------------
 
-toStmt :: Design -> NameMap -> [NetNode] -> (WireId -> String) -> Set.Set WireId -> NetNode -> [String]
-toStmt _      _  _  _ _ NInput{}                = []
-toStmt _      _  _  _ _ NHint{}                 = []
-toStmt _      _  _  _ _ NRepr{}                 = []
-toStmt _      _  _  _ _ NGroup{}               = []
-toStmt _      _  _  _ _ (NComment txt)          = ["", "  -- " ++ txt]
-toStmt _      _  _  _ _ NReg{}                  = []  -- handled by clockProcesses
-toStmt _      _  _  _ _ NRegFile{}              = []  -- writes handled by clockProcesses
-toStmt _      nm _  _ _ (NRegFileRead out g fld rdA cnt) =
+-- | Emit the concurrent statement(s) for a node.  The leading entity @name@ is
+-- only needed to name ROM arrays stably ('romSigName'); everything else ignores
+-- it and delegates to 'toStmt''.
+toStmt :: String -> Design -> NameMap -> [NetNode] -> (WireId -> String) -> Set.Set WireId -> NetNode -> [String]
+toStmt name _ nm nodes _ _ (NRom out rdA _ _ _) =
+    let addr = lookupWire nm rdA
+    in [ "  " ++ lookupWire nm out ++ " <= "
+             ++ romSigName name nodes out ++ "(to_integer(" ++ addr ++ "))"
+             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
+toStmt _ design nm nodes render skip node = toStmt' design nm nodes render skip node
+
+toStmt' :: Design -> NameMap -> [NetNode] -> (WireId -> String) -> Set.Set WireId -> NetNode -> [String]
+toStmt' _     _  _  _ _ NInput{}                = []
+toStmt' _     _  _  _ _ NHint{}                 = []
+toStmt' _     _  _  _ _ NRepr{}                 = []
+toStmt' _     _  _  _ _ NGroup{}               = []
+toStmt' _     _  _  _ _ (NComment txt)          = ["", "  -- " ++ txt]
+toStmt' _     _  _  _ _ NReg{}                  = []  -- handled by clockProcesses
+toStmt' _     _  _  _ _ NRegFile{}              = []  -- writes handled by clockProcesses
+toStmt' _     nm _  _ _ (NRegFileRead out g fld rdA cnt) =
     -- Indexed combinational read of a register-file record field.
     let addr  = lookupWire nm rdA
         nbits = ceiling (logBase 2 (fromIntegral (max cnt 2) :: Double)) :: Int
@@ -928,7 +953,7 @@ toStmt _      nm _  _ _ (NRegFileRead out g fld rdA cnt) =
     in [ "  " ++ lookupWire nm out ++ " <= "
              ++ g ++ "." ++ fld ++ "(to_integer(" ++ raddr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      nm _  _ _ (NMem out rdA _ _ _ sz _ _ _) =
+toStmt' _     nm _  _ _ (NMem out rdA _ _ _ sz _ _ _) =
     -- Truncate addr to the minimum bits that can index sz entries before to_integer
     -- so that out-of-range addresses (e.g. 0xFFFFFE00) don't overflow INTEGER.
     let addr  = lookupWire nm rdA
@@ -937,23 +962,19 @@ toStmt _      nm _  _ _ (NMem out rdA _ _ _ sz _ _ _) =
     in [ "  " ++ lookupWire nm out ++ " <= "
              ++ memSigName out nm ++ "(to_integer(" ++ raddr ++ "))"
              ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      nm _  _ _ (NRom out rdA _ _ _) =
-    let addr = lookupWire nm rdA
-    in [ "  " ++ lookupWire nm out ++ " <= "
-             ++ romSigName out ++ "(to_integer(" ++ addr ++ "))"
-             ++ " when not is_x(" ++ addr ++ ") else (others => '0');" ]
-toStmt _      _  _  _ _ (NComb _ (PLit _ _) []) = []  -- handled by archDecls
-toStmt _      _  _  render _ (NOutput inp pname _ _) =
+-- NRom is handled by the 'toStmt' wrapper (it needs the entity name).
+toStmt' _     _  _  _ _ (NComb _ (PLit _ _) []) = []  -- handled by archDecls
+toStmt' _     _  _  render _ (NOutput inp pname _ _) =
     [ "  " ++ pname ++ " <= " ++ render inp ++ ";" ]
-toStmt _      _  _  _ inlineSet (NComb out _ _) | Set.member out inlineSet = []  -- inlined into consumer
-toStmt _      nm ns render _ (NComb out op ins) =
+toStmt' _     _  _  _ inlineSet (NComb out _ _) | Set.member out inlineSet = []  -- inlined into consumer
+toStmt' _     nm ns render _ (NComb out op ins) =
     let expr = combExpr render ns op ins
         stmt = case (op, ins) of
             (PShiftL, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
             (PShiftR, [_, b]) -> expr ++ " when not is_x(" ++ lookupWire nm b ++ ") else (others => '0')"
             _                  -> expr
     in [ "  " ++ lookupWire nm out ++ " <= " ++ stmt ++ ";" ]
-toStmt design nm _  _ _ (NSubInst instNm entRef inPorts outPorts) =
+toStmt' design nm _  _ _ (NSubInst instNm entRef inPorts outPorts) =
     let (libName, entName) = case entRef of
             LocalEntity  e   -> ("work", e)
             ExternEntity l e -> (l, e)

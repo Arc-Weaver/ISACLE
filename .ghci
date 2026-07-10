@@ -1,0 +1,22 @@
+-- Auto-loaded by `cabal exec ghci`.  Exposes the built isacle packages, mirrors
+-- the cabal default-extensions, and pre-imports the system-building surface so
+-- you can go straight to generating:
+--
+--   isacle> sys = do { g <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8)); createBus @SimpleBus "databus" (attachPeripheral 0x300 g >> pure ()) >> pure () }
+--   isacle> writeSystem "build/demo" "demo" sys
+--   isacle> saMemMap (renderSystem defaultGenOptions "demo" sys)   -- pure inspection
+--
+-- (Use `cabal exec ghci`, not `cabal repl isacle` — the latter source-loads the
+--  library, so these imports would run before the modules exist.)
+:set -package isacle
+
+:seti -XDataKinds -XTypeApplications -XScopedTypeVariables -XFlexibleContexts
+:seti -XKindSignatures -XTypeFamilies -XTypeOperators -XRecursiveDo -XBinaryLiterals
+:seti -XNoStarIsType
+
+import Prelude
+import Isacle.System.CLI
+import Isacle.System.Generate
+
+:set prompt "isacle> "
+:set prompt-cont "isacle| "

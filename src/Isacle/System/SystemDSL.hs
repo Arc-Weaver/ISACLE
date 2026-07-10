@@ -46,6 +46,12 @@ module Isacle.System.SystemDSL
     , noIrq
       -- * Design runner
     , execSystemDSL
+    , runSystemDesign
+    , runSystemDesignWith
+      -- * Deferred file loading (resolved by the IO interpreter)
+    , loadFile
+    , loadFileBytes
+    , FileEnv
       -- * Peripheral constructors
     , createUart
     , createGpio
@@ -66,10 +72,13 @@ module Isacle.System.SystemDSL
 
 import Prelude
 import Data.Kind (Type)
-import Data.Word (Word32)
+import Data.Word (Word32, Word8)
 import Control.Monad (forM)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
+import qualified Data.Map.Strict as Map
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import qualified Hdl.Monad as Hdl
 import Data.Proxy (Proxy(..))
 import GHC.Generics (Generic, Rep)
@@ -126,6 +135,27 @@ data SysDoc = SysDoc
 emptySysDoc :: SysDoc
 emptySysDoc = SysDoc [] []
 
+-- | Resolved file contents, keyed by path.  Populated by the IO interpreter
+-- ('Isacle.System.Emit.writeSystem') before the real elaboration pass; empty
+-- during pure runs, so 'loadFile' yields @""@ then.
+type FileEnv = Map.Map FilePath BS.ByteString
+
+-- | Internal build state threaded through 'SysDSL': the accumulated 'SysDoc',
+-- the resolved file environment (read-only, seeded by the runner), and the list
+-- of paths requested via 'loadFile' (accumulated so the IO interpreter knows
+-- what to read in its harvest pass).
+data SysBuild = SysBuild
+    { sbDoc  :: SysDoc
+    , sbEnv  :: FileEnv
+    , sbReqs :: [FilePath]
+    }
+
+emptyBuild :: SysBuild
+emptyBuild = SysBuild emptySysDoc Map.empty []
+
+emptyBuildWith :: FileEnv -> SysBuild
+emptyBuildWith env = emptyBuild { sbEnv = env }
+
 -- ---------------------------------------------------------------------------
 -- PeriphToken
 -- ---------------------------------------------------------------------------
@@ -161,16 +191,44 @@ data PeriphToken (proto :: Type) p dom dat a = PeriphToken
 -- SysDSL monad
 -- ---------------------------------------------------------------------------
 
--- | System-level monad.  Wraps 'NetM' with accumulated 'SysDoc'.
-newtype SysDSL a = SysDSL (StateT SysDoc NetM a)
+-- | System-level monad.  Wraps 'NetM' with the accumulated 'SysBuild' (system
+-- documentation, resolved file environment, and requested file paths).
+newtype SysDSL a = SysDSL (StateT SysBuild NetM a)
     deriving newtype (Functor, Applicative, Monad)
 
 -- | Run a system description, returning the user result, the flat 'NetNode'
--- list (for VHDL emission), and the system documentation.
+-- list (for VHDL emission), and the system documentation.  Pure: no file
+-- environment, so any 'loadFile' yields @""@.
 runSystemDSL :: SysDSL a -> (a, [NetNode], SysDoc)
-runSystemDSL (SysDSL st) = (a, nodes, doc)
+runSystemDSL (SysDSL st) = (a, nodes, sbDoc b)
   where
-    ((a, doc), nodes, _design) = runNetM (runStateT st emptySysDoc)
+    ((a, b), nodes, _design) = runNetM (runStateT st emptyBuild)
+
+-- ---------------------------------------------------------------------------
+-- Deferred file loading
+-- ---------------------------------------------------------------------------
+
+-- | Request the contents of a file as text.  The read is __deferred__: a pure
+-- run sees @""@, while the IO interpreter ('Isacle.System.Emit.writeSystem' /
+-- 'Isacle.System.CLI.systemMain') performs a harvest pass to collect requested
+-- paths, reads them, and re-runs with the contents available.
+--
+-- Because paths are gathered before contents are known, the /set/ of files a
+-- system loads must not depend on any file's contents (paths are normally
+-- literals — this is not a real restriction in practice).
+loadFile :: FilePath -> SysDSL String
+loadFile path = SysDSL $ do
+    modify $ \b -> b { sbReqs = path : sbReqs b }
+    b <- get
+    pure (maybe "" BSC.unpack (Map.lookup path (sbEnv b)))
+
+-- | 'loadFile' returning raw bytes — feed a ROM image with
+-- 'Isacle.System.Rom.romFromBytes'.
+loadFileBytes :: FilePath -> SysDSL [Word8]
+loadFileBytes path = SysDSL $ do
+    modify $ \b -> b { sbReqs = path : sbReqs b }
+    b <- get
+    pure (maybe [] BS.unpack (Map.lookup path (sbEnv b)))
 
 -- ---------------------------------------------------------------------------
 -- BusDSL monad
@@ -318,7 +376,8 @@ createBus busName (BusDSL busSt) = SysDSL $ do
         masterResp = fst $ synthBus (busArch :: proto) reqSink children
         periph     = bdsPeriph finalSt
 
-    modify $ \doc -> doc { sdBuses = sdBuses doc ++ [BusSection busName periph] }
+    modify $ \b -> b { sbDoc = let doc = sbDoc b
+                               in doc { sdBuses = sdBuses doc ++ [BusSection busName periph] } }
     pure ( Bus { busName = busName, busReq = reqSink, busResp = masterResp }
          , userA )
 
@@ -500,7 +559,8 @@ createHarvardCPU instName (Chip cpuDef isaDef) codeBus dataBus irqDriver = SysDS
     resp <- lift $ driveBus dataBus cpuReq
     lift $ connectSig dmemRdSig (srRData resp)
     lift $ connectSig stallSig  (srStall resp)
-    modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
+    modify $ \b -> b { sbDoc = let doc = sbDoc b
+                               in doc { sdCPUs = sdCPUs doc ++ [instName] } }
 
 -- | Synthesise an L1 cache that bridges the CPU two-port interface to the
 -- system bus.
@@ -577,7 +637,8 @@ createCachedCPU instName (Chip cpuDef isaDef) cacheH = SysDSL $ do
         materialize (vcoDataWrAddr out) >>= alias (chDataWrAddr cacheH)
         materialize (vcoDataWrData out) >>= alias (chDataWrData cacheH)
 
-    modify $ \doc -> doc { sdCPUs = sdCPUs doc ++ [instName] }
+    modify $ \b -> b { sbDoc = let doc = sbDoc b
+                               in doc { sdCPUs = sdCPUs doc ++ [instName] } }
 
 -- | Emit a zero-extending resize node (identity when widths match).
 resizeTo :: Int -> Int -> WireId -> NetM WireId
@@ -595,7 +656,26 @@ alias dst src = emit $ NComb dst POr [src, src]
 -- @execSystemDSL \@Sys \@(Unsigned 8) "top" mySystem@
 execSystemDSL :: forall a. String -> SysDSL a -> Design
 execSystemDSL name (SysDSL st) =
-    execDesign name (fmap fst (runStateT st emptySysDoc))
+    execDesign name (fmap fst (runStateT st emptyBuild))
+
+-- | Run a system description once, returning the user result, the full 'Design'
+-- (top entity plus sub-entities, for VHDL emission), and the 'SysDoc' (for the
+-- memory map / C header / linker artifacts).  A single monad pass, so callers
+-- that need every output — e.g. 'Isacle.System.Emit.writeSystem' — do not run
+-- the description twice.
+runSystemDesign :: forall a. String -> SysDSL a -> (a, Design, SysDoc)
+runSystemDesign name sys = (a, design, doc)
+  where (a, design, doc, _reqs) = runSystemDesignWith Map.empty name sys
+
+-- | 'runSystemDesign' with a resolved file environment (from the IO
+-- interpreter's harvest pass) and, additionally, the list of paths the system
+-- requested via 'loadFile' / 'loadFileBytes'.  Used to drive the two-pass
+-- deferred-load resolution in 'Isacle.System.Emit'.
+runSystemDesignWith
+    :: forall a. FileEnv -> String -> SysDSL a -> (a, Design, SysDoc, [FilePath])
+runSystemDesignWith env name (SysDSL st) = (a, design, sbDoc b, reverse (sbReqs b))
+  where
+    ((a, b), design) = runDesign name (runStateT st (emptyBuildWith env))
 
 -- ---------------------------------------------------------------------------
 -- Peripheral constructors
