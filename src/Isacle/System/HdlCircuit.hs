@@ -24,7 +24,7 @@ import GHC.TypeLits (natVal)
 
 import Hdl.Net
 import Hdl.Sig
-import Hdl.Entity (PortRef(..))
+import Hdl.Types (Named(..))
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph (PeriphOps(..), BusIface(..))
 
@@ -106,8 +106,7 @@ data GpioPhys dom dat = GpioPhys
     , gpioDdr  :: Sig dom dat
     } deriving Generic
 
-deriving instance (KnownDom dom, HdlType dat) => HdlPorts (GpioPhys dom dat)
-deriving instance (KnownDom dom, HdlType dat) => PortRef  (GpioPhys dom dat)
+deriving instance (KnownDom dom, HdlType dat) => Named (GpioPhys dom dat)
 
 data UartPhys dom = UartPhys
     { uartTxLine :: Sig dom Bool
@@ -115,16 +114,14 @@ data UartPhys dom = UartPhys
     , uartTxIrq  :: Sig dom Bool
     } deriving Generic
 
-deriving instance KnownDom dom => HdlPorts (UartPhys dom)
-deriving instance KnownDom dom => PortRef  (UartPhys dom)
+deriving instance KnownDom dom => Named (UartPhys dom)
 
 data TimerPhys dom = TimerPhys
     { timerOvfIrq :: Sig dom Bool
     , timerCmpIrq :: Sig dom Bool
     } deriving Generic
 
-deriving instance KnownDom dom => HdlPorts (TimerPhys dom)
-deriving instance KnownDom dom => PortRef  (TimerPhys dom)
+deriving instance KnownDom dom => Named (TimerPhys dom)
 
 instance (KnownDom dom, HdlType dat) => HdlPhys (GpioPhys dom dat) where
     emitPhysOuts names _dom _datW phys = do

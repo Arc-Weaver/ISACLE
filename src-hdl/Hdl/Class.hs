@@ -30,10 +30,10 @@ import Hdl.Entity
 -- ---------------------------------------------------------------------------
 
 -- | Instantiate an entity as a named sub-instance in the current structural
--- context.  Input signals are connected positionally via 'PortRef'; output
+-- context.  Input signals are connected positionally via 'Named'; output
 -- wires are returned as a typed bundle.
 instEntity :: forall i o.
-              (PortRef i, PortRef o)
+              (Named i, Named o)
            => Entity i o
            -> String   -- ^ instance label (e.g. "u_alu")
            -> i        -- ^ parent-side input signals

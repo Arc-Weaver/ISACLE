@@ -88,7 +88,7 @@ import GHC.TypeLits (natVal, KnownNat, type (<=))
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
-import Hdl.Entity (PortRef, Entity)
+import Hdl.Entity (Entity)
 import Hdl.IO (bind, entity)
 import Hdl.Class (inputS, outputS, connectSig, freshSig)
 import Isacle.System.Periph
@@ -245,8 +245,7 @@ data SlavePort dom dat = SlavePort
     , spWData :: Sig dom dat
     } deriving (Generic)
 
-deriving instance (KnownDom dom, HdlType dat) => HdlPorts (SlavePort dom dat)
-deriving instance (KnownDom dom, HdlType dat) => PortRef  (SlavePort dom dat)
+deriving instance (KnownDom dom, HdlType dat) => Named (SlavePort dom dat)
 
 -- | Internal record for one peripheral slot inside a bus.  The peripheral is
 -- instantiated as its own sub-entity (via 'bind'/'entity') at 'attachPeripheral'
@@ -287,7 +286,7 @@ newtype BusDSL (proto :: Type) dom dat a = BusDSL (StateT (BusDSLState dom dat) 
 attachPeripheral
     :: forall proto p dom dat a.
        ( KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat)
-       , HdlPhys a, HdlPorts a, PortRef a )
+       , HdlPhys a, Named a )
     => Word32
     -> PeriphToken proto p dom dat a
     -> BusDSL proto dom dat a
@@ -408,13 +407,9 @@ data HCpuOut dom dat aw caw = HCpuOut
     } deriving (Generic)
 
 deriving instance (KnownDom dom, HdlType dat, KnownNat cw, KnownNat caw)
-    => HdlPorts (HCpuIn dom dat cw caw)
-deriving instance (KnownDom dom, HdlType dat, KnownNat cw, KnownNat caw)
-    => PortRef  (HCpuIn dom dat cw caw)
+    => Named (HCpuIn dom dat cw caw)
 deriving instance (KnownDom dom, HdlType dat, KnownNat aw, KnownNat caw)
-    => HdlPorts (HCpuOut dom dat aw caw)
-deriving instance (KnownDom dom, HdlType dat, KnownNat aw, KnownNat caw)
-    => PortRef  (HCpuOut dom dat aw caw)
+    => Named (HCpuOut dom dat aw caw)
 
 -- | Re-tag a signal's phantom representation type — a no-op rewrap (the second
 -- 'Sig' parameter is phantom).  Bridges the ISA compiler's type-erased
@@ -442,13 +437,9 @@ data VnCpuOut dom dat aw = VnCpuOut
     } deriving (Generic)
 
 deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
-    => HdlPorts (VnCpuIn dom dat aw)
+    => Named (VnCpuIn dom dat aw)
 deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
-    => PortRef  (VnCpuIn dom dat aw)
-deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
-    => HdlPorts (VnCpuOut dom dat aw)
-deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
-    => PortRef  (VnCpuOut dom dat aw)
+    => Named (VnCpuOut dom dat aw)
 
 -- | Synthesise a Harvard CPU into the system, connect it to a data bus, and
 -- instantiate an internal code ROM.

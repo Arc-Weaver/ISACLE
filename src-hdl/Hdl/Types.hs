@@ -33,7 +33,8 @@ module Hdl.Types
       -- * Operation classes on HdlType values (lifted to signals)
     , HdlEq(..)
     , HdlOrd(..)
-    , HdlPorts(..)
+    , Named(..)
+    , Port(..)
     , PortSpec(..)
       -- * Generic derivation support (satisfy derived-instance constraints)
     , PortLayout(..)
@@ -53,7 +54,7 @@ module Hdl.Types
     ) where
 
 import Prelude
-import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
+import GHC.TypeLits (KnownNat, Nat, natVal, type (+), Symbol, KnownSymbol, symbolVal)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
@@ -405,21 +406,25 @@ data PortSpec = PortSpec
 -- convert between Haskell signal bundles and flat lists of wire identifiers.
 --
 -- For any Haskell record whose fields are all 'Sig' values (or other
--- 'HdlPorts' bundles), the four methods can be derived automatically:
+-- 'Named' bundles), the four methods can be derived automatically:
 --
 -- @
 -- data MyPorts = MyPorts { foo :: Sig SysClk (Unsigned 8), bar :: Sig SysClk Bool }
---   deriving (Generic, HdlPorts)
+--   deriving (Generic, Named)
 -- @
-class HdlPorts a where
+class Named a where
     -- | Number of wires in this port bundle.
     portCount   :: Proxy a -> Int
     -- | Port metadata in bundle order.  Each element knows its own domain.
     portSpecs   :: Proxy a -> [PortSpec]
+    -- | Port names in bundle order (defaults to the 'portSpecs' names).
+    portNames   :: Proxy a -> [String]
     -- | Materialize all signals in the bundle to a flat wire list.
     toWireIds   :: a -> NetM [WireId]
     -- | Wrap a flat list of wire IDs back into a bundle (output side).
     fromWireIds :: [WireId] -> a
+
+    portNames p = map portName (portSpecs p)
 
     default portCount   :: (Generic a, PortLayout (Rep a)) => Proxy a -> Int
     portCount _ = length (layoutSpecs @(Rep a))
@@ -433,28 +438,44 @@ class HdlPorts a where
     default fromWireIds :: (Generic a, PortLayout (Rep a)) => [WireId] -> a
     fromWireIds ws = to (fst (layoutDecode @(Rep a) ws))
 
-instance HdlPorts () where
+instance Named () where
     portCount   _ = 0
     portSpecs   _ = []
     toWireIds   _ = return []
     fromWireIds _ = ()
 
--- (The concrete @instance HdlPorts (Sig dom a)@ lives in "Hdl.Sig".)
+-- | A port whose name is carried at the __type level__ — so an input's port
+-- name exists before its signal value does (the framework allocates the port,
+-- then hands the body the signal).  Symmetric for inputs and outputs:
+-- @Port \"gpio_a_in\" (Sig dom (Unsigned 8))@.  Wraps a single-wire bundle @a@
+-- and overrides its port name with the type-level 'Symbol'.
+newtype Port (name :: Symbol) a = Port { unPort :: a }
 
-instance (HdlPorts a, HdlPorts b) => HdlPorts (a, b) where
+instance (KnownSymbol name, Named a) => Named (Port name a) where
+    portCount   _        = portCount (Proxy @a)
+    portSpecs   _        = [ p { portName = symbolVal (Proxy @name) }
+                           | p <- portSpecs (Proxy @a) ]
+    toWireIds   (Port a) = toWireIds a
+    fromWireIds ws       = Port (fromWireIds ws)
+
+-- (The concrete @instance Named (Sig dom a)@ lives in "Hdl.Sig".)
+
+instance (Named a, Named b) => Named (a, b) where
     portCount _ = portCount (Proxy @a) + portCount (Proxy @b)
     portSpecs _ = portSpecs (Proxy @a) ++ portSpecs (Proxy @b)
+    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b)) - 1] ]
     toWireIds (a, b) = (++) <$> toWireIds a <*> toWireIds b
     fromWireIds ws =
         let n = portCount (Proxy @a)
             (wa, wb) = splitAt n ws
         in (fromWireIds wa, fromWireIds wb)
 
-instance (HdlPorts a, HdlPorts b, HdlPorts c) => HdlPorts (a, b, c) where
+instance (Named a, Named b, Named c) => Named (a, b, c) where
     portCount _ = portCount (Proxy @a) + portCount (Proxy @b) + portCount (Proxy @c)
     portSpecs _ = portSpecs (Proxy @a)
                ++ portSpecs (Proxy @b)
                ++ portSpecs (Proxy @c)
+    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b, c)) - 1] ]
     toWireIds (a, b, c) = (\x y z -> x ++ y ++ z)
         <$> toWireIds a <*> toWireIds b <*> toWireIds c
     fromWireIds ws =
@@ -468,7 +489,7 @@ instance (HdlPorts a, HdlPorts b, HdlPorts c) => HdlPorts (a, b, c) where
 -- Generic port bundle machinery
 -- ---------------------------------------------------------------------------
 
--- | Generic traversal for 'HdlPorts' derivation.  Users never write instances
+-- | Generic traversal for 'Named' derivation.  Users never write instances
 -- of this class directly; it is satisfied automatically by the structure of
 -- any @deriving Generic@ data type.
 class PortLayout (f :: Type -> Type) where
@@ -488,7 +509,7 @@ instance {-# OVERLAPPABLE #-} PortLayout f => PortLayout (M1 i m f) where
     layoutDecode ws = let (x, ws') = layoutDecode @f ws in (M1 x, ws')
 
 -- Selector field: use the Haskell field name as the port name.
-instance {-# OVERLAPPING #-} (Selector s, HdlPorts a)
+instance {-# OVERLAPPING #-} (Selector s, Named a)
       => PortLayout (M1 S s (K1 R a)) where
     layoutSpecs =
         let nm    = selName (undefined :: M1 S s (K1 R a) ())

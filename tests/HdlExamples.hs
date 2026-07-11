@@ -90,7 +90,7 @@ data RamPorts = RamPorts
     , wrAddr :: Sig SysClk (Unsigned 5)
     , wrData :: Sig SysClk (Unsigned 8)
     , wrEn   :: Sig SysClk Bool
-    } deriving (Generic, HdlPorts, PortRef)
+    } deriving (Generic, Named)
 
 regFile32x8 :: Entity RamPorts (Sig SysClk (Unsigned 8))
 regFile32x8 = bind "reg_file_32x8" (hdl go)
@@ -120,7 +120,7 @@ data PipeIn = PipeIn
     { pX :: Sig SysClk (Unsigned 8)
     , pY :: Sig SysClk (Unsigned 8)
     , pZ :: Sig SysClk (Unsigned 8)
-    } deriving (Generic, HdlPorts, PortRef)
+    } deriving (Generic, Named)
 
 pipelineAdder :: Entity PipeIn (Sig SysClk (Unsigned 8))
 pipelineAdder = bind "pipeline_top" (hdl go)
@@ -172,7 +172,7 @@ data BusReq
     = BusWrite { reqAddr :: Sig SysClk (Unsigned 16)
                , reqData :: Sig SysClk (Unsigned 8) }
     | BusRead  { reqAddr :: Sig SysClk (Unsigned 16) }
-    deriving (Generic, HdlPorts, PortRef)
+    deriving (Generic, Named)
 
 -- Produces a write transaction: tag=0, both fields driven.
 genWrite :: Entity (Sig SysClk (Unsigned 16), Sig SysClk (Unsigned 8)) BusReq
@@ -206,7 +206,7 @@ data UartCmd
     | UartSetBaud { baudDiv  :: Sig SysClk (Unsigned 16) }
     | UartDiscard { discardN :: Sig SysClk (Unsigned 4) }
     | UartReset   { delayUs  :: Sig SysClk (Unsigned 8) }
-    deriving (Generic, HdlPorts, PortRef)
+    deriving (Generic, Named)
 
 -- Pipeline-registers the outgoing byte before packaging it as a send command.
 uartSendCmd :: Entity (Sig SysClk (Unsigned 8)) UartCmd
@@ -234,13 +234,13 @@ banner name = do
     putStrLn (replicate 72 '-')
 
 -- | Elaborate and emit a single entity (flat, no sub-instances).
-printEntity :: (PortRef i, PortRef o) => Entity i o -> IO ()
+printEntity :: (Named i, Named o) => Entity i o -> IO ()
 printEntity ent = do
     banner (entityName ent)
     putStrLn (emitEntity (elaborate ent))
 
 -- | Elaborate and emit a hierarchical design (entity + all sub-entities).
-printDesign :: (PortRef i, PortRef o) => Entity i o -> IO ()
+printDesign :: (Named i, Named o) => Entity i o -> IO ()
 printDesign ent = do
     let (_, design) = elaborateDesign ent
     mapM_ emit' (Map.toAscList design)

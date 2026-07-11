@@ -103,7 +103,7 @@ instance (HdlType a, Num a) => Num (Sig dom a) where
 -- HdlPorts — the concrete single-signal port bundle
 -- ---------------------------------------------------------------------------
 
-instance (HdlType a, KnownDom dom) => HdlPorts (Sig dom a) where
+instance (HdlType a, KnownDom dom) => Named (Sig dom a) where
     portCount _ = 1
     portSpecs _ = [PortSpec
         { portName  = "sig"
