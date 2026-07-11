@@ -12,7 +12,7 @@ import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
 import Hdl.Sim   (simulateSystem)
 import Isacle.System.BusCap
     ( Capability(..), canDrive, canDriveWidth, BusAdapter(..), widthAdapter, stallAdapter )
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
 import Isacle.System.HdlCircuit (GpioPhys(..))

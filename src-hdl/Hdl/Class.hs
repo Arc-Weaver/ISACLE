@@ -21,6 +21,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
 import Hdl.Net
+import Hdl.Sig   (Sig(..), materialize)
 import Hdl.Types
 import Hdl.Entity
 

@@ -86,7 +86,7 @@ import GHC.Generics (Generic, Rep)
 import GHC.TypeLits (natVal, KnownNat, type (<=))
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Hdl.Entity (PortRef, Entity)
 import Hdl.IO (bind, entity)

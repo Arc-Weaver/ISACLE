@@ -9,7 +9,7 @@ module Isacle.Periph.GPIO
 
 import Prelude
 import Data.Word (Word32)
-import Hdl.Types (KnownDom, HdlType, Sig)
+import Hdl.Sig (KnownDom, HdlType, Sig)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)

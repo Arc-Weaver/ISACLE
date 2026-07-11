@@ -40,7 +40,8 @@ import qualified Data.Map.Strict as Map
 
 import Hdl.Net   (NetM, freshWire, emit, defer, hintWire,
                   NetNode(NReg, NRegFile, NRegFileRead), SomeBits(..))
-import Hdl.Types (Sig(..), Signal(sigLitW), materialize, mux, (.==.), (.<.),
+import Hdl.Sig   (Sig(..), materialize)
+import Hdl.Types (Signal(sigLitW), mux, (.==.), (.<.),
                   sigNot, (.&&.), HdlType(..), HdlOrd, KnownDom(..))
 
 -- ---------------------------------------------------------------------------

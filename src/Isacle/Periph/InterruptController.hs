@@ -33,7 +33,7 @@ import Control.Monad (forM)
 import GHC.TypeLits (KnownNat)
 
 import Hdl.Prim  (Unsigned)
-import Hdl.Types (Sig, HdlType, Width, mux, sigResize)
+import Hdl.Sig (Sig, HdlType, Width, mux, sigResize)
 import Isacle.System.Periph
 import Isacle.Periph.Interrupt (interruptArbiter)
 

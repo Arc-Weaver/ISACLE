@@ -2,13 +2,8 @@
 {-# LANGUAGE DefaultSignatures    #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Hdl.Types
-    ( -- * Per-signal domain tags
-      Sig(..)
-    , Signal(..)
-    , materialize
-      -- * Representation tagging
-    , withRepr
-    , sigReinterpret
+    ( -- * The abstract combinational signal surface
+      Signal(..)
       -- * Combinational operations
     , (.==.)
     , (.<.)
@@ -62,8 +57,6 @@ import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import System.Mem.StableName (makeStableName)
-import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
     ( Generic, Rep, from, to
     , M1(..), K1(..), U1(..)
@@ -74,34 +67,6 @@ import GHC.Generics
     )
 
 import Hdl.Net
-
--- ---------------------------------------------------------------------------
--- Per-signal clock domain
--- ---------------------------------------------------------------------------
-
-data Sig (dom :: k) (a :: Type)
-    = SWire WireId
-    | SExpr (NetM WireId)
-
-materialize :: Sig dom a -> NetM WireId
-materialize (SWire wid) = pure wid
-materialize (SExpr m)   = memoSExpr m sn
-  where sn = unsafePerformIO (makeStableName m)
-
--- ---------------------------------------------------------------------------
--- Num instance — combinational arithmetic
--- ---------------------------------------------------------------------------
-
-primSig2 :: PrimOp -> Sig dom a -> Sig dom b -> Sig dom c
-primSig2 op a b = SExpr $ do
-    wa <- materialize a
-    wb <- materialize b
-    lookupOrEmit op [wa, wb]
-
-primSig1 :: PrimOp -> Sig dom a -> Sig dom b
-primSig1 op a = SExpr $ do
-    wa <- materialize a
-    lookupOrEmit op [wa]
 
 -- ---------------------------------------------------------------------------
 -- Signal — the combinational signal surface, abstract over the interpreter
@@ -143,37 +108,8 @@ class Signal (sig :: k -> Type -> Type) where
     -- seams (instruction word / bus wires viewed at the demanded width).
     sigRetype :: (HdlType a, HdlType b) => sig dom a -> sig dom b
 
-instance Signal Sig where
-    sigPrim1 = primSig1
-    sigPrim2 = primSig2
-    sigPrim3 op a b c = SExpr $ do
-        wa <- materialize a
-        wb <- materialize b
-        wc <- materialize c
-        lookupOrEmit op [wa, wb, wc]
-    sigLitW v w = SExpr (lookupOrEmit (PLit v w) [])
-    sigRetype (SWire w) = SWire w
-    sigRetype (SExpr m) = SExpr m
-
--- | Tag a typed signal's wire with its representation (from 'hdlRepr'), so the
--- emitter declares it with the right VHDL signal type.  Apply where a typed
--- value originates (ports, registers) — the emitter then propagates the tag
--- through combinational ops, so intermediate results inherit it.
-withRepr :: forall dom a. HdlType a => Sig dom a -> Sig dom a
-withRepr s = SExpr $ do
-    w <- materialize s
-    reprWire w (hdlRepr (Proxy @a))
-    pure w
-
--- | Reinterpret a signal's bits as another representation of the /same width/
--- (e.g. @Unsigned n@ ↔ @Signed n@).  Unlike 'withRepr', which retags a leaf
--- wire in place, this emits a distinct cast wire (VHDL @signed(..)@\/@unsigned(..)@),
--- so the source wire keeps its own representation and may still be used under it.
--- This is the seam to cross between an unsigned bus and a signed datapath.
-sigReinterpret :: forall b dom a. HdlType b => Sig dom a -> Sig dom b
-sigReinterpret s = SExpr $ do
-    w <- materialize s
-    lookupOrEmit (PReinterpret (hdlRepr (Proxy @b))) [w]
+-- (The concrete @instance Signal Sig@, 'withRepr', and 'sigReinterpret' live in
+-- "Hdl.Sig" — they are the netlist backend's realisation and reference 'NetM'.)
 
 -- ---------------------------------------------------------------------------
 -- Comparison and logical operations
@@ -275,16 +211,7 @@ sigResize = sigPrim1 (PResize (fromIntegral (natVal (Proxy @m))))
 
 -- ---------------------------------------------------------------------------
 
-instance (HdlType a, Num a) => Num (Sig dom a) where
-    (+)    = primSig2 PAdd
-    (-)    = primSig2 PSub
-    (*)    = primSig2 PMul
-    negate = primSig1 PNot
-    abs    = id
-    signum = const (SExpr $ lookupOrEmit (PLit 1 w) [])
-      where w = fromIntegral (natVal (Proxy @(Width a)))
-    fromInteger n = SExpr $ lookupOrEmit (PLit n w) []
-      where w = fromIntegral (natVal (Proxy @(Width a)))
+-- (The concrete @instance Num (Sig dom a)@ lives in "Hdl.Sig".)
 
 -- ---------------------------------------------------------------------------
 -- Synthesizability
@@ -512,15 +439,7 @@ instance HdlPorts () where
     toWireIds   _ = return []
     fromWireIds _ = ()
 
-instance (HdlType a, KnownDom dom) => HdlPorts (Sig dom a) where
-    portCount _ = 1
-    portSpecs _ = [PortSpec
-        { portName  = "sig"
-        , portWidth = fromIntegral (natVal (Proxy :: Proxy (Width a)))
-        , portDom   = domId (Proxy @dom) }]
-    toWireIds sig     = (:[]) <$> materialize sig
-    fromWireIds [w]   = SWire w
-    fromWireIds _     = error "HdlPorts (Sig): fromWireIds: wrong wire count"
+-- (The concrete @instance HdlPorts (Sig dom a)@ lives in "Hdl.Sig".)
 
 instance (HdlPorts a, HdlPorts b) => HdlPorts (a, b) where
     portCount _ = portCount (Proxy @a) + portCount (Proxy @b)

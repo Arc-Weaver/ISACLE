@@ -23,7 +23,7 @@ import GHC.Generics (Generic)
 import GHC.TypeLits (natVal)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Entity (PortRef(..))
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph (PeriphOps(..), BusIface(..))

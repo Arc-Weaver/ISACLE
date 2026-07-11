@@ -6,7 +6,7 @@ module Isacle.Periph.DMA
 
 import Prelude
 import Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..), NetM)
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Class (regS)
 import Hdl.Prim (Unsigned)
 

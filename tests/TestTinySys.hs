@@ -9,7 +9,7 @@ import qualified Data.Map.Strict as Map
 import System.Directory (createDirectoryIfMissing)
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Hdl.Emit.Vhdl (emitVhdlDesignFiles)
 import Isacle.System.SystemDSL

@@ -42,6 +42,7 @@ import GHC.Generics
     )
 
 import Hdl.Net
+import Hdl.Sig   (Sig)
 import Hdl.Types
 
 -- ---------------------------------------------------------------------------

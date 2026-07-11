@@ -10,7 +10,7 @@ import qualified Data.Map.Strict as M
 import System.Exit (exitFailure)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Class (inputS, outputS)
 import Hdl.Bits  (Signed)
 import Hdl.Prim  (Unsigned)

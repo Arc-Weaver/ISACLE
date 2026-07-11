@@ -39,7 +39,7 @@ import System.Exit (exitFailure, exitSuccess)
 import qualified Data.Map.Strict as Map
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Hdl.Bits  (Signed)
 import Isacle.System.SystemDSL

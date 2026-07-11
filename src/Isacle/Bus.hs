@@ -4,7 +4,7 @@ module Isacle.Bus
     ) where
 
 import Prelude
-import Hdl.Types (Sig, mux, HdlType)
+import Hdl.Sig (Sig, mux, HdlType)
 import Hdl.Prim (Unsigned)
 
 -- | Combine read-data outputs from N memory-mapped peripherals by sum.

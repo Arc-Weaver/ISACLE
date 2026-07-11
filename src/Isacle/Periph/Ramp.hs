@@ -34,7 +34,7 @@ import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Bits (Signed, Unsigned, KnownNat)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)

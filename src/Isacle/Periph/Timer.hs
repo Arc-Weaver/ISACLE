@@ -18,7 +18,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)

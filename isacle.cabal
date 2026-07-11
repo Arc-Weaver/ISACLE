@@ -74,6 +74,7 @@ library isacle-hdl
     Hdl.Net
     Hdl.Prim
     Hdl.Reduce
+    Hdl.Sig
     Hdl.Sim
     Hdl.Types
   build-depends:

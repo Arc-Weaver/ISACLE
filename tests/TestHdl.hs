@@ -5,7 +5,7 @@ import qualified Data.Map.Strict as Map
 import System.Exit (exitFailure)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Prim
 import Hdl.Class
 import Hdl.Entity hiding (entity)

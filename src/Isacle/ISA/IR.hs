@@ -96,7 +96,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal, type (<=))
 
 import Hdl.Net (Repr(..))
-import Hdl.Types (HdlType(..), Width)
+import Hdl.Sig (HdlType(..), Width)
 import Hdl.Bits (Unsigned, Signed, Arith, AddR, MulR)
 import Isacle.ISA.Types (ALUPrim(..), CPUFlag(..))
 

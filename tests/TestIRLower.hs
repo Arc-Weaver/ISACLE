@@ -5,7 +5,7 @@ module Main where
 
 import Prelude
 import Hdl.Net
-import Hdl.Types (Sig(..), KnownDom(..), materialize)
+import Hdl.Sig (Sig(..), KnownDom(..), materialize)
 import Hdl.Monad ()            -- the Hdl Sig NetM instance (provides 'named')
 import Hdl.Bits (Unsigned)
 import Isacle.ISA.IR

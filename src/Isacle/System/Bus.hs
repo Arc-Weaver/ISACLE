@@ -22,7 +22,7 @@ module Isacle.System.Bus
 import Prelude
 import Data.Kind (Type)
 
-import Hdl.Types (Sig, HdlType, KnownDom)
+import Hdl.Sig (Sig, HdlType, KnownDom)
 import Hdl.Net   (NetM)
 import Hdl.Class (connectSig)
 import Isacle.System.BusArch (BusArch, SimpleBus, MasterReq(..), SlaveResp(..))

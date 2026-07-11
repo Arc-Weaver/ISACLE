@@ -35,7 +35,8 @@ import Data.Kind (Type)
 import Data.Type.Bool (If)
 import GHC.TypeLits (Nat, KnownNat, type (+), type (<=?))
 
-import Hdl.Types (Sig, sigResize, sigConcat, HdlType(..))
+import Hdl.Sig   (Sig)
+import Hdl.Types (sigResize, sigConcat, HdlType(..))
 import Hdl.Prim  (Unsigned)
 import Hdl.Bits  (Signed, BitVector)
 
