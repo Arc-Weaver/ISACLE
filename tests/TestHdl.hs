@@ -8,8 +8,8 @@ import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim
 import Hdl.Class
-import Hdl.Entity hiding (entity)
-import Hdl.IO (bind, entity)
+import Hdl.Entity
+import Hdl.IO (entity, instanceOf)
 import Hdl.Emit.Vhdl
 
 -- ---------------------------------------------------------------------------
@@ -87,9 +87,9 @@ testCounter = do
 
 testHierarchy :: IO ()
 testHierarchy = do
-    let adder :: Entity (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
+    let adder :: EntityDef (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
                         (Sig Clk (Unsigned 8))
-        adder = bind "adder8" $ hdl $ \(a, b) -> return (a + b)
+        adder = entity "adder8" $ hdl $ \(a, b) -> return (a + b)
 
         design = execDesign "top" $ do
             x <- inputS @Clk @(Unsigned 8) "x"
@@ -246,9 +246,9 @@ testRom = do
 
 testMultiInst :: IO ()
 testMultiInst = do
-    let half :: Entity (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
+    let half :: EntityDef (Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
                        (Sig Clk (Unsigned 8), Sig Clk Bool)
-        half = bind "half_adder8" $ hdl $ \(a, b) -> return (a + b, a .==. b)
+        half = entity "half_adder8" $ hdl $ \(a, b) -> return (a + b, a .==. b)
 
         design = execDesign "top" $ do
             x <- inputS @Clk @(Unsigned 8) "x"

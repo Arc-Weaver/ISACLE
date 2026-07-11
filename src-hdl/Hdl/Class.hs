@@ -34,7 +34,7 @@ import Hdl.Entity
 -- wires are returned as a typed bundle.
 instEntity :: forall i o.
               (Named i, Named o)
-           => Entity i o
+           => EntityDef i o
            -> String   -- ^ instance label (e.g. "u_alu")
            -> i        -- ^ parent-side input signals
            -> NetM o

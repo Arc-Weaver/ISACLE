@@ -88,8 +88,8 @@ import GHC.TypeLits (natVal, KnownNat, type (<=))
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
-import Hdl.Entity (Entity)
-import Hdl.IO (bind, entity)
+import Hdl.Entity (EntityDef)
+import Hdl.IO (entity, instanceOf)
 import Hdl.Class (inputS, outputS, connectSig, freshSig)
 import Isacle.System.Periph
 import Isacle.System.Bus (Bus(..), BusMaster(..))
@@ -313,8 +313,8 @@ attachPeripheral base token = BusDSL $ do
 
     -- Instantiate the peripheral as its own named sub-entity (e.g. "gpio0" →
     -- gpio0.vhd) with the entity tooling; the broadcast master drives its ports.
-    (rd, phys) <- lift $ entity nm
-        (bind nm body :: Entity (SlavePort dom dat) (Sig dom dat, a))
+    (rd, phys) <- lift $ instanceOf nm
+        (entity nm body :: EntityDef (SlavePort dom dat) (Sig dom dat, a))
         SlavePort { spReq   = mqReq   master, spWe    = mqWe    master
                   , spAddr  = mqAddr  master, spWData = mqWData master }
     -- Promote the peripheral's physical outputs to top-level SoC ports.
@@ -501,9 +501,9 @@ createHarvardCPU instName (Chip cpuDef isaDef) codeBus dataBus irqDriver = SysDS
                 }
 
     -- Instantiate the CPU as a named sub-entity via the entity tooling.
-    out <- lift $ entity instName
-        (bind instName cpuBody
-            :: Entity (HCpuIn dom dat codeWordW codeAddrW)
+    out <- lift $ instanceOf instName
+        (entity instName cpuBody
+            :: EntityDef (HCpuIn dom dat codeWordW codeAddrW)
                       (HCpuOut dom dat addrW codeAddrW))
         HCpuIn { hciCodeRd  = codeRdSig, hciDmemRd = dmemRdSig
                , hciStall   = stallSig,  hciIrqPend = irqPendSig, hciIrqVec = irqVecSig }
@@ -611,9 +611,9 @@ createCachedCPU instName (Chip cpuDef isaDef) cacheH = SysDSL $ do
                 }
 
     -- Instantiate the CPU as a named sub-entity; the cache drives its inputs.
-    out <- lift $ entity instName
-        (bind instName vnBody
-            :: Entity (VnCpuIn dom dat addrW) (VnCpuOut dom dat addrW))
+    out <- lift $ instanceOf instName
+        (entity instName vnBody
+            :: EntityDef (VnCpuIn dom dat addrW) (VnCpuOut dom dat addrW))
         VnCpuIn { vciInstr   = SWire (chInstrWord  cacheH)
                 , vciDmemRd  = SWire (chDataRdData cacheH)
                 , vciStall   = SWire (chStall      cacheH)

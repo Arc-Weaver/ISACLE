@@ -6,9 +6,9 @@ module Hdl.Entity
       PortMap
       -- * Behavioral description
     , hdl
-      -- * Entity construction
-    , Entity
-    , entity
+      -- * EntityDef construction
+    , EntityDef
+    , entityDef
     , entityName
     , entityBody
       -- * Synthesis override
@@ -17,7 +17,7 @@ module Hdl.Entity
       -- * Elaborated port declaration
     , Dir(..)
     , PortDecl(..)
-      -- * Elaborated entity
+      -- * Elaborated entityDef
     , ElabEntity(..)
       -- * Elaboration
     , elaborate
@@ -67,7 +67,7 @@ data PortDecl = PortDecl
 -- ElabEntity
 -- ---------------------------------------------------------------------------
 
--- | An elaborated entity: port declarations and the flat node list.
+-- | An elaborated entityDef: port declarations and the flat node list.
 -- This is the form consumed by the VHDL emitter.
 data ElabEntity = ElabEntity
     { elabName  :: String
@@ -76,15 +76,15 @@ data ElabEntity = ElabEntity
     } deriving (Show)
 
 -- ---------------------------------------------------------------------------
--- Entity
+-- EntityDef
 -- ---------------------------------------------------------------------------
 
--- | A first-class HDL entity.
+-- | A first-class HDL entityDef.
 --
 -- 'entityBody' is the behavioral simulation model.
 -- 'entitySynth', when present, substitutes a vendor primitive at synthesis;
 -- the port mapping is expressed as type-safe functions between bundles.
-data Entity i o = Entity
+data EntityDef i o = EntityDef
     { entityName  :: String
     , entityBody  :: i -> NetM o   -- ^ the netlist-backend body (pass 2: polymorphic @Hdl s m@)
     , entitySynth :: Maybe (SynthTarget i o)
@@ -97,7 +97,7 @@ data Entity i o = Entity
 data SynthTarget i o = forall vi vo.
     ( PortMap i vi
     , PortMap vo o
-    ) => SynthTarget (Entity vi vo)
+    ) => SynthTarget (EntityDef vi vo)
 
 -- ---------------------------------------------------------------------------
 -- Smart constructors
@@ -108,22 +108,22 @@ data SynthTarget i o = forall vi vo.
 hdl :: (i -> NetM o) -> (i -> NetM o)
 hdl = id
 
--- | Build an entity from a name and its behavioral description.
-entity :: String -> (i -> NetM o) -> Entity i o
-entity name body = Entity name body Nothing
+-- | Build an entityDef from a name and its behavioral description.
+entityDef :: String -> (i -> NetM o) -> EntityDef i o
+entityDef name body = EntityDef name body Nothing
 
--- | Attach a vendor synthesis target to an entity.
-withSynth :: Entity i o -> SynthTarget i o -> Entity i o
+-- | Attach a vendor synthesis target to an entityDef.
+withSynth :: EntityDef i o -> SynthTarget i o -> EntityDef i o
 withSynth e s = e { entitySynth = Just s }
 
 -- ---------------------------------------------------------------------------
 -- Elaboration
 -- ---------------------------------------------------------------------------
 
--- | Elaborate an entity: allocate input wires, run the behavioral body,
+-- | Elaborate an entityDef: allocate input wires, run the behavioral body,
 -- emit 'NInput'/'NOutput' nodes, and return the fully described 'ElabEntity'.
-elaborate :: forall i o. (Named i, Named o) => Entity i o -> ElabEntity
-elaborate Entity{..} = ElabEntity entityName portDecls nodes
+elaborate :: forall i o. (Named i, Named o) => EntityDef i o -> ElabEntity
+elaborate EntityDef{..} = ElabEntity entityName portDecls nodes
   where
     iSpecs    = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
     oSpecs    = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))
@@ -145,8 +145,8 @@ elaborate Entity{..} = ElabEntity entityName portDecls nodes
 -- | Like 'elaborate', but also returns the full 'Design' — including any
 -- sub-entities instantiated via 'instEntity' inside the body.
 -- Use this for hierarchical designs.
-elaborateDesign :: forall i o. (Named i, Named o) => Entity i o -> (ElabEntity, Design)
-elaborateDesign Entity{..} = (ElabEntity entityName portDecls topNodes, fullDesign)
+elaborateDesign :: forall i o. (Named i, Named o) => EntityDef i o -> (ElabEntity, Design)
+elaborateDesign EntityDef{..} = (ElabEntity entityName portDecls topNodes, fullDesign)
   where
     iSpecs    = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
     oSpecs    = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))
