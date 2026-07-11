@@ -1,4 +1,4 @@
--- | Command-line entry point for a 'SysDSL' system.
+-- | Command-line entry point for a 'SysNet' system.
 --
 -- The minimal-boilerplate path: a whole system file is one import and one call,
 -- with the system constructed inline and handed straight to 'systemMain'.
@@ -124,7 +124,7 @@ usage prog = unlines
 -- | Parse argv and generate the requested artifacts for @sys@.  @name@ is the
 -- default top-entity name (overridable with @--name@); the default output
 -- directory is @build/\<name\>@.
-systemMain :: String -> SysDSL a -> IO ()
+systemMain :: String -> SysNet a -> IO ()
 systemMain name sys = do
     args <- getArgs
     case parseArgs name args of

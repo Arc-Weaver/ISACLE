@@ -29,13 +29,13 @@ tinyChip = Chip tinyCPUDef tinyISA
 
 main :: IO ()
 main = systemMain "tiny_soc" $ do
-    -- Deferred file read: the SysDSL only *records* the request; the interpreter
+    -- Deferred file read: the SysNet only *records* the request; the interpreter
     -- (systemMain) reads examples/prog.bin and re-runs with its bytes available.
     progBytes <- loadFileBytes "examples/prog.bin"
-    gpioIn  <- sysInput "gpio_in" :: SysDSL (Sig Sys (Unsigned 8))
+    gpioIn  <- sysInput "gpio_in" :: SysNet (Sig Sys (Unsigned 8))
     gpio    <- createGpio "gpio0" gpioIn
     coderom <- createRom 256 (romFromBytes progBytes :: RomImage (Unsigned 8)) "coderom0"
-    (codeBus, ()) <- createBus @SimpleBus "codebus" (attachPeripheral 0x0  coderom >> pure ())
-    (dataBus, ()) <- createBus @SimpleBus "databus" (attachPeripheral 0x60 gpio    >> pure ())
+    (codeBus, ()) <- createBus @_ @SimpleBus "codebus" (attachPeripheral 0x0  coderom >> pure ())
+    (dataBus, ()) <- createBus @_ @SimpleBus "databus" (attachPeripheral 0x60 gpio    >> pure ())
     dormant <- noIrq
     createHarvardCPU "cpu0" tinyChip codeBus dataBus dormant

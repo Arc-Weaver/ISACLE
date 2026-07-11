@@ -22,8 +22,9 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecursiveDo                #-}
 module Isacle.System.SystemDSL
-    ( -- * System-level monad
+    ( -- * System-building typeclass + its netlist instance
       SysDSL
+    , SysNet
     , runSystemDSL
       -- * Peripheral tokens (opaque; carry name + PeriphDef)
     , PeriphToken
@@ -75,6 +76,7 @@ import Prelude
 import Data.Kind (Type)
 import Data.Word (Word32, Word8)
 import Control.Monad (forM)
+import Control.Monad.Fix (MonadFix)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class (lift)
 import qualified Data.Map.Strict as Map
@@ -141,7 +143,7 @@ emptySysDoc = SysDoc [] []
 -- during pure runs, so 'loadFile' yields @""@ then.
 type FileEnv = Map.Map FilePath BS.ByteString
 
--- | Internal build state threaded through 'SysDSL': the accumulated 'SysDoc',
+-- | Internal build state threaded through 'SysNet': the accumulated 'SysDoc',
 -- the resolved file environment (read-only, seeded by the runner), and the list
 -- of paths requested via 'loadFile' (accumulated so the IO interpreter knows
 -- what to read in its harvest pass).
@@ -189,19 +191,79 @@ data PeriphToken (proto :: Type) p dom dat a = PeriphToken
     }
 
 -- ---------------------------------------------------------------------------
--- SysDSL monad
+-- SysNet monad
 -- ---------------------------------------------------------------------------
 
--- | System-level monad.  Wraps 'NetM' with the accumulated 'SysBuild' (system
--- documentation, resolved file environment, and requested file paths).
-newtype SysDSL a = SysDSL (StateT SysBuild NetM a)
-    deriving newtype (Functor, Applicative, Monad)
+-- | The netlist/synthesis __instance__ of the 'SysDSL' class.  Wraps 'NetM'
+-- with the accumulated 'SysBuild' (system documentation, resolved file
+-- environment, requested file paths).  'NetM' lives only here (and the emitter),
+-- never in the 'SysDSL' class surface.
+newtype SysNet a = SysNet (StateT SysBuild NetM a)
+    deriving newtype (Functor, Applicative, Monad, MonadFix)
+
+-- | The system-building surface, as a __typeclass__.  Its methods are the
+-- system operations (create a bus, attach/​instantiate a CPU, a peripheral, …);
+-- 'SysNet' is the concrete backend instance that realises them via 'NetM'.
+-- User system code is written @'SysDSL' m => … m …@ and interpreted by whichever
+-- instance runs it.  Signals stay concrete 'Sig'; only the assembly monad @m@ is
+-- abstract, and 'NetM' never appears in this class.
+class MonadFix m => SysDSL m where
+    createBus        :: (BusArch proto, KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+                     => String -> BusDSL proto dom dat a
+                     -> m (Bus proto dom (Unsigned 32) dat, a)
+    createHarvardCPU :: forall core addrW codeWordW codeAddrW proto cproto (dom :: Type) dat alu.
+                        ( KnownDom dom, KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW
+                        , addrW <= 32, codeAddrW <= 32, HdlType dat
+                        , HdlType core, Generic core, GFields (Rep core)
+                        , BusMaster proto, BusMaster cproto )
+                     => String
+                     -> Chip core alu (Width dat) addrW codeWordW codeAddrW
+                     -> Bus cproto dom (Unsigned 32) (Unsigned codeWordW)
+                     -> Bus proto  dom (Unsigned 32) dat
+                     -> IrqDriver dom codeAddrW
+                     -> m ()
+    createIrq        :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
+                     => Sig dom Bool -> [(Sig dom Bool, Integer)] -> m (IrqDriver dom caw)
+    noIrq            :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
+                     => m (IrqDriver dom caw)
+    createUart       :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+                     => String -> Sig dom Bool -> m (PeriphToken proto UART dom dat (UartPhys dom))
+    createGpio       :: (Num dat, Num (Sig dom dat))
+                     => String -> Sig dom dat -> m (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
+    createTimer      :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+                     => String -> Sig dom Bool -> m (PeriphToken proto Timer dom dat (TimerPhys dom))
+    createRamp       :: KnownDom dom
+                     => String -> Sig dom Bool -> m (PeriphToken proto Ramp dom (Unsigned 8) ())
+    createRam        :: (Num dat, Num (Sig dom dat))
+                     => Int -> [Integer] -> String -> m (PeriphToken proto RAM dom dat ())
+    createRom        :: (Num dat, Num (Sig dom dat))
+                     => Int -> RomImage dat -> String -> m (PeriphToken proto ROM dom dat ())
+    loadFile         :: FilePath -> m String
+    loadFileBytes    :: FilePath -> m [Word8]
+    sysInput         :: forall a dom. (KnownDom dom, HdlType a) => String -> m (Sig dom a)
+    sysOutput        :: forall a dom. (KnownDom dom, HdlType a) => String -> Sig dom a -> m ()
+
+instance SysDSL SysNet where
+    createBus        = createBusImpl
+    createHarvardCPU = createHarvardCPUImpl
+    createIrq        = createIrqImpl
+    noIrq            = noIrqImpl
+    createUart       = createUartImpl
+    createGpio       = createGpioImpl
+    createTimer      = createTimerImpl
+    createRamp       = createRampImpl
+    createRam        = createRamImpl
+    createRom        = createRomImpl
+    loadFile         = loadFileImpl
+    loadFileBytes    = loadFileBytesImpl
+    sysInput         = sysInputImpl
+    sysOutput        = sysOutputImpl
 
 -- | Run a system description, returning the user result, the flat 'NetNode'
 -- list (for VHDL emission), and the system documentation.  Pure: no file
 -- environment, so any 'loadFile' yields @""@.
-runSystemDSL :: SysDSL a -> (a, [NetNode], SysDoc)
-runSystemDSL (SysDSL st) = (a, nodes, sbDoc b)
+runSystemDSL :: SysNet a -> (a, [NetNode], SysDoc)
+runSystemDSL (SysNet st) = (a, nodes, sbDoc b)
   where
     ((a, b), nodes, _design) = runNetM (runStateT st emptyBuild)
 
@@ -217,16 +279,16 @@ runSystemDSL (SysDSL st) = (a, nodes, sbDoc b)
 -- Because paths are gathered before contents are known, the /set/ of files a
 -- system loads must not depend on any file's contents (paths are normally
 -- literals — this is not a real restriction in practice).
-loadFile :: FilePath -> SysDSL String
-loadFile path = SysDSL $ do
+loadFileImpl :: FilePath -> SysNet String
+loadFileImpl path = SysNet $ do
     modify $ \b -> b { sbReqs = path : sbReqs b }
     b <- get
     pure (maybe "" BSC.unpack (Map.lookup path (sbEnv b)))
 
 -- | 'loadFile' returning raw bytes — feed a ROM image with
 -- 'Isacle.System.Rom.romFromBytes'.
-loadFileBytes :: FilePath -> SysDSL [Word8]
-loadFileBytes path = SysDSL $ do
+loadFileBytesImpl :: FilePath -> SysNet [Word8]
+loadFileBytesImpl path = SysNet $ do
     modify $ \b -> b { sbReqs = path : sbReqs b }
     b <- get
     pure (maybe [] BS.unpack (Map.lookup path (sbEnv b)))
@@ -350,13 +412,13 @@ attachPeripheral base token = BusDSL $ do
 --     port' <- attachPeripheral 0x300 gpioTok
 --     return (tx', port')
 -- @
-createBus
+createBusImpl
     :: forall proto dom dat a.
        (BusArch proto, KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> BusDSL proto dom dat a
-    -> SysDSL (Bus proto dom (Unsigned 32) dat, a)
-createBus busName (BusDSL busSt) = SysDSL $ do
+    -> SysNet (Bus proto dom (Unsigned 32) dat, a)
+createBusImpl busName (BusDSL busSt) = SysNet $ do
     -- Root request placeholders: forward-declared 'freshSig' wires the driving
     -- master (a CPU, a cache, …) fills in later via 'driveBus'.  The peripherals
     -- are instantiated /now/, wired to these placeholders — so the bus is a
@@ -451,7 +513,7 @@ deriving instance (KnownDom dom, HdlType dat, KnownNat aw)
 --
 -- The CPU address width (@addrW@) may differ from the bus address width
 -- (always 32-bit); a zero-extend resize is inserted automatically.
-createHarvardCPU :: forall core addrW codeWordW codeAddrW proto cproto (dom :: Type) dat alu.
+createHarvardCPUImpl :: forall core addrW codeWordW codeAddrW proto cproto (dom :: Type) dat alu.
               ( KnownDom dom
               , KnownNat addrW, KnownNat codeWordW, KnownNat codeAddrW
               , addrW <= 32, codeAddrW <= 32
@@ -464,8 +526,8 @@ createHarvardCPU :: forall core addrW codeWordW codeAddrW proto cproto (dom :: T
            -> Bus cproto dom (Unsigned 32) (Unsigned codeWordW)  -- ^ code bus (data = code word)
            -> Bus proto  dom (Unsigned 32) dat                   -- ^ data bus
            -> IrqDriver dom codeAddrW                            -- ^ interrupt driver ('noIrq' if dormant)
-           -> SysDSL ()
-createHarvardCPU instName (Chip cpuDef isaDef) codeBus dataBus irqDriver = SysDSL $ do
+           -> SysNet ()
+createHarvardCPUImpl instName (Chip cpuDef isaDef) codeBus dataBus irqDriver = SysNet $ do
     let codeWordB    = fromIntegral (natVal (Proxy @codeWordW))  :: Int
     let addrBits     = fromIntegral (natVal (Proxy @addrW))       :: Int
     let codeAddrBits = fromIntegral (natVal (Proxy @codeAddrW))   :: Int
@@ -568,8 +630,8 @@ createL1Cache
        ( KnownDom dom, KnownNat wordW, KnownNat addrW, HdlType dat, BusMaster proto )
     => CacheConfig
     -> Bus proto dom (Unsigned 32) dat
-    -> SysDSL CacheHandle
-createL1Cache cfg busNode = SysDSL $ lift $
+    -> SysNet CacheHandle
+createL1Cache cfg busNode = SysNet $ lift $
     synthL1Cache @proto @dom @wordW @addrW cfg busNode
 
 -- | Synthesise a cached von Neumann CPU and connect it to a 'CacheHandle'.
@@ -588,8 +650,8 @@ createCachedCPU
     => String
     -> Chip core alu (Width dat) addrW (Width dat) addrW
     -> CacheHandle
-    -> SysDSL ()
-createCachedCPU instName (Chip cpuDef isaDef) cacheH = SysDSL $ do
+    -> SysNet ()
+createCachedCPU instName (Chip cpuDef isaDef) cacheH = SysNet $ do
     let addrBits  = fromIntegral (natVal (Proxy @addrW)) :: Int
 
     -- CPU sub-entity body: the abstract, NetM-free 'synthVonNeumannCPU'' at
@@ -646,8 +708,8 @@ alias dst src = emit $ NComb dst POr [src, src]
 -- any sub-entities such as RAM blocks) ready for 'emitVhdlDesignFiles'.
 -- Apply @dom@ and @dat@ as visible type arguments to disambiguate:
 -- @execSystemDSL \@Sys \@(Unsigned 8) "top" mySystem@
-execSystemDSL :: forall a. String -> SysDSL a -> Design
-execSystemDSL name (SysDSL st) =
+execSystemDSL :: forall a. String -> SysNet a -> Design
+execSystemDSL name (SysNet st) =
     execDesign name (fmap fst (runStateT st emptyBuild))
 
 -- | Run a system description once, returning the user result, the full 'Design'
@@ -655,7 +717,7 @@ execSystemDSL name (SysDSL st) =
 -- memory map / C header / linker artifacts).  A single monad pass, so callers
 -- that need every output — e.g. 'Isacle.System.Emit.writeSystem' — do not run
 -- the description twice.
-runSystemDesign :: forall a. String -> SysDSL a -> (a, Design, SysDoc)
+runSystemDesign :: forall a. String -> SysNet a -> (a, Design, SysDoc)
 runSystemDesign name sys = (a, design, doc)
   where (a, design, doc, _reqs) = runSystemDesignWith Map.empty name sys
 
@@ -664,8 +726,8 @@ runSystemDesign name sys = (a, design, doc)
 -- requested via 'loadFile' / 'loadFileBytes'.  Used to drive the two-pass
 -- deferred-load resolution in 'Isacle.System.Emit'.
 runSystemDesignWith
-    :: forall a. FileEnv -> String -> SysDSL a -> (a, Design, SysDoc, [FilePath])
-runSystemDesignWith env name (SysDSL st) = (a, design, sbDoc b, reverse (sbReqs b))
+    :: forall a. FileEnv -> String -> SysNet a -> (a, Design, SysDoc, [FilePath])
+runSystemDesignWith env name (SysNet st) = (a, design, sbDoc b, reverse (sbReqs b))
   where
     ((a, b), design) = runDesign name (runStateT st (emptyBuildWith env))
 
@@ -677,12 +739,12 @@ runSystemDesignWith env name (SysDSL st) = (a, design, sbDoc b, reverse (sbReqs 
 -- Register interface (UDR, USR, UBRR) is fully wired.
 -- Physical outputs (TX, rxIrq, txIrq) are stubs until a serial-FSM
 -- sub-component is implemented.
-createUart
+createUartImpl
     :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> Sig dom Bool                  -- ^ RX serial line
-    -> SysDSL (PeriphToken proto UART dom dat (UartPhys dom))
-createUart name rxPin = pure $ PeriphToken
+    -> SysNet (PeriphToken proto UART dom dat (UartPhys dom))
+createUartImpl name rxPin = pure $ PeriphToken
     { ptName     = name
     , ptDef      = do
           (txLine, rxIrq, txIrq) <- uartDefWithFSM rxPin
@@ -692,12 +754,12 @@ createUart name rxPin = pure $ PeriphToken
 
 -- | Create a GPIO peripheral token.
 -- Fully implemented: DDR, PORT, and PIN registers all synthesize correctly.
-createGpio
+createGpioImpl
     :: (Num dat, Num (Sig dom dat))
     => String
     -> Sig dom dat                   -- ^ input pin bus
-    -> SysDSL (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
-createGpio name pins = pure $ PeriphToken
+    -> SysNet (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
+createGpioImpl name pins = pure $ PeriphToken
     { ptName     = name
     , ptDef      = gpioDef pins >>= \(port, ddr) ->
                        return GpioPhys { gpioPort = port, gpioDdr = ddr }
@@ -707,12 +769,12 @@ createGpio name pins = pure $ PeriphToken
 -- | Create a Timer peripheral token.
 -- Physical outputs (overflow IRQ, compare-match IRQ) are stubs until a
 -- counter-FSM sub-component is implemented.
-createTimer
+createTimerImpl
     :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> Sig dom Bool                  -- ^ tick / count enable
-    -> SysDSL (PeriphToken proto Timer dom dat (TimerPhys dom))
-createTimer name tick = pure $ PeriphToken
+    -> SysNet (PeriphToken proto Timer dom dat (TimerPhys dom))
+createTimerImpl name tick = pure $ PeriphToken
     { ptName     = name
     , ptDef      = do
           (ovf, cmp) <- timerDefWithFSM tick
@@ -724,12 +786,12 @@ createTimer name tick = pure $ PeriphToken
 -- The bus carries @Unsigned 8@ but the internal datapath is @Signed 8@; the
 -- ramp moves its CURRENT value toward SETPOINT by STEP each tick.  Register
 -- map: 0 SETPOINT (RW), 1 STEP (RW), 2 CURRENT (RO).
-createRamp
+createRampImpl
     :: KnownDom dom
     => String
     -> Sig dom Bool                  -- ^ tick / advance enable
-    -> SysDSL (PeriphToken proto Ramp dom (Unsigned 8) ())
-createRamp name tick = pure $ PeriphToken
+    -> SysNet (PeriphToken proto Ramp dom (Unsigned 8) ())
+createRampImpl name tick = pure $ PeriphToken
     { ptName     = name
     , ptDef      = rampDefWithFSM tick
     , ptAddrSize = 0
@@ -738,13 +800,13 @@ createRamp name tick = pure $ PeriphToken
 -- | Create a synchronous block RAM peripheral token.
 -- Attach with @attachPeripheral base ram0@; the RAM occupies @size@ entries
 -- starting at @base@.
-createRam
+createRamImpl
     :: (Num dat, Num (Sig dom dat))
     => Int          -- ^ number of addressable entries
     -> [Integer]    -- ^ initial contents (padded to @size@ with 0)
     -> String       -- ^ instance name
-    -> SysDSL (PeriphToken proto RAM dom dat ())
-createRam size initVals name = pure $ PeriphToken
+    -> SysNet (PeriphToken proto RAM dom dat ())
+createRamImpl size initVals name = pure $ PeriphToken
     { ptName     = name
     , ptDef      = blockRamDef size initVals
     , ptAddrSize = fromIntegral size
@@ -760,13 +822,13 @@ newtype RomImage dat = RomImage [Integer]
 -- instruction memory or a data-bus lookup table.  The word width comes from the
 -- 'RomImage' type.  Attach with @attachPeripheral base rom0@; the ROM occupies
 -- @size@ words starting at @base@.
-createRom
+createRomImpl
     :: (Num dat, Num (Sig dom dat))
     => Int                     -- ^ number of words
     -> RomImage dat            -- ^ typed image (word type = @dat@)
     -> String                  -- ^ instance name
-    -> SysDSL (PeriphToken proto ROM dom dat ())
-createRom size (RomImage ws) name = pure $ PeriphToken
+    -> SysNet (PeriphToken proto ROM dom dat ())
+createRomImpl size (RomImage ws) name = pure $ PeriphToken
     { ptName     = name
     , ptDef      = romCombDef size ws
     , ptAddrSize = fromIntegral size
@@ -790,9 +852,9 @@ data IrqDriver dom caw = IrqDriver
 -- for a CPU whose interrupts are dormant (e.g. an instruction-coverage SoC whose
 -- programs enable interrupts but expect no source to vector them away).  The ack
 -- input is accepted and ignored (the CPU drives it unconditionally).
-noIrq :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
-      => SysDSL (IrqDriver dom caw)
-noIrq = SysDSL $ lift $ do
+noIrqImpl :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
+      => SysNet (IrqDriver dom caw)
+noIrqImpl = SysNet $ lift $ do
     ack <- freshSig
     pure IrqDriver { irqPending = sigFalse, irqVector = fromInteger 0, irqAck = ack }
 
@@ -809,12 +871,12 @@ noIrq = SysDSL $ lift $ do
 -- @request@ signals are supplied directly — typically peripheral irq outputs
 -- (e.g. @timerOvfIrq@ / @uartRxIrq@ off a 'createBus').  Vectors are the ISA's
 -- interrupt addresses (chosen at the system level, not in the ISA package).
-createIrq
+createIrqImpl
     :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
     => Sig dom Bool                 -- ^ global interrupt enable
     -> [(Sig dom Bool, Integer)]    -- ^ (request, vector), index 0 = highest priority
-    -> SysDSL (IrqDriver dom caw)
-createIrq enable srcs = SysDSL $ lift $ do
+    -> SysNet (IrqDriver dom caw)
+createIrqImpl enable srcs = SysNet $ lift $ do
     ack <- freshSig
     -- latch each source, cleared when the CPU acknowledges (shared ack: correct
     -- for one-at-a-time servicing, which the priority winner guarantees).
@@ -828,13 +890,13 @@ createIrq enable srcs = SysDSL $ lift $ do
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Emit a top-level output port from within 'SysDSL'.
+-- | Emit a top-level output port from within 'SysNet'.
 -- The signal type @a@ may differ from the bus data type @dat@
 -- (e.g. expose a 'Bool' TX pin alongside 8-bit GPIO).
-sysOutput :: forall a dom.
+sysOutputImpl :: forall a dom.
              (KnownDom dom, HdlType a)
-          => String -> Sig dom a -> SysDSL ()
-sysOutput name sig = SysDSL $ lift $ outputS @dom @a name sig
+          => String -> Sig dom a -> SysNet ()
+sysOutputImpl name sig = SysNet $ lift $ outputS @dom @a name sig
 
 -- | Declare a top-level __input__ port and return its signal — the dual of
 -- 'sysOutput'.  Wire the result into a peripheral constructor (e.g. GPIO pin
@@ -845,10 +907,10 @@ sysOutput name sig = SysDSL $ lift $ outputS @dom @a name sig
 -- gpioIn <- sysInput \"gpio_a_in\"
 -- gpioA  <- createGpio \"gpio_a\" gpioIn
 -- @
-sysInput :: forall a dom.
+sysInputImpl :: forall a dom.
             (KnownDom dom, HdlType a)
-         => String -> SysDSL (Sig dom a)
-sysInput name = SysDSL $ lift $ inputS @dom @a name
+         => String -> SysNet (Sig dom a)
+sysInputImpl name = SysNet $ lift $ inputS @dom @a name
 
 -- | Constant-false Bool signal (1-bit zero literal).
 sigFalse :: Sig dom Bool

@@ -32,7 +32,7 @@ instance KnownDom Clk where
 mySystem
     :: Sig Clk Bool
     -> Sig Clk (Unsigned 8)
-    -> SysDSL
+    -> SysNet
               (Sig Clk Bool, Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 mySystem rxPin gpioIn = do
     uart <- createUart "uart" rxPin
