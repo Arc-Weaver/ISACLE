@@ -30,6 +30,7 @@ module Isacle.Periph.Ramp
     ) where
 
 import Prelude
+import Control.Monad.Fix (MonadFix)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 
@@ -37,7 +38,7 @@ import Hdl.Net
 import Hdl.Sig
 import Hdl.Bits (Signed, Unsigned, KnownNat)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -66,8 +67,8 @@ asUnsigned = sigReinterpret
 -- by 'rampFSM'.  Returns the signed @(setpoint, step)@ control signals for the
 -- FSM to consume.
 rampDef
-    :: Sig dom (Unsigned 8)        -- ^ current value (from 'rampFSM')
-    -> PeriphDef Ramp (Sig dom) (Unsigned 8)
+    :: Monad m => Sig dom (Unsigned 8)        -- ^ current value (from 'rampFSM')
+    -> PeriphDef Ramp (Sig dom) m (Unsigned 8)
                  (Sig dom (Signed 8), Sig dom (Signed 8))
 rampDef curU = do
     -- Fused typed PE2 combinators — and a signed-register exercise (regField/
@@ -126,9 +127,9 @@ rampFSM tick setpoint step = asUnsigned cur
 -- | 'rampDef' with 'rampFSM' wired in via a recursive binding.  Use as the
 -- @ptDef@ in a 'PeriphToken'.  The ramp has no IRQ outputs.
 rampDefWithFSM
-    :: KnownDom dom
+    :: (KnownDom dom, MonadFix m)
     => Sig dom Bool                 -- ^ tick / advance enable
-    -> PeriphDef Ramp (Sig dom) (Unsigned 8) ()
+    -> PeriphDef Ramp (Sig dom) m (Unsigned 8) ()
 rampDefWithFSM tick = mdo
     (setpoint, step) <- rampDef curU
     let curU = rampFSM tick setpoint step
@@ -144,7 +145,7 @@ rampDefWithFSM tick = mdo
 --   base + 1  STEP
 --   base + 2  CURRENT (read = current value)
 rampUnit
-    :: KnownDom dom
+    :: (KnownDom dom, MonadFix m)
     => Word32                          -- ^ peripheral base address
     -> Sig dom Bool                    -- ^ tick / advance enable
     -> Sig dom (Unsigned 32)           -- ^ bus write address
@@ -156,5 +157,5 @@ rampUnit base tick wrAddr wrData wrEn rdAddr = rdData
   where
     bus = hdlBusIface wrAddr wrData wrEn rdAddr base
     ((setpoint, step), rdData, _spec) =
-        runPeriphDef hdlOps bus (rampDef curU)
+        runPeriphNet hdlOps bus (rampDef curU)
     curU = rampFSM tick setpoint step

@@ -66,14 +66,14 @@ activeSource sources =
 -- so the only bus-visible register is the status register (read-only) at
 -- @statusOff@.  Returns the CPU-side @(irq_pending, irq_vector)@.
 staticIrqDef
-    :: forall dom dat vecW.
-       ( HdlType dat, KnownNat (Width dat), Num (Sig dom dat)
+    :: forall dom dat vecW m.
+       ( HdlType dat, KnownNat (Width dat), Num (Sig dom dat), Monad m
        , KnownNat vecW, Num (Sig dom (Unsigned vecW)) )
     => Word8              -- ^ status register byte offset
     -> [Integer]          -- ^ vectors, index 0 = highest priority (length N)
     -> Sig dom Bool       -- ^ global enable
     -> [Sig dom Bool]     -- ^ N source requests (index 0 = highest priority)
-    -> PeriphDef IrqCtrl (Sig dom) dat (Sig dom Bool, Sig dom (Unsigned vecW))
+    -> PeriphDef IrqCtrl (Sig dom) m dat (Sig dom Bool, Sig dom (Unsigned vecW))
 staticIrqDef statusOff vectors enable sources = do
     roField @dat statusOff "ISR" "Active interrupt source (0 = none)"
         (activeSource sources)
@@ -91,13 +91,13 @@ staticIrqDef statusOff vectors enable sources = do
 -- by the status register (read-only) at offset @N@.  Each vector register is
 -- bus-data wide and resized to the CPU's vector width.
 progIrqDef
-    :: forall dom dat vecW.
-       ( HdlType dat, KnownNat (Width dat), Num dat, Num (Sig dom dat)
+    :: forall dom dat vecW m.
+       ( HdlType dat, KnownNat (Width dat), Num dat, Num (Sig dom dat), Monad m
        , KnownNat vecW, Num (Sig dom (Unsigned vecW)) )
     => Int                -- ^ N (sources = vectors)
     -> Sig dom Bool       -- ^ global enable
     -> [Sig dom Bool]     -- ^ N source requests (index 0 = highest priority)
-    -> PeriphDef IrqCtrl (Sig dom) dat (Sig dom Bool, Sig dom (Unsigned vecW))
+    -> PeriphDef IrqCtrl (Sig dom) m dat (Sig dom Bool, Sig dom (Unsigned vecW))
 progIrqDef n enable sources = do
     vregs <- forM [0 .. n - 1] $ \i ->
         regField @dat (fromIntegral i) ("VEC" ++ show i)

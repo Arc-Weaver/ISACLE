@@ -5,6 +5,7 @@
 -- (GPIO, Timer, UART, …) work without modification.
 module Isacle.System.HdlCircuit
     ( hdlOps
+    , runPeriphNet
     , hdlBusIface
     , busPortIface
       -- * Named physical-output bundles
@@ -25,8 +26,9 @@ import GHC.TypeLits (natVal)
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Types (Named(..))
+import Hdl.Class (regEnS, ram, rom, named)
 import Hdl.Prim (Unsigned)
-import Isacle.System.Periph (PeriphOps(..), BusIface(..))
+import Isacle.System.Periph (PeriphOps(..), BusIface(..), PeriphDef, PeriphSpec, runPeriphDef)
 
 -- ---------------------------------------------------------------------------
 -- HDL ops
@@ -35,67 +37,32 @@ import Isacle.System.Periph (PeriphOps(..), BusIface(..))
 -- | 'PeriphOps' for the isacle-hdl backend.  'sigReg' produces a deferred
 -- 'NReg' node; duplicate emissions from 'SExpr' re-materialisation are
 -- removed by the CSE pass in the VHDL emitter before output.
+-- | The isacle-hdl (netlist) backend realisation of 'PeriphOps' — the stateful
+-- ops are the real 'Hdl' 'regS' / 'ram' / 'rom' / 'named' primitives (no
+-- 'SExpr'); combinational ops are the pure 'Signal' operators.  This is the
+-- concrete @m = NetM@ instance the peripheral definitions run through.
 hdlOps :: forall dom dat.
           (KnownDom dom, HdlType dat, Num dat)
-       => PeriphOps (Sig dom) dat
+       => PeriphOps (Sig dom) NetM dat
 hdlOps = PeriphOps
-    { sigReg      = hdlSigReg
-    , sigBlockMem = hdlSigBlockMem
-    , sigRom      = hdlSigRom
+    { sigReg      = regEnS
+    , sigBlockMem = \size initVals wrEn wrAddr wrData rdAddr ->
+                        ram size initVals rdAddr wrAddr wrData wrEn
+    , sigRom      = \size initVals rdAddr -> rom size initVals rdAddr
     , sigAddrLt   = \addr lim -> addr .<. fromIntegral lim
-    , sigZero     = litSig 0
+    , sigZero     = fromInteger 0
     , sigAnd      = (.&&.)
     , sigMux      = mux
-    , sigHint     = \name s -> SExpr $ do
-                        w <- materialize s
-                        hintWire w name
-                        pure w
+    , sigHint     = named
     }
-  where
-    litSig :: Integer -> Sig dom dat
-    litSig v = SExpr $ do
-        out <- freshWire
-        emit $ NComb out (PLit v w) []
-        pure out
-      where w = fromIntegral (natVal (Proxy @(Width dat)))
 
-    hdlSigReg :: dat -> Sig dom Bool -> Sig dom dat -> Sig dom dat
-    hdlSigReg initVal en inp = SExpr $ do
-        outWid <- freshWire
-        let bitWidth = fromIntegral (natVal (Proxy @(Width dat)))
-            initBits = SomeBits (toBits initVal) bitWidth
-            domInfo  = domId (Proxy @dom)
-        defer $ do
-            enWid  <- materialize en
-            inWid  <- materialize inp
-            emit $ NReg outWid inWid (Just enWid) initBits domInfo
-        pure outWid
-
-    hdlSigBlockMem :: Int -> [Integer]
-                   -> Sig dom Bool -> Sig dom (Unsigned 32) -> Sig dom dat -> Sig dom (Unsigned 32)
-                   -> Sig dom dat
-    hdlSigBlockMem size initVals wrEn wrAddr wrData rdAddr = SExpr $ do
-        out <- freshWire
-        let datW   = fromIntegral (natVal (Proxy @(Width dat)))
-            domInf = domId (Proxy @dom)
-        defer $ do
-            enW  <- materialize wrEn
-            waW  <- materialize wrAddr
-            wdW  <- materialize wrData
-            raW  <- materialize rdAddr
-            emit $ NMem out raW waW wdW enW size datW initVals domInf
-        pure out
-
-    -- Combinational ROM: a purely combinational 'NRom' lookup (readAddr → data
-    -- the same cycle), for instruction/code memory.
-    hdlSigRom :: Int -> [Integer] -> Sig dom (Unsigned 32) -> Sig dom dat
-    hdlSigRom size initVals rdAddr = SExpr $ do
-        out <- freshWire
-        let datW = fromIntegral (natVal (Proxy @(Width dat)))
-        defer $ do
-            raW <- materialize rdAddr
-            emit $ NRom out raW size datW initVals
-        pure out
+-- | Run a peripheral definition in an __isolated__ 'NetM' and return the pure
+-- triple, discarding the emitted nodes.  Used for the metadata/spec pass (only
+-- the 'PeriphSpec' is kept) and by the legacy standalone @*Unit@ wrappers.  The
+-- real hardware pass instead runs 'runPeriphDef' in the ambient 'NetM'.
+runPeriphNet :: PeriphOps (Sig dom) NetM dat -> BusIface (Sig dom) dat
+             -> PeriphDef p (Sig dom) NetM dat a -> (a, Sig dom dat, PeriphSpec)
+runPeriphNet ops bus def = let (r, _, _) = runNetM (runPeriphDef ops bus def) in r
 
 -- ---------------------------------------------------------------------------
 -- Named physical-output bundles

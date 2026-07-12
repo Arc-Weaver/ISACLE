@@ -13,6 +13,7 @@ module Isacle.Periph.Timer
     ) where
 
 import Prelude
+import Control.Monad.Fix (MonadFix)
 import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
@@ -21,7 +22,7 @@ import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -44,9 +45,9 @@ data Timer
 --
 -- Returns @(tccr, ocr, tcntPreset, tcntWritten)@.
 timerDef
-    :: (Num dat)
+    :: (Num dat, MonadFix m)
     => sig dat                     -- ^ current counter value (from counter FSM)
-    -> PeriphDef Timer sig dat (sig dat, sig dat, sig dat, sig Bool)
+    -> PeriphDef Timer sig m dat (sig dat, sig dat, sig dat, sig Bool)
 timerDef cntSig = do
     -- TCCR: has the CTC bit-field, so it keeps the explicit register/bitF
     -- declaration (the read-back is the written value).
@@ -131,9 +132,9 @@ counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
 -- Use this as the @ptDef@ in a 'PeriphToken' so that 'attachPeripheral'
 -- gets real overflow and compare-match outputs instead of stubs.
 timerDefWithFSM
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
     => Sig dom Bool              -- ^ tick / count enable
-    -> PeriphDef Timer (Sig dom) dat (Sig dom Bool, Sig dom Bool)
+    -> PeriphDef Timer (Sig dom) m dat (Sig dom Bool, Sig dom Bool)
                                  -- ^ (ovfIrq, cmpIrq)
 timerDefWithFSM tick = mdo
     (tccr, ocr, tcntPreset, tcntWritten) <- timerDef cnt
@@ -151,7 +152,7 @@ timerDefWithFSM tick = mdo
 --     base + 1  TCNT  counter (write = preset, read = current value)
 --     base + 2  OCR   output compare
 timerUnit
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
     => Word32                          -- ^ peripheral base address
     -> Sig dom Bool                    -- ^ tick / count enable
     -> Sig dom (Unsigned 32)           -- ^ bus write address
@@ -163,6 +164,6 @@ timerUnit base tick wrAddr wrData wrEn rdAddr = (rdData, ovfIrq, cmpIrq)
   where
     bus = hdlBusIface wrAddr wrData wrEn rdAddr base
     ((tccr, ocr, tcntPreset, tcntWritten), rdData, _spec) =
-        runPeriphDef hdlOps bus (timerDef cnt)
+        runPeriphNet hdlOps bus (timerDef cnt)
     (cnt, ovfIrq, cmpIrq) =
         counterFSM tick tccr ocr tcntPreset tcntWritten

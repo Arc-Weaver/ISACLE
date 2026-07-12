@@ -13,6 +13,7 @@ module Isacle.Periph.UART
     ) where
 
 import Prelude
+import Control.Monad.Fix (MonadFix)
 import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
@@ -21,7 +22,7 @@ import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -43,10 +44,10 @@ data UART
 -- Returns @(txData, txStrobe, baud)@ for the serial FSM.
 -- @txStrobe@ pulses True on the cycle the CPU writes to UDR.
 uartDef
-    :: (Num dat)
+    :: (Num dat, MonadFix m)
     => sig dat    -- ^ status register value (driven by serial FSM)
     -> sig dat    -- ^ RX buffer (read side of UDR, driven by serial FSM)
-    -> PeriphDef UART sig dat (sig dat, sig Bool, sig dat)
+    -> PeriphDef UART sig m dat (sig dat, sig Bool, sig dat)
 uartDef stat rxData = do
     -- UDR: typed metadata, but the read side returns the FSM's RX buffer (not the
     -- written value) and the write side needs a strobe, so the logic stays
@@ -430,9 +431,9 @@ serialFSM baud txDataIn txStrobe rxLine = (txLine, status, rxBuf, rxIrq, udreIrq
 -- Returns @(txLine, rxIrq, txIrq)@.  Use this as the @ptDef@ in a
 -- 'PeriphToken' so that 'attachPeripheral' gets real serial outputs.
 uartDefWithFSM
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
     => Sig dom Bool   -- ^ RX serial line
-    -> PeriphDef UART (Sig dom) dat (Sig dom Bool, Sig dom Bool, Sig dom Bool)
+    -> PeriphDef UART (Sig dom) m dat (Sig dom Bool, Sig dom Bool, Sig dom Bool)
                       -- ^ (txLine, rxIrq, txIrq)
 uartDefWithFSM rxLine = mdo
     (txData, txStrobe, baud) <- uartDef stat rxBuf
@@ -450,7 +451,7 @@ uartDefWithFSM rxLine = mdo
 --     base + 1  USR   status (read-only)
 --     base + 2  UBRR  baud rate divisor
 uartUnit
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
     => Word32                          -- ^ peripheral base address
     -> Sig dom Bool                    -- ^ RX serial line
     -> Sig dom (Unsigned 32)           -- ^ bus write address
@@ -463,6 +464,6 @@ uartUnit base rxLine wrAddr wrData wrEn rdAddr = (rdData, txLine, rxIrq, txIrq)
   where
     bus = hdlBusIface wrAddr wrData wrEn rdAddr base
     ((txDataIn, txStrobe, baud), rdData, _spec) =
-        runPeriphDef hdlOps bus (uartDef stat rxBuf)
+        runPeriphNet hdlOps bus (uartDef stat rxBuf)
     (txLine, stat, rxBuf, rxIrq, txIrq) =
         serialFSM baud txDataIn txStrobe rxLine

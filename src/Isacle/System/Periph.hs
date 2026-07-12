@@ -118,20 +118,22 @@ specSize (PeriphSpec fs) = maximum
 --
 --   * 'nullOps' — spec / documentation interpreter; all operations are no-ops.
 --   * @'hdlOps'@ (in "Isacle.System.HdlCircuit") — isacle-hdl backend.
-data PeriphOps (sig :: Type -> Type) dat = PeriphOps
-    { -- | Create a clocked register.
+-- | The __stateful__ operations are monadic (they build clocked hardware in the
+-- backend monad @m@); the __combinational__ operations stay pure.  The isacle-hdl
+-- backend ('hdlOps') realises the stateful ops with the real 'Hdl' 'register' /
+-- 'ram' / 'rom' — no 'SExpr'.  The spec pass ('nullOps') realises them as pure
+-- no-ops in any monad, so it emits no hardware.
+data PeriphOps (sig :: Type -> Type) (m :: Type -> Type) dat = PeriphOps
+    { -- | Create a clocked register (monadic).
       -- @sigReg initVal writeEnable writeData@ → current register value.
-      sigReg :: dat -> sig Bool -> sig dat -> sig dat
-      -- | Create a block RAM/ROM.
+      sigReg :: dat -> sig Bool -> sig dat -> m (sig dat)
+      -- | Create a block RAM/ROM (monadic).
       -- @sigBlockMem size initVals writeEnable writeAddr writeData readAddr@
     , sigBlockMem :: Int -> [Integer]
                   -> sig Bool -> sig (Unsigned 32) -> sig dat -> sig (Unsigned 32)
-                  -> sig dat
-      -- | Create a read-only ROM with a __combinational__ lookup (0-cycle:
-      -- @readAddr@ → @readData@ the same cycle).  Unlike 'sigBlockMem' (a
-      -- synchronous block memory) this is right for an instruction ROM the CPU
-      -- fetches from combinationally.  @sigRom size initVals readAddr@.
-    , sigRom :: Int -> [Integer] -> sig (Unsigned 32) -> sig dat
+                  -> m (sig dat)
+      -- | Create a read-only ROM with a __combinational__ lookup (monadic).
+    , sigRom :: Int -> [Integer] -> sig (Unsigned 32) -> m (sig dat)
       -- | Address less-than: @sigAddrLt addr limit@ is True when @addr < limit@.
     , sigAddrLt :: sig (Unsigned 32) -> Word32 -> sig Bool
       -- | Zero signal (initial read-data accumulator).
@@ -140,21 +142,23 @@ data PeriphOps (sig :: Type -> Type) dat = PeriphOps
     , sigAnd  :: sig Bool -> sig Bool -> sig Bool
       -- | Combinational mux: @sigMux sel thenSig elseSig@.
     , sigMux  :: sig Bool -> sig dat -> sig dat -> sig dat
-      -- | Attach a human-readable name hint to a signal (no-op in spec pass).
-    , sigHint :: String -> sig dat -> sig dat
+      -- | Attach a human-readable name hint to a signal (monadic).
+    , sigHint :: String -> sig dat -> m (sig dat)
     }
 
--- | Spec / documentation ops: all hardware operations are no-ops.
-nullOps :: PeriphOps NullSig dat
+-- | Spec / documentation ops: every operation is a pure no-op in any monad, so
+-- running a peripheral with these emits no hardware — only field metadata is
+-- collected (in the 'PeriphDef' state).
+nullOps :: Applicative m => PeriphOps NullSig m dat
 nullOps = PeriphOps
-    { sigReg      = \_ _ _ -> NullSig
-    , sigBlockMem = \_ _ _ _ _ _ -> NullSig
-    , sigRom      = \_ _ _ -> NullSig
+    { sigReg      = \_ _ _ -> pure NullSig
+    , sigBlockMem = \_ _ _ _ _ _ -> pure NullSig
+    , sigRom      = \_ _ _ -> pure NullSig
     , sigAddrLt   = \_ _ -> NullSig
     , sigZero     = NullSig
     , sigAnd      = \_ _ -> NullSig
     , sigMux      = \_ _ _ -> NullSig
-    , sigHint     = \_ s  -> s
+    , sigHint     = \_ s  -> pure s
     }
 
 -- ---------------------------------------------------------------------------
@@ -197,8 +201,8 @@ nullBusIface = BusIface
 -- PeriphDef: peripheral definition monad
 -- ---------------------------------------------------------------------------
 
-data PeriphEnv sig dat = PeriphEnv
-    { peOps :: PeriphOps sig dat
+data PeriphEnv sig m dat = PeriphEnv
+    { peOps :: PeriphOps sig m dat
     , peBus :: BusIface sig dat
     }
 
@@ -207,27 +211,35 @@ data PeriphAccum sig dat = PeriphAccum
     , paRdData :: sig dat
     }
 
--- | Peripheral description monad.
+-- | Peripheral description monad — a transformer over the backend monad @m@.
 --
 -- @p@   — phantom peripheral kind tag (e.g. @GPIO@, @UART@).
 -- @sig@ — signal family; 'NullSig' for spec, @Sig dom@ for isacle-hdl.
+-- @m@   — backend monad ('NetM' for isacle-hdl; any 'Applicative' for the spec
+--         pass).  Lift its 'Hdl' operations in with 'liftHdl'.
 -- @dat@ — bus data type.
 -- @a@   — return type (the peripheral's physical output signals).
-newtype PeriphDef (p :: Type) (sig :: Type -> Type) dat a = PeriphDef
-    { unPeriphDef :: ReaderT (PeriphEnv sig dat) (State (PeriphAccum sig dat)) a }
+newtype PeriphDef (p :: Type) (sig :: Type -> Type) (m :: Type -> Type) dat a = PeriphDef
+    { unPeriphDef :: ReaderT (PeriphEnv sig m dat) (StateT (PeriphAccum sig dat) m) a }
     deriving newtype (Functor, Applicative, Monad, MonadFix)
 
--- | Run a peripheral definition.
+-- | Lift a backend ('Hdl') computation into a peripheral definition — the seam
+-- where a peripheral runs @register@/@ram@/@rom@/… of the abstract HDL monad.
+liftHdl :: Monad m => m a -> PeriphDef p sig m dat a
+liftHdl = PeriphDef . lift . lift
+
+-- | Run a peripheral definition in the backend monad @m@.
 runPeriphDef
-    :: PeriphOps sig dat
+    :: Monad m
+    => PeriphOps sig m dat
     -> BusIface sig dat
-    -> PeriphDef p sig dat a
-    -> (a, sig dat, PeriphSpec)
-runPeriphDef ops bus def =
-    let env      = PeriphEnv { peOps = ops, peBus = bus }
-        initAcc  = PeriphAccum { paFields = [], paRdData = sigZero ops }
-        (a, acc) = runState (runReaderT (unPeriphDef def) env) initAcc
-    in (a, paRdData acc, PeriphSpec (paFields acc))
+    -> PeriphDef p sig m dat a
+    -> m (a, sig dat, PeriphSpec)
+runPeriphDef ops bus def = do
+    let env     = PeriphEnv { peOps = ops, peBus = bus }
+        initAcc = PeriphAccum { paFields = [], paRdData = sigZero ops }
+    (a, acc) <- runStateT (runReaderT (unPeriphDef def) env) initAcc
+    pure (a, paRdData acc, PeriphSpec (paFields acc))
 
 -- ---------------------------------------------------------------------------
 -- Signal-level circuit operations
@@ -236,35 +248,37 @@ runPeriphDef ops bus def =
 -- | Declare a named registered output at @offset@.
 -- The name is attached to the register flip-flop output in the HDL backend.
 onWrite
-    :: String   -- ^ register name (used as a VHDL signal hint)
+    :: Monad m => String   -- ^ register name (used as a VHDL signal hint)
     -> Word32
     -> dat
-    -> PeriphDef p sig dat (sig dat)
+    -> PeriphDef p sig m dat (sig dat)
 onWrite name off initVal = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let wen  = biWrEqAddr bus off
         wdat = biWrData bus
-        reg  = sigHint ops name (sigReg ops initVal wen wdat)
+    reg0 <- lift (lift (sigReg ops initVal wen wdat))
+    reg  <- lift (lift (sigHint ops name reg0))
     pure (sigMux ops wen wdat reg)
 
 -- | Like 'onWrite' but also returns a write-strobe.
 onWriteStrobe
-    :: String   -- ^ register name (used as a VHDL signal hint)
+    :: Monad m => String   -- ^ register name (used as a VHDL signal hint)
     -> Word32
     -> dat
-    -> PeriphDef p sig dat (sig dat, sig Bool)
+    -> PeriphDef p sig m dat (sig dat, sig Bool)
 onWriteStrobe name off initVal = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let wen  = biWrEqAddr bus off
         wdat = biWrData bus
-        reg  = sigHint ops name (sigReg ops initVal wen wdat)
+    reg0 <- lift (lift (sigReg ops initVal wen wdat))
+    reg  <- lift (lift (sigHint ops name reg0))
     pure (sigMux ops wen wdat reg, wen)
 
 -- | Wire @sig@ into the read-data mux at @offset@.
 onRead
-    :: Word32
+    :: Monad m => Word32
     -> sig dat
-    -> PeriphDef p sig dat ()
+    -> PeriphDef p sig m dat ()
 onRead off sig = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     lift $ modify $ \acc ->
@@ -278,9 +292,9 @@ onRead off sig = PeriphDef $ do
 -- across a separate metadata/logic pair. Returns the register's value signal.
 --
 -- > setpoint <- regField @(Signed 8) 0 "SETPOINT" "target value" 0
-regField :: forall a p sig dat. HdlType a
+regField :: forall a p sig m dat. (HdlType a, Monad m)
          => Word8 -> String -> String -> dat
-         -> PeriphDef p sig dat (sig dat)
+         -> PeriphDef p sig m dat (sig dat)
 regField off name desc initVal = do
     fieldOf @a ReadWrite off name desc
     val <- onWrite name (fromIntegral off) initVal
@@ -290,9 +304,9 @@ regField off name desc initVal = do
 -- | PE2: declare a /typed/ read-only register AND wire its read mux from a
 -- peripheral-supplied signal, single-sourcing the field metadata and the read
 -- logic. For status/input registers the hardware drives.
-roField :: forall a p sig dat. HdlType a
+roField :: forall a p sig m dat. (HdlType a, Monad m)
         => Word8 -> String -> String -> sig dat
-        -> PeriphDef p sig dat ()
+        -> PeriphDef p sig m dat ()
 roField off name desc sig = do
     fieldOf @a ReadOnly off name desc
     onRead (fromIntegral off) sig
@@ -302,17 +316,17 @@ roField off name desc sig = do
 -- ---------------------------------------------------------------------------
 
 -- | Core field declaration: explicit width + representation.
-fieldFull :: RegWidth -> Repr -> RegAccess -> Word8 -> String -> String
-          -> PeriphDef p sig dat ()
+fieldFull :: Monad m => RegWidth -> Repr -> RegAccess -> Word8 -> String -> String
+          -> PeriphDef p sig m dat ()
 fieldFull width repr acc off name desc = PeriphDef $ lift $ modify $ \a ->
     a { paFields = paFields a ++ [FieldSpec off width acc name desc repr []] }
 
 -- | Untyped register declaration: the bits are treated as unsigned.
-field :: RegWidth -> RegAccess -> Word8 -> String -> String
-      -> PeriphDef p sig dat ()
+field :: Monad m => RegWidth -> RegAccess -> Word8 -> String -> String
+      -> PeriphDef p sig m dat ()
 field width = fieldFull width RUnsigned
 
-field8 :: RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+field8 :: Monad m => RegAccess -> Word8 -> String -> String -> PeriphDef p sig m dat ()
 field8 = field RW8
 
 -- | Typed register declaration: the register's software type is given by an
@@ -322,8 +336,8 @@ field8 = field RW8
 -- @uint8_t@ …) — the bus is just wires, the interpretation lives here.
 --
 -- > fieldOf @(Signed 8) ReadWrite 0 "SETPOINT" "Target value"
-fieldOf :: forall a p sig dat. HdlType a
-        => RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+fieldOf :: forall a p sig m dat. (HdlType a, Monad m)
+        => RegAccess -> Word8 -> String -> String -> PeriphDef p sig m dat ()
 fieldOf = fieldFull (regWidthBits (fromIntegral (natVal (Proxy @(Width a)))))
                     (hdlRepr (Proxy @a))
   where
@@ -343,8 +357,8 @@ fieldOf = fieldFull (regWidthBits (fromIntegral (natVal (Proxy @(Width a)))))
 -- > data Ctrl = Ctrl { enable :: Bit, mode :: Unsigned 2, irq :: Bit }
 -- >   deriving (Generic, HdlType)
 -- > fieldRec @Ctrl ReadWrite 0 "CTRL" "control register"
-fieldRec :: forall a p sig dat. (HdlType a, Generic a, GFields (Rep a))
-         => RegAccess -> Word8 -> String -> String -> PeriphDef p sig dat ()
+fieldRec :: forall a p sig m dat. (HdlType a, Generic a, GFields (Rep a), Monad m)
+         => RegAccess -> Word8 -> String -> String -> PeriphDef p sig m dat ()
 fieldRec acc off name desc = PeriphDef $ lift $ modify $ \st ->
     st { paFields = paFields st
                  ++ [FieldSpec off width acc name desc (hdlRepr (Proxy @a)) bfs] }
@@ -358,8 +372,8 @@ fieldRec acc off name desc = PeriphDef $ lift $ modify $ \st ->
     bfs = [ BitField (fromIntegral (plPos p)) (fromIntegral (plHi p)) acc (plName p) ""
           | p <- layoutPlacements layout ]
 
-register :: RegWidth -> Word8 -> String -> String -> [BitField]
-         -> PeriphDef p sig dat ()
+register :: Monad m => RegWidth -> Word8 -> String -> String -> [BitField]
+         -> PeriphDef p sig m dat ()
 register width off name desc bfs = PeriphDef $ lift $ modify $ \a ->
     a { paFields = paFields a ++ [FieldSpec off width ReadWrite name desc RUnsigned bfs] }
 
@@ -382,25 +396,25 @@ data ROM
 -- | Block RAM peripheral for the isacle-hdl path.
 -- Occupies @size@ entries of the bus address space starting at the peripheral
 -- base.  Write is synchronous; read is asynchronous (combinational).
-blockRamDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+blockRamDef :: Monad m => Int -> [Integer] -> PeriphDef p sig m dat ()
 blockRamDef size initVals = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let relRd  = biRelRdAddr bus
         relWr  = biRelWrAddr bus
         rdSel  = sigAddrLt ops relRd (fromIntegral size)
         wrEn'  = sigAnd ops (biWrEn bus) (sigAddrLt ops relWr (fromIntegral size))
-        rdData = sigBlockMem ops size initVals wrEn' relWr (biWrData bus) relRd
+    rdData <- lift (lift (sigBlockMem ops size initVals wrEn' relWr (biWrData bus) relRd))
     lift $ modify $ \acc ->
         acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }
 
 -- | ROM peripheral for the isacle-hdl path (synchronous block memory).
-blockRomDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+blockRomDef :: Monad m => Int -> [Integer] -> PeriphDef p sig m dat ()
 blockRomDef size initVals = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let relRd  = biRelRdAddr bus
         rdSel  = sigAddrLt ops relRd (fromIntegral size)
         noWr   = sigAddrLt ops relRd 0   -- unsigned < 0 is always False
-        rdData = sigBlockMem ops size initVals noWr relRd (sigZero ops) relRd
+    rdData <- lift (lift (sigBlockMem ops size initVals noWr relRd (sigZero ops) relRd))
     lift $ modify $ \acc ->
         acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }
 
@@ -408,11 +422,11 @@ blockRomDef size initVals = PeriphDef $ do
 -- 'sigRom' → a combinational @NRom@).  This is what an instruction/code ROM must
 -- be — the CPU fetches combinationally (the opcode must be stable the cycle the
 -- address is driven), unlike a data-bus block ROM which may be synchronous.
-romCombDef :: Int -> [Integer] -> PeriphDef p sig dat ()
+romCombDef :: Monad m => Int -> [Integer] -> PeriphDef p sig m dat ()
 romCombDef size initVals = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let relRd  = biRelRdAddr bus
         rdSel  = sigAddrLt ops relRd (fromIntegral size)
-        rdData = sigRom ops size initVals relRd
+    rdData <- lift (lift (sigRom ops size initVals relRd))
     lift $ modify $ \acc ->
         acc { paRdData = sigMux ops rdSel rdData (paRdData acc) }

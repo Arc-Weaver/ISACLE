@@ -12,7 +12,7 @@ import Data.Word (Word32)
 import Hdl.Sig (KnownDom, HdlType, Sig)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -33,9 +33,9 @@ data GPIO
 -- @pinsIn@ is the current physical pin-input signal.
 -- Returns @(PORT latch signal, DDR signal)@.
 gpioDef
-    :: (Num dat)
+    :: (Num dat, Monad m)
     => sig dat                                    -- ^ physical pin inputs
-    -> PeriphDef GPIO sig dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
+    -> PeriphDef GPIO sig m dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
 gpioDef pinsIn = do
     -- Typed PE2 combinators: each register's name, offset and type are
     -- single-sourced, and its read/write logic is wired in the same call.
@@ -62,5 +62,5 @@ gpioUnit
     -> (Sig dom dat, Sig dom dat, Sig dom dat)  -- ^ (rdData, PORT, DDR)
 gpioUnit base pinsIn wrAddr wrData wrEn rdAddr =
     let bus              = hdlBusIface wrAddr wrData wrEn rdAddr base
-        ((port, ddr), rdData, _spec) = runPeriphDef hdlOps bus (gpioDef pinsIn)
+        ((port, ddr), rdData, _spec) = runPeriphNet hdlOps bus (gpioDef pinsIn)
     in (rdData, port, ddr)

@@ -98,7 +98,7 @@ import Isacle.System.Bus (Bus(..), BusMaster(..))
 import Isacle.System.BusArch
     (BusArch(..), SimpleBus(..), MasterReq(..), SlaveResp(..), BusChild)
 import Isacle.System.HdlCircuit
-    ( hdlOps, busPortIface, HdlPhys(..)
+    ( hdlOps, runPeriphNet, busPortIface, HdlPhys(..)
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
     )
 import Isacle.Periph.Interrupt (interruptArbiter)
@@ -186,7 +186,7 @@ emptyBuildWith env = emptyBuild { sbEnv = env }
 -- agnostic (any @proto@), so they attach to any bus.
 data PeriphToken (proto :: Type) p dom dat a = PeriphToken
     { ptName     :: String
-    , ptDef      :: PeriphDef p (Sig dom) dat a
+    , ptDef      :: PeriphDef p (Sig dom) NetM dat a
     , ptAddrSize :: Word32
     }
 
@@ -360,18 +360,19 @@ attachPeripheral base token = BusDSL $ do
         -- doesn't depend on the request values.
         specBus = busPortIface (mqReq master) (mqWe master)
                                (mqAddr master) (mqWData master) base
-        (_, _, spec) = runPeriphDef hdlOps specBus (ptDef token)
+        -- Spec pass in an isolated NetM (nodes discarded); only the metadata is kept.
+        (_, _, spec) = runPeriphNet hdlOps specBus (ptDef token)
         size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
         entry = PeriphEntry { peName = nm, peBase = base, peSpec = spec }
         -- Top-level names for the physical outputs: @<instance>_<port>@.
         physNames = [ nm ++ "_" ++ portName ps | ps <- portSpecs (Proxy @a) ]
         -- The peripheral's behaviour as a sub-entity body: decode the bus port,
-        -- return its read-data signal and physical-output bundle.
+        -- return its read-data signal and physical-output bundle (real emission).
         body :: SlavePort dom dat -> NetM (Sig dom dat, a)
-        body sp =
+        body sp = do
             let busP = busPortIface (spReq sp) (spWe sp) (spAddr sp) (spWData sp) base
-                (phys, rd, _) = runPeriphDef hdlOps busP (ptDef token)
-            in pure (rd, phys)
+            (phys, rd, _) <- runPeriphDef hdlOps busP (ptDef token)
+            pure (rd, phys)
 
     -- Instantiate the peripheral as its own named sub-entity (e.g. "gpio0" →
     -- gpio0.vhd) with the entity tooling; the broadcast master drives its ports.
