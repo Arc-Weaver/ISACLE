@@ -11,7 +11,7 @@ module Isacle.Periph.GPIO
 
 import Prelude hiding (read)
 import Data.Word (Word32)
-import Hdl.Sig (KnownDom, HdlType, Sig, (.&.), (.|.), sigComplement)
+import Hdl.Sig (KnownDom, HdlType, Sig, Signal, (.&.), (.|.), sigComplement)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
 import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface, Peripheral, mkPeripheral)
@@ -68,9 +68,9 @@ gpioDef pinsIn = do
 --
 --   offset 0  data  RW  output latch / pin read-back
 --   offset 1  dir   RW  direction (1 = output ⇒ drives pin_out, else input)
-gpio :: KnownDom dom
-     => Sig dom (Unsigned 8)          -- ^ physical pin input (from the caller)
-     -> Peripheral dom (Unsigned 8) (Sig dom (Unsigned 8), Sig dom (Unsigned 8))
+gpio :: (Signal s, Monad m)
+     => s dom (Unsigned 8)          -- ^ physical pin input (from the caller)
+     -> Peripheral s dom m (Unsigned 8) (s dom (Unsigned 8), s dom (Unsigned 8))
 gpio gpioIn = mkPeripheral "gpio" $ do
     dataReg   <- declareRegVector @8 "data"
     dirReg    <- declareRegVector @8 "dir"

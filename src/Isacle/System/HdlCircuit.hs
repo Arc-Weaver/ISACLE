@@ -21,6 +21,7 @@ module Isacle.System.HdlCircuit
 
 import Prelude
 import Control.Monad (zipWithM_)
+import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word32)
 import GHC.Generics (Generic)
@@ -77,25 +78,26 @@ runPeriphNet ops bus def = let (r, _, _) = runNetM (runPeriphDef ops bus def) in
 data AnyPeriph
 
 -- | A peripheral __object__: a name plus a body that decodes the (relative) bus
--- and produces its physical outputs @o@.  Physical inputs are declared inside the
--- body with 'input'; physical outputs are the body's return.  Built by
--- 'mkPeripheral', placed into a system by @instantiate@, wired to a bus by
--- @attachPeripheral@ — see "Isacle.System.SystemDSL".
-data Peripheral dom dat o = Peripheral
+-- and produces its physical outputs @o@.  Backend-abstract — the body is written
+-- over the 'Signal' family @s@ and monad @m@; a concrete backend (@s = 'Sig'@,
+-- @m = 'NetM'@) is only chosen when it is @instantiate@d.  Physical inputs are
+-- parameters of the peripheral-defining function (captured in the body); physical
+-- outputs are the body's return.
+data Peripheral (s :: k -> Type -> Type) (dom :: k) (m :: Type -> Type) dat o = Peripheral
     { perName :: String
-    , perBody :: PeriphDef AnyPeriph (Sig dom) NetM dat o
+    , perBody :: PeriphDef AnyPeriph (s dom) m dat o
     }
 
--- | Build a peripheral object from a name and a body.  Physical __inputs__ are
--- parameters of the peripheral-defining function (captured in the body); the body
--- uses 'declareRegVector'/'write'/'read' for its registers and __returns__ its
--- physical outputs.
+-- | Build a peripheral object from a name and a body.  The body uses
+-- 'declareRegVector'/'write'/'read' for its registers over the abstract 'Signal'
+-- family, takes its physical __inputs__ as parameters (captured), and __returns__
+-- its physical outputs.
 --
 -- > gpio gpioIn = mkPeripheral "gpio" $ do
 -- >     dataReg <- declareRegVector @8 "data"; …; return (writeDir, writeData)
 mkPeripheral :: String
-             -> PeriphDef AnyPeriph (Sig dom) NetM dat o
-             -> Peripheral dom dat o
+             -> PeriphDef AnyPeriph (s dom) m dat o
+             -> Peripheral s dom m dat o
 mkPeripheral = Peripheral
 
 -- ---------------------------------------------------------------------------

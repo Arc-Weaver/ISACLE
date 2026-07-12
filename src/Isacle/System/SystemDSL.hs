@@ -427,7 +427,7 @@ attachPeripheral base token = BusDSL $ do
 -- 'attachPeripheral'.  This owns entity construction + physical I/O — attach owns
 -- only the bus.
 instantiate :: forall dom dat o. (KnownDom dom, HdlType dat, Num dat)
-            => Peripheral dom dat o -> SysNet (BusPeripheral dom dat, o)
+            => Peripheral Sig dom NetM dat o -> SysNet (BusPeripheral dom dat, o)
 instantiate (Peripheral name body) = SysNet $ lift $ do
     req  <- freshSig :: NetM (Sig dom Bool)
     we   <- freshSig :: NetM (Sig dom Bool)
