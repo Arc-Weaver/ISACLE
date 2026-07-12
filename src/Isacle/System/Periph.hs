@@ -10,6 +10,7 @@ module Isacle.System.Periph
     , nullBusIface
       -- * Peripheral definition monad
     , PeriphDef
+    , liftHdl
     , runPeriphDef
       -- * Signal-level register operations
     , onWrite

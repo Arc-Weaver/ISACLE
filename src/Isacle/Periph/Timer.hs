@@ -8,8 +8,6 @@ module Isacle.Periph.Timer
     , counterFSM
       -- * Combined PeriphDef with FSM wired in
     , timerDefWithFSM
-      -- * Standalone circuit wrapper
-    , timerUnit
     ) where
 
 import Prelude
@@ -19,6 +17,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 
 import Hdl.Net
+import Hdl.Class (regS)
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
@@ -89,40 +88,24 @@ counterFSM
     -> Sig dom dat            -- ^ OCR  (from timerDef)
     -> Sig dom dat            -- ^ TCNT preset value (from timerDef onWriteStrobe)
     -> Sig dom Bool           -- ^ TCNT write strobe (from timerDef)
-    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
-counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
+    -> NetM (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
+counterFSM tick tccr ocr tcntPreset tcntWritten = mdo
+    -- The counter register — the abstract 'regS' (deferred feedback); @mdo@ ties
+    -- @cnt@ to the next value it computes from itself.
+    cnt <- regS (0 :: dat) cntNext
+    let ctcMode = sigBit 0 tccr
+        atTop   = cnt .==. ocr
+        atMax   = cnt .==. maxVal
+        cntInc  = cnt + 1
+        cntTick = mux (ctcMode .&&. atTop) 0
+                      (mux (sigNot ctcMode .&&. atMax) 0 cntInc)
+        cntNext = mux tcntWritten tcntPreset (mux tick cntTick cnt)
+        ovf = tick .&&. sigNot ctcMode .&&. atMax .&&. sigNot tcntWritten
+        cmp = tick .&&. ctcMode        .&&. atTop .&&. sigNot tcntWritten
+    pure (cnt, ovf, cmp)
   where
-    w       = fromIntegral (natVal (Proxy @(Width dat)))
-    domInfo = domId (Proxy @dom)
-    maxVal  = fromInteger (2^w - 1) :: Sig dom dat
-
-    -- Counter register with deferred feedback.
-    cnt = SExpr $ do
-        outWid <- freshWire
-        let cntSig     = SWire outWid :: Sig dom dat
-            cntCtcMode = sigBit 0 tccr
-            cntAtTop   = cntSig .==. ocr
-            cntAtMax   = cntSig .==. maxVal
-            cntInc     = cntSig + 1
-            cntTick    = mux (cntCtcMode .&&. cntAtTop)
-                             0
-                             (mux (sigNot cntCtcMode .&&. cntAtMax)
-                                  0
-                                  cntInc)
-            cntNext    = mux tcntWritten tcntPreset (mux tick cntTick cntSig)
-
-        defer $ do
-            nextWid <- materialize cntNext
-            let initBits = SomeBits 0 w
-            emit $ NReg outWid nextWid Nothing initBits domInfo
-        pure outWid
-
-    ctcMode = sigBit 0 tccr
-    atTop   = cnt .==. ocr
-    atMax   = cnt .==. maxVal
-
-    ovf = tick .&&. sigNot ctcMode .&&. atMax  .&&. sigNot tcntWritten
-    cmp = tick .&&. ctcMode        .&&. atTop  .&&. sigNot tcntWritten
+    w      = fromIntegral (natVal (Proxy @(Width dat)))
+    maxVal = fromInteger (2^w - 1) :: Sig dom dat
 
 -- ---------------------------------------------------------------------------
 -- Combined PeriphDef with counter FSM
@@ -132,38 +115,18 @@ counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
 -- Use this as the @ptDef@ in a 'PeriphToken' so that 'attachPeripheral'
 -- gets real overflow and compare-match outputs instead of stubs.
 timerDefWithFSM
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
+    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => Sig dom Bool              -- ^ tick / count enable
-    -> PeriphDef Timer (Sig dom) m dat (Sig dom Bool, Sig dom Bool)
+    -> PeriphDef Timer (Sig dom) NetM dat (Sig dom Bool, Sig dom Bool)
                                  -- ^ (ovfIrq, cmpIrq)
 timerDefWithFSM tick = mdo
     (tccr, ocr, tcntPreset, tcntWritten) <- timerDef cnt
-    let (cnt, ovf, cmp) = counterFSM tick tccr ocr tcntPreset tcntWritten
+    (cnt, ovf, cmp) <- liftHdl (counterFSM tick tccr ocr tcntPreset tcntWritten)
     return (ovf, cmp)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
--- | Memory-mapped timer built from 'timerDef' + 'counterFSM'.
---
---   Register layout:
---     base + 0  TCCR  control
---     base + 1  TCNT  counter (write = preset, read = current value)
---     base + 2  OCR   output compare
-timerUnit
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat), MonadFix m)
-    => Word32                          -- ^ peripheral base address
-    -> Sig dom Bool                    -- ^ tick / count enable
-    -> Sig dom (Unsigned 32)           -- ^ bus write address
-    -> Sig dom dat                     -- ^ bus write data
-    -> Sig dom Bool                    -- ^ bus write enable
-    -> Sig dom (Unsigned 32)           -- ^ bus read address
-    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (rdData, ovfIrq, cmpIrq)
-timerUnit base tick wrAddr wrData wrEn rdAddr = (rdData, ovfIrq, cmpIrq)
-  where
-    bus = hdlBusIface wrAddr wrData wrEn rdAddr base
-    ((tccr, ocr, tcntPreset, tcntWritten), rdData, _spec) =
-        runPeriphNet hdlOps bus (timerDef cnt)
-    (cnt, ovfIrq, cmpIrq) =
-        counterFSM tick tccr ocr tcntPreset tcntWritten
+-- (The legacy standalone @timerUnit@ wrapper was removed — use 'timerDefWithFSM'
+--  as a 'PeriphToken' def via 'createTimer'.)
