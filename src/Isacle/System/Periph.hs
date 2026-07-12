@@ -19,13 +19,14 @@ module Isacle.System.Periph
       -- * Typed field + logic in one (PE2)
     , regField
     , roField
-      -- * Register handles (PE3): declare + writeAction + readAction
+      -- * Register handles (PE3): declare + write + read
     , Reg(..)
     , declareReg
+    , declareRegVector
     , declareRegUnsigned
     , declareRegSigned
-    , writeAction
-    , readAction
+    , write
+    , read
     , toBusData
       -- * Register / field declarations (metadata)
     , field
@@ -52,7 +53,7 @@ module Isacle.System.Periph
     , romCombDef
     ) where
 
-import Prelude
+import Prelude hiding (read)
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word8, Word32)
@@ -380,6 +381,14 @@ declareRegUnsigned :: forall n p sig m dat. (KnownNat n, HdlType (Unsigned n), M
                    => String -> PeriphDef p sig m dat (Reg (Unsigned n))
 declareRegUnsigned = declareReg @(Unsigned n)
 
+-- | Declare a register as a bit-vector of width @n@ — an unsigned word, the
+-- natural type for bit-masking peripherals (GPIO direction/data, etc.).
+--
+-- > dataReg <- declareRegVector @8 "data"   -- Reg (Unsigned 8)
+declareRegVector :: forall n p sig m dat. (KnownNat n, HdlType (Unsigned n), Monad m)
+                 => String -> PeriphDef p sig m dat (Reg (Unsigned n))
+declareRegVector = declareReg @(Unsigned n)
+
 -- | Declare a signed register of the given bit-width at the next free offset —
 -- the datapath is interpreted signed (C-header @int8_t@ etc.).
 --
@@ -399,9 +408,9 @@ rwOfBits n  = error ("declareReg: unsupported width " ++ show n
 -- this register's offset (initialised to 0), returning its current value /typed/
 -- as @a@ (reinterpreted from the bus data at the seam).  The flip-flop is named
 -- after the register.  Feed the result on to 'liftHdl' logic and/or 'readAction'.
-writeAction :: forall a p sig m dat. (HdlType a, Num dat, Monad m)
-            => Reg a -> PeriphDef p sig m dat (sig a)
-writeAction reg = PeriphDef $ do
+write :: forall a p sig m dat. (HdlType a, Num dat, Monad m)
+      => Reg a -> PeriphDef p sig m dat (sig a)
+write reg = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let wen  = biWrEqAddr bus (regOffset reg)
         wdat = biWrData bus
@@ -412,9 +421,9 @@ writeAction reg = PeriphDef $ do
 -- | The read side of a register: reinterpret the /typed/ value @sig a@ back to
 -- the bus data and wire it into the read-data mux at this register's offset —
 -- the value the CPU reads back at it.
-readAction :: forall a p sig m dat. (HdlType dat, Monad m)
-           => Reg a -> sig a -> PeriphDef p sig m dat ()
-readAction reg s = PeriphDef $ do
+read :: forall a p sig m dat. (HdlType dat, Monad m)
+     => Reg a -> sig a -> PeriphDef p sig m dat ()
+read reg s = PeriphDef $ do
     PeriphEnv { peOps = ops, peBus = bus } <- ask
     let sDat = sigReinterp ops s :: sig dat
     lift $ modify $ \acc ->

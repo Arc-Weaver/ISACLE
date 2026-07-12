@@ -7,7 +7,7 @@ module Isacle.Periph.GPIO
     , gpioUnit
     ) where
 
-import Prelude
+import Prelude hiding (read)
 import Data.Word (Word32)
 import Hdl.Sig (KnownDom, HdlType, Sig)
 import Hdl.Prim  (Unsigned)
@@ -44,12 +44,12 @@ gpioDef pinsIn = do
     -- read-back as separate actions.  @writeAction@ hands back a typed
     -- @sig (Unsigned 8)@; the read-back here just echoes it (a plain RW register),
     -- but 'liftHdl' logic could sit between 'writeAction' and 'readAction'.
-    ddr  <- declareRegUnsigned @8 "DDR"
-    ddrV <- writeAction ddr
-    readAction ddr ddrV
-    port <- declareRegUnsigned @8 "PORT"
-    portV <- writeAction port
-    readAction port portV
+    ddr  <- declareRegVector @8 "DDR"
+    ddrV <- write ddr
+    read ddr ddrV
+    port <- declareRegVector @8 "PORT"
+    portV <- write port
+    read port portV
     -- Reinterpret the typed register values back to the bus data width for the
     -- physical output bundle the system wires generically.
     (,) <$> toBusData portV <*> toBusData ddrV
