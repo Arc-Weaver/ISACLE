@@ -86,10 +86,8 @@ uartDef stat rxData = do
 --   rxAcc    dat-bit accumulator
 --   rxBuf    dat-bit RX buffer  (rxBufVld 1-bit valid flag)
 
--- | Logical-AND two Bool signals; short alias.
-(.&.) :: Sig dom Bool -> Sig dom Bool -> Sig dom Bool
-(.&.) = (.&&.)
-infixr 3 .&.
+-- (The local Bool @.&.@ alias was removed — 'Hdl.Types..&.' now provides bitwise
+--  AND that also covers @Bool@.)
 
 -- | 'mux' with the branches swapped for readability (if cond then t else f).
 ifSig :: HdlType a => Sig dom Bool -> Sig dom a -> Sig dom a -> Sig dom a

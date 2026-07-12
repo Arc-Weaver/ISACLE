@@ -9,6 +9,9 @@ module Hdl.Types
     , (.<.)
     , (.&&.)
     , (.||.)
+    , (.&.)
+    , (.|.)
+    , sigComplement
     , sigAnd
     , sigOr
     , sigNot
@@ -55,7 +58,8 @@ module Hdl.Types
 
 import Prelude
 import GHC.TypeLits (KnownNat, Nat, natVal, type (+), Symbol, KnownSymbol, symbolVal)
-import Data.Bits ((.&.), (.|.), shiftL, shiftR)
+import Data.Bits (shiftL, shiftR)
+import qualified Data.Bits as B
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
 import GHC.Generics
@@ -140,6 +144,21 @@ sigOr = sigPrim2 POr
 
 sigNot :: Signal sig => sig dom Bool -> sig dom Bool
 sigNot = sigPrim1 PNot
+
+-- | Bitwise AND/OR/NOT on a multi-bit word (same 'PAnd'/'POr'/'PNot' primitives —
+-- @numeric_std@ overloads @and@/@or@/@not@ bitwise on @unsigned@).  For the
+-- masking logic peripherals do (GPIO pin/direction mux, etc.).
+infixr 3 .&.
+(.&.) :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
+(.&.) = sigPrim2 PAnd
+
+infixr 2 .|.
+(.|.) :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
+(.|.) = sigPrim2 POr
+
+-- | Bitwise complement of a multi-bit word.
+sigComplement :: (Signal sig, HdlType a) => sig dom a -> sig dom a
+sigComplement = sigPrim1 PNot
 
 -- | Multiplexer: @mux sel t f@ chooses @t@ when @sel@ is high, @f@ otherwise.
 mux :: (Signal sig, HdlType a) => sig dom Bool -> sig dom a -> sig dom a -> sig dom a
@@ -283,8 +302,8 @@ instance HdlType a => GHdlType (K1 r a) where
 
 instance (GHdlType f, GHdlType g) => GHdlType (f :*: g) where
     gWidth            = gWidth @f + gWidth @g
-    gToBits (x :*: y) = (gToBits x `shiftL` gWidth @g) .|. gToBits y
-    gFromBits n       = gFromBits (n `shiftR` wg) :*: gFromBits (n .&. ((1 `shiftL` wg) - 1))
+    gToBits (x :*: y) = (gToBits x `shiftL` gWidth @g) B..|. gToBits y
+    gFromBits n       = gFromBits (n `shiftR` wg) :*: gFromBits (n B..&. ((1 `shiftL` wg) - 1))
       where wg = gWidth @g
 
 -- | Derived 'toBits' for a record: pack fields MSB-first in field order.
