@@ -374,22 +374,16 @@ rwOfBits n  = error ("declareReg: unsupported width " ++ show n
                      ++ " bits (expected 8, 16, or 32)")
 
 -- | The write side of a register: a clocked register that captures bus writes to
--- this register's offset (initialised to 0), returning its current value.  Feed
--- the result on to 'liftHdl' logic and/or straight to 'readAction'.  The
--- flip-flop carries the register's name with a @_q@ suffix (its stored Q output),
--- leaving the bare name for the bus-visible read value wired by 'readAction'.
+-- this register's offset (initialised to 0), returning its current value.  The
+-- flip-flop is named after the register (from its 'declareReg' name).  Feed the
+-- result on to 'liftHdl' logic and/or straight to 'readAction'.
 writeAction :: (Num dat, Monad m) => Reg dat -> PeriphDef p sig m dat (sig dat)
-writeAction reg = onWrite (regName reg ++ "_q") (regOffset reg) 0
+writeAction reg = onWrite (regName reg) (regOffset reg) 0
 
--- | The read side of a register: name @sig@ with the register's name and wire it
--- into the read-data mux at this register's offset — the value the CPU reads back
--- carries the register's name in the emitted HDL.
+-- | The read side of a register: wire @sig@ into the read-data mux at this
+-- register's offset — the value the CPU reads back at it.
 readAction :: Monad m => Reg dat -> sig dat -> PeriphDef p sig m dat ()
-readAction reg sig = PeriphDef $ do
-    PeriphEnv { peOps = ops, peBus = bus } <- ask
-    named <- lift (lift (sigHint ops (regName reg) sig))
-    lift $ modify $ \acc ->
-        acc { paRdData = sigMux ops (biRdEqAddr bus (regOffset reg)) named (paRdData acc) }
+readAction reg = onRead (regOffset reg)
 
 -- ---------------------------------------------------------------------------
 -- Structural metadata declarations
