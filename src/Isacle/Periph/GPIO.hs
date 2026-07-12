@@ -33,23 +33,26 @@ data GPIO
 -- @pinsIn@ is the current physical pin-input signal.
 -- Returns @(PORT latch signal, DDR signal)@.
 gpioDef
-    :: (Num dat, Monad m)
+    :: (Num dat, HdlType dat, Monad m)
     => sig dat                                    -- ^ physical pin inputs
     -> PeriphDef GPIO sig m dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
 gpioDef pinsIn = do
     -- PIN: read-only, driven by the sampled physical inputs (offset 0).
     roField @(Unsigned 8) 0 "PIN" "Sampled physical inputs" pinsIn
     -- DDR / PORT: read-write registers built with the PE3 handle API — declare
-    -- the register, then wire its write side and read-back as separate actions.
-    -- Here the read-back simply echoes the written value (a plain RW register);
-    -- 'liftHdl' logic could sit between 'writeAction' and 'readAction' instead.
-    ddr  <- declareRegUnsigned 8 "DDR"
+    -- the register (its width/type come from @\@8@), then wire its write side and
+    -- read-back as separate actions.  @writeAction@ hands back a typed
+    -- @sig (Unsigned 8)@; the read-back here just echoes it (a plain RW register),
+    -- but 'liftHdl' logic could sit between 'writeAction' and 'readAction'.
+    ddr  <- declareRegUnsigned @8 "DDR"
     ddrV <- writeAction ddr
     readAction ddr ddrV
-    port <- declareRegUnsigned 8 "PORT"
+    port <- declareRegUnsigned @8 "PORT"
     portV <- writeAction port
     readAction port portV
-    return (portV, ddrV)
+    -- Reinterpret the typed register values back to the bus data width for the
+    -- physical output bundle the system wires generically.
+    (,) <$> toBusData portV <*> toBusData ddrV
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper

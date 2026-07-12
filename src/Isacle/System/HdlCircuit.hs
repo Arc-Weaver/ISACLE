@@ -54,6 +54,7 @@ hdlOps = PeriphOps
     , sigAnd      = (.&&.)
     , sigMux      = mux
     , sigHint     = named
+    , sigReinterp = sigReinterpret
     }
 
 -- | Run a peripheral definition in an __isolated__ 'NetM' and return the pure

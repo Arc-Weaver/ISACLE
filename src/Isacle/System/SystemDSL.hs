@@ -228,7 +228,7 @@ class MonadFix m => SysDSL m where
                      => m (IrqDriver dom caw)
     createUart       :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom Bool -> m (PeriphToken proto UART dom dat (UartPhys dom))
-    createGpio       :: (Num dat, Num (Sig dom dat))
+    createGpio       :: (HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom dat -> m (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
     createTimer      :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom Bool -> m (PeriphToken proto Timer dom dat (TimerPhys dom))
@@ -756,7 +756,7 @@ createUartImpl name rxPin = pure $ PeriphToken
 -- | Create a GPIO peripheral token.
 -- Fully implemented: DDR, PORT, and PIN registers all synthesize correctly.
 createGpioImpl
-    :: (Num dat, Num (Sig dom dat))
+    :: (HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> Sig dom dat                   -- ^ input pin bus
     -> SysNet (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
