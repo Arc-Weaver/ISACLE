@@ -11,7 +11,6 @@ module Isacle.System.HdlCircuit
       -- * Peripheral objects
     , Peripheral(..)
     , mkPeripheral
-    , input
       -- * Named physical-output bundles
     , GpioPhys(..)
     , UartPhys(..)
@@ -30,9 +29,9 @@ import GHC.TypeLits (natVal)
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Types (Named(..))
-import Hdl.Class (regEnS, ram, rom, named, inputS)
+import Hdl.Class (regEnS, ram, rom, named)
 import Hdl.Prim (Unsigned)
-import Isacle.System.Periph (PeriphOps(..), BusIface(..), PeriphDef, PeriphSpec, runPeriphDef, liftHdl)
+import Isacle.System.Periph (PeriphOps(..), BusIface(..), PeriphDef, PeriphSpec, runPeriphDef)
 
 -- ---------------------------------------------------------------------------
 -- HDL ops
@@ -87,21 +86,17 @@ data Peripheral dom dat o = Peripheral
     , perBody :: PeriphDef AnyPeriph (Sig dom) NetM dat o
     }
 
--- | Build a peripheral object from a name and a body.  The body uses
--- 'declareRegVector'/'write'/'read' for its registers and 'input' for its
--- physical inputs, and returns its physical outputs.
+-- | Build a peripheral object from a name and a body.  Physical __inputs__ are
+-- parameters of the peripheral-defining function (captured in the body); the body
+-- uses 'declareRegVector'/'write'/'read' for its registers and __returns__ its
+-- physical outputs.
+--
+-- > gpio gpioIn = mkPeripheral "gpio" $ do
+-- >     dataReg <- declareRegVector @8 "data"; …; return (writeDir, writeData)
 mkPeripheral :: String
              -> PeriphDef AnyPeriph (Sig dom) NetM dat o
              -> Peripheral dom dat o
 mkPeripheral = Peripheral
-
--- | Declare a physical __input__ port of the peripheral and return its signal —
--- the dual of returning a physical output.  Allocates a real input port (reusing
--- 'inputS'), so a GPIO's @gpio_in@ pins actually enter the design instead of
--- collapsing to a captured constant.
-input :: (KnownDom dom, HdlType a)
-      => String -> PeriphDef p (Sig dom) NetM dat (Sig dom a)
-input name = liftHdl (inputS name)
 
 -- ---------------------------------------------------------------------------
 -- Named physical-output bundles

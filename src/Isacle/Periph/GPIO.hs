@@ -14,7 +14,7 @@ import Data.Word (Word32)
 import Hdl.Sig (KnownDom, HdlType, Sig, (.&.), (.|.), sigComplement)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface, Peripheral, mkPeripheral, input)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface, Peripheral, mkPeripheral)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -69,16 +69,16 @@ gpioDef pinsIn = do
 --   offset 0  data  RW  output latch / pin read-back
 --   offset 1  dir   RW  direction (1 = output ⇒ drives pin_out, else input)
 gpio :: KnownDom dom
-     => Peripheral dom (Unsigned 8) (Sig dom (Unsigned 8), Sig dom (Unsigned 8))
-gpio = mkPeripheral "gpio" $ do
-    pin     <- input "gpio_in"
-    dataReg <- declareRegVector @8 "data"
-    dirReg  <- declareRegVector @8 "dir"
-    dir     <- write dirReg
-    dat     <- write dataReg
-    read dataReg ((pin .&. sigComplement dir) .|. (dat .&. dir))
-    read dirReg  dir
-    pure (dir, dat)   -- (oe, pin_out)
+     => Sig dom (Unsigned 8)          -- ^ physical pin input (from the caller)
+     -> Peripheral dom (Unsigned 8) (Sig dom (Unsigned 8), Sig dom (Unsigned 8))
+gpio gpioIn = mkPeripheral "gpio" $ do
+    dataReg   <- declareRegVector @8 "data"
+    dirReg    <- declareRegVector @8 "dir"
+    writeDir  <- write dirReg
+    writeData <- write dataReg
+    read dataReg ((gpioIn .&. sigComplement writeDir) .|. (writeData .&. writeDir))
+    read dirReg  writeDir
+    return (writeDir, writeData)   -- (oe, pin_out)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper

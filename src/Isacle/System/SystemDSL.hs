@@ -39,7 +39,6 @@ module Isacle.System.SystemDSL
       -- * Peripheral objects (entity/bus split)
     , Peripheral
     , mkPeripheral
-    , input
     , BusPeripheral(..)
     , instantiate
     , attachPeripheral'
@@ -107,7 +106,7 @@ import Isacle.System.BusArch
 import Isacle.System.HdlCircuit
     ( hdlOps, runPeriphNet, busPortIface, HdlPhys(..)
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
-    , Peripheral(..), mkPeripheral, input
+    , Peripheral(..), mkPeripheral
     )
 import Isacle.Periph.Interrupt (interruptArbiter)
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
