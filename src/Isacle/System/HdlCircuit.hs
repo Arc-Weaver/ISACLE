@@ -8,6 +8,10 @@ module Isacle.System.HdlCircuit
     , runPeriphNet
     , hdlBusIface
     , busPortIface
+      -- * Peripheral objects
+    , Peripheral(..)
+    , mkPeripheral
+    , input
       -- * Named physical-output bundles
     , GpioPhys(..)
     , UartPhys(..)
@@ -26,9 +30,9 @@ import GHC.TypeLits (natVal)
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Types (Named(..))
-import Hdl.Class (regEnS, ram, rom, named)
+import Hdl.Class (regEnS, ram, rom, named, inputS)
 import Hdl.Prim (Unsigned)
-import Isacle.System.Periph (PeriphOps(..), BusIface(..), PeriphDef, PeriphSpec, runPeriphDef)
+import Isacle.System.Periph (PeriphOps(..), BusIface(..), PeriphDef, PeriphSpec, runPeriphDef, liftHdl)
 
 -- ---------------------------------------------------------------------------
 -- HDL ops
@@ -64,6 +68,40 @@ hdlOps = PeriphOps
 runPeriphNet :: PeriphOps (Sig dom) NetM dat -> BusIface (Sig dom) dat
              -> PeriphDef p (Sig dom) NetM dat a -> (a, Sig dom dat, PeriphSpec)
 runPeriphNet ops bus def = let (r, _, _) = runNetM (runPeriphDef ops bus def) in r
+
+-- ---------------------------------------------------------------------------
+-- Peripheral objects — mkPeripheral / input
+-- ---------------------------------------------------------------------------
+
+-- | Phantom kind tag for peripherals built with 'mkPeripheral' (the register/
+-- physical-I/O metadata carries the real identity).
+data AnyPeriph
+
+-- | A peripheral __object__: a name plus a body that decodes the (relative) bus
+-- and produces its physical outputs @o@.  Physical inputs are declared inside the
+-- body with 'input'; physical outputs are the body's return.  Built by
+-- 'mkPeripheral', placed into a system by @instantiate@, wired to a bus by
+-- @attachPeripheral@ — see "Isacle.System.SystemDSL".
+data Peripheral dom dat o = Peripheral
+    { perName :: String
+    , perBody :: PeriphDef AnyPeriph (Sig dom) NetM dat o
+    }
+
+-- | Build a peripheral object from a name and a body.  The body uses
+-- 'declareRegVector'/'write'/'read' for its registers and 'input' for its
+-- physical inputs, and returns its physical outputs.
+mkPeripheral :: String
+             -> PeriphDef AnyPeriph (Sig dom) NetM dat o
+             -> Peripheral dom dat o
+mkPeripheral = Peripheral
+
+-- | Declare a physical __input__ port of the peripheral and return its signal —
+-- the dual of returning a physical output.  Allocates a real input port (reusing
+-- 'inputS'), so a GPIO's @gpio_in@ pins actually enter the design instead of
+-- collapsing to a captured constant.
+input :: (KnownDom dom, HdlType a)
+      => String -> PeriphDef p (Sig dom) NetM dat (Sig dom a)
+input name = liftHdl (inputS name)
 
 -- ---------------------------------------------------------------------------
 -- Named physical-output bundles

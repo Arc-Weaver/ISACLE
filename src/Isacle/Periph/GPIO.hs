@@ -3,16 +3,18 @@ module Isacle.Periph.GPIO
       GPIO
       -- * PeriphDef description (single source of truth)
     , gpioDef
+      -- * Peripheral object (entity/bus split)
+    , gpio
       -- * Standalone circuit wrapper
     , gpioUnit
     ) where
 
 import Prelude hiding (read)
 import Data.Word (Word32)
-import Hdl.Sig (KnownDom, HdlType, Sig)
+import Hdl.Sig (KnownDom, HdlType, Sig, (.&.), (.|.), sigComplement)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
+import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface, Peripheral, mkPeripheral, input)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -53,6 +55,30 @@ gpioDef pinsIn = do
     -- Reinterpret the typed register values back to the bus data width for the
     -- physical output bundle the system wires generically.
     (,) <$> toBusData portV <*> toBusData ddrV
+
+-- ---------------------------------------------------------------------------
+-- Peripheral object — the hardware-correct entity/bus split
+-- ---------------------------------------------------------------------------
+
+-- | GPIO as a peripheral object: its physical pin input @gpio_in@ is a real
+-- input port (declared with 'input'), and it returns its physical outputs
+-- @(oe, pin_out)@ = @(dir register, data register)@.  Reading the data register
+-- returns the live pin on input bits and the latched value on output bits —
+-- @(pin & ~dir) | (data & dir)@ — the standard tristate read-back.
+--
+--   offset 0  data  RW  output latch / pin read-back
+--   offset 1  dir   RW  direction (1 = output ⇒ drives pin_out, else input)
+gpio :: KnownDom dom
+     => Peripheral dom (Unsigned 8) (Sig dom (Unsigned 8), Sig dom (Unsigned 8))
+gpio = mkPeripheral "gpio" $ do
+    pin     <- input "gpio_in"
+    dataReg <- declareRegVector @8 "data"
+    dirReg  <- declareRegVector @8 "dir"
+    dir     <- write dirReg
+    dat     <- write dataReg
+    read dataReg ((pin .&. sigComplement dir) .|. (dat .&. dir))
+    read dirReg  dir
+    pure (dir, dat)   -- (oe, pin_out)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper

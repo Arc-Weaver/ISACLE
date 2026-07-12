@@ -36,6 +36,13 @@ module Isacle.System.SystemDSL
       -- * Bus protocols (signalling)
     , SimpleBus(..)    -- re-exported from Isacle.System.BusArch
     , attachPeripheral
+      -- * Peripheral objects (entity/bus split)
+    , Peripheral
+    , mkPeripheral
+    , input
+    , BusPeripheral(..)
+    , instantiate
+    , attachPeripheral'
       -- * System-level operations
     , createBus
     , createHarvardCPU
@@ -100,6 +107,7 @@ import Isacle.System.BusArch
 import Isacle.System.HdlCircuit
     ( hdlOps, runPeriphNet, busPortIface, HdlPhys(..)
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
+    , Peripheral(..), mkPeripheral, input
     )
 import Isacle.Periph.Interrupt (interruptArbiter)
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
@@ -188,6 +196,19 @@ data PeriphToken (proto :: Type) p dom dat a = PeriphToken
     { ptName     :: String
     , ptDef      :: PeriphDef p (Sig dom) NetM dat a
     , ptAddrSize :: Word32
+    }
+
+-- | A peripheral placed into a system by 'instantiate' but not yet bound to a
+-- bus.  Its entity is already built; its slave-port inputs are __fresh deferred
+-- nets__ (driven by 'attachPeripheral' from the bus master via 'connectSig'),
+-- and 'bperRData' is the read-data it drives back.  The register window decodes
+-- __relative__ addresses (base 0); 'attachPeripheral' applies the base by driving
+-- @spAddr@ with @masterAddr - base@.
+data BusPeripheral dom dat = BusPeripheral
+    { bperSlave :: SlavePort dom dat   -- ^ fresh nets, driven by attachPeripheral
+    , bperRData :: Sig dom dat         -- ^ read data driven by the peripheral
+    , bperSpec  :: PeriphSpec
+    , bperName  :: String
     }
 
 -- ---------------------------------------------------------------------------
@@ -395,6 +416,52 @@ attachPeripheral base token = BusDSL $ do
   where
     domInfo  = domId   (Proxy @dom)
     datW     = fromIntegral (natVal (Proxy @(Width dat)))
+
+-- ---------------------------------------------------------------------------
+-- Peripheral objects: instantiate + attach (the entity/bus split)
+-- ---------------------------------------------------------------------------
+
+-- | Place a 'Peripheral' object into the system: elaborate its body once (bus
+-- decoded relative to base 0, against __fresh deferred slave nets__), returning a
+-- 'BusPeripheral' handle plus the peripheral's physical outputs @o@.  The caller
+-- wires @o@ (e.g. 'sysOutput') and later connects the handle to a bus with
+-- 'attachPeripheral'.  This owns entity construction + physical I/O — attach owns
+-- only the bus.
+instantiate :: forall dom dat o. (KnownDom dom, HdlType dat, Num dat)
+            => Peripheral dom dat o -> SysNet (BusPeripheral dom dat, o)
+instantiate (Peripheral name body) = SysNet $ lift $ do
+    req  <- freshSig :: NetM (Sig dom Bool)
+    we   <- freshSig :: NetM (Sig dom Bool)
+    addr <- freshSig :: NetM (Sig dom (Unsigned 32))
+    wdat <- freshSig :: NetM (Sig dom dat)
+    let busP = busPortIface req we addr wdat 0
+    (o, rd, spec) <- runPeriphDef hdlOps busP body
+    pure ( BusPeripheral (SlavePort req we addr wdat) rd spec name, o )
+
+-- | Connect an instantiated 'BusPeripheral' to a bus — __bus wiring only__.
+-- Drives its deferred slave nets from the bus master (relative addressing:
+-- @spAddr = masterAddr - base@) and registers its read-data window in the mux.
+attachPeripheral' :: forall proto dom dat.
+       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom (Unsigned 32)))
+    => Word32 -> BusPeripheral dom dat -> BusDSL proto dom dat ()
+attachPeripheral' base bp = BusDSL $ do
+    st <- get
+    let master  = bdsMaster st
+        sp      = bperSlave bp
+        spec    = bperSpec bp
+        size    = case specSize spec of { 0 -> 1; n -> n }
+        relAddr = mqAddr master - fromIntegral base
+    -- Drive the deferred slave-port nets from the master.
+    lift $ connectSig (spReq   sp) (mqReq   master)
+    lift $ connectSig (spWe    sp) (mqWe    master)
+    lift $ connectSig (spAddr  sp) relAddr
+    lift $ connectSig (spWData sp) (mqWData master)
+    let entry = PeriphEntry { peName = bperName bp, peBase = base, peSpec = spec }
+        slot  = PeriphSlot { psName = bperName bp, psBase = base, psSize = size
+                           , psSpec = spec
+                           , psResp = SlaveResp { srRData = bperRData bp, srStall = sigFalse } }
+    put st { bdsPeriph = bdsPeriph st ++ [entry]
+           , bdsSlots  = bdsSlots  st ++ [slot] }
 
 -- ---------------------------------------------------------------------------
 -- createBus
