@@ -19,6 +19,13 @@ module Isacle.System.Periph
       -- * Typed field + logic in one (PE2)
     , regField
     , roField
+      -- * Register handles (PE3): declare + writeAction + readAction
+    , Reg(..)
+    , declareReg
+    , declareRegUnsigned
+    , declareRegSigned
+    , writeAction
+    , readAction
       -- * Register / field declarations (metadata)
     , field
     , field8
@@ -311,6 +318,71 @@ roField :: forall a p sig m dat. (HdlType a, Monad m)
 roField off name desc sig = do
     fieldOf @a ReadOnly off name desc
     onRead (fromIntegral off) sig
+
+-- ---------------------------------------------------------------------------
+-- PE3: register handles — declare / writeAction / readAction as separate,
+--      composable actions so arbitrary 'liftHdl' logic can sit between the
+--      value the CPU wrote and the value it reads back.
+-- ---------------------------------------------------------------------------
+
+-- | A declared register: its byte offset, width, representation and name.
+-- Produced by 'declareRegUnsigned' / 'declareRegSigned'; wired by 'writeAction'
+-- (write side) and 'readAction' (read side).  Splitting a register into a handle
+-- plus separate write/read actions lets any HDL processing sit between them:
+--
+-- > reg     <- declareRegUnsigned 8 "CTRL"
+-- > written <- writeAction reg            -- what the CPU wrote (a clocked register)
+-- > back    <- liftHdl (process written)  -- arbitrary HDL processing
+-- > readAction reg back                   -- what the CPU reads back at CTRL
+data Reg dat = Reg
+    { regOffset :: Word32   -- ^ byte offset within the peripheral window
+    , regWidth  :: RegWidth
+    , regRepr   :: Repr
+    , regName   :: String
+    } deriving (Show)
+
+-- | Declare a register at the next free byte offset, recording its metadata and
+-- returning a handle.  The register defaults to read-write; wiring 'writeAction'
+-- and/or 'readAction' realises its hardware.
+declareReg :: Monad m => RegWidth -> Repr -> String -> PeriphDef p sig m dat (Reg dat)
+declareReg width repr name = PeriphDef $ do
+    off <- lift $ gets (nextOffset . paFields)
+    lift $ modify $ \a ->
+        a { paFields = paFields a ++ [FieldSpec off width ReadWrite name "" repr []] }
+    pure (Reg (fromIntegral off) width repr name)
+  where
+    nextOffset = foldl (\o f -> o + widthBytes (fieldWidth f)) 0
+    widthBytes RW8 = 1
+    widthBytes RW16 = 2
+    widthBytes RW32 = 4
+
+-- | Declare an unsigned register of the given bit-width (8/16/32) at the next
+-- free offset.
+declareRegUnsigned :: Monad m => Int -> String -> PeriphDef p sig m dat (Reg dat)
+declareRegUnsigned bits = declareReg (rwOfBits bits) RUnsigned
+
+-- | Declare a signed register of the given bit-width (8/16/32) at the next free
+-- offset — the datapath is interpreted signed (C-header @int8_t@ etc.).
+declareRegSigned :: Monad m => Int -> String -> PeriphDef p sig m dat (Reg dat)
+declareRegSigned bits = declareReg (rwOfBits bits) RSigned
+
+rwOfBits :: Int -> RegWidth
+rwOfBits 8  = RW8
+rwOfBits 16 = RW16
+rwOfBits 32 = RW32
+rwOfBits n  = error ("declareReg: unsupported width " ++ show n
+                     ++ " bits (expected 8, 16, or 32)")
+
+-- | The write side of a register: a clocked register that captures bus writes to
+-- this register's offset (initialised to 0), returning its current value.  Feed
+-- the result on to 'liftHdl' logic and/or straight to 'readAction'.
+writeAction :: (Num dat, Monad m) => Reg dat -> PeriphDef p sig m dat (sig dat)
+writeAction reg = onWrite (regName reg) (regOffset reg) 0
+
+-- | The read side of a register: wire @sig@ into the read-data mux at this
+-- register's offset — the value the CPU reads back at it.
+readAction :: Monad m => Reg dat -> sig dat -> PeriphDef p sig m dat ()
+readAction reg = onRead (regOffset reg)
 
 -- ---------------------------------------------------------------------------
 -- Structural metadata declarations

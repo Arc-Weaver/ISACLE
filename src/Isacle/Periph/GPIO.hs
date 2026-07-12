@@ -37,12 +37,19 @@ gpioDef
     => sig dat                                    -- ^ physical pin inputs
     -> PeriphDef GPIO sig m dat (sig dat, sig dat)  -- ^ (PORT output, DDR output)
 gpioDef pinsIn = do
-    -- Typed PE2 combinators: each register's name, offset and type are
-    -- single-sourced, and its read/write logic is wired in the same call.
-    roField  @(Unsigned 8) 0 "PIN"  "Sampled physical inputs"      pinsIn
-    ddr  <- regField @(Unsigned 8) 1 "DDR"  "Data direction (1 = output)" 0
-    port <- regField @(Unsigned 8) 2 "PORT" "Output latch"               0
-    return (port, ddr)
+    -- PIN: read-only, driven by the sampled physical inputs (offset 0).
+    roField @(Unsigned 8) 0 "PIN" "Sampled physical inputs" pinsIn
+    -- DDR / PORT: read-write registers built with the PE3 handle API — declare
+    -- the register, then wire its write side and read-back as separate actions.
+    -- Here the read-back simply echoes the written value (a plain RW register);
+    -- 'liftHdl' logic could sit between 'writeAction' and 'readAction' instead.
+    ddr  <- declareRegUnsigned 8 "DDR"
+    ddrV <- writeAction ddr
+    readAction ddr ddrV
+    port <- declareRegUnsigned 8 "PORT"
+    portV <- writeAction port
+    readAction port portV
+    return (portV, ddrV)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper
