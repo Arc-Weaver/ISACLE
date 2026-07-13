@@ -72,13 +72,17 @@ gpio :: (Signal s, Monad m)
      => s dom (Unsigned 8)          -- ^ physical pin input (from the caller)
      -> Peripheral s dom m (Unsigned 8) (s dom (Unsigned 8), s dom (Unsigned 8))
 gpio gpioIn = mkPeripheral "gpio" $ do
-    dataReg   <- declareRegVector @8 "data"
-    dirReg    <- declareRegVector @8 "dir"
+    pinReg    <- declareRegVector @8 "PIN"    -- offset 0: read-only pin state
+    dirReg    <- declareRegVector @8 "DDR"    -- offset 1: direction (1 = output)
+    dataReg   <- declareRegVector @8 "PORT"   -- offset 2: output latch
     writeDir  <- write dirReg
     writeData <- write dataReg
-    read dataReg ((gpioIn .&. sigComplement writeDir) .|. (writeData .&. writeDir))
+    -- Reading PIN returns the live pin on input bits, the latched value on output
+    -- bits — the standard tristate read-back @(pin & ~dir) | (data & dir)@.
+    read pinReg  ((gpioIn .&. sigComplement writeDir) .|. (writeData .&. writeDir))
     read dirReg  writeDir
-    return (writeDir, writeData)   -- (oe, pin_out)
+    read dataReg writeData
+    return (writeDir, writeData)   -- (DDR = oe, PORT = pin_out)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper
