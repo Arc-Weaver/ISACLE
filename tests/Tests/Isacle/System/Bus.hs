@@ -1,10 +1,13 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveAnyClass #-}
 module Tests.Isacle.System.Bus where
 
 import Prelude
 import Data.Word (Word32)
 import Data.Proxy (Proxy(..))
+import GHC.Generics (Generic)
 import qualified Data.Map.Strict as M
 import System.Exit (exitFailure)
 
@@ -13,6 +16,7 @@ import Hdl.Sim   (simulateSystem)
 import Isacle.System.BusCap
     ( Capability(..), canDrive, canDriveWidth, BusAdapter(..), widthAdapter, stallAdapter )
 import Hdl.Sig (KnownDom(..), Sig(..))
+import Hdl.Types (Named)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
 import Isacle.System.HdlCircuit (GpioPhys(..))
@@ -43,6 +47,18 @@ gpioBusSys gpioIn = do
         gpio' <- attachPeripheral gpioBase gpio
         return (gpioPort gpio', gpioDdr gpio')
     return (port, ddr)
+
+-- | Top-entity wrapper for the whole-SoC sim: the GPIO's outputs become the
+-- top-level pins @gpio_port@/@gpio_ddr@ via the returned 'Named' record.
+data GpioSysOut = GpioSysOut
+    { gpio_port :: Sig Clk (Unsigned 8)
+    , gpio_ddr  :: Sig Clk (Unsigned 8)
+    } deriving (Generic, Named)
+
+gpioSysTop :: () -> SysNet GpioSysOut
+gpioSysTop () = do
+    (port, ddr) <- gpioBusSys (SExpr (pure 0) :: Sig Clk (Unsigned 8))
+    return GpioSysOut { gpio_port = port, gpio_ddr = ddr }
 
 -- ---------------------------------------------------------------------------
 -- Tests
@@ -109,12 +125,12 @@ runBusTests = do
     -- solver), so the SoC simulates and its gpio outputs resolve — at reset both
     -- the port and DDR registers read 0.
     putStrLn "\n-- whole-SoC simulation --"
-    let design = execSystemDSL "top" (gpioBusSys pinSig)
+    let design = execSystemDSL "top" gpioSysTop
         socOut = head (simulateSystem design "top" M.empty 1)
     assert "whole-SoC sim resolves gpio port output"
-        (M.lookup "gpio_GpioPhys_gpioPort" socOut == Just 0)
+        (M.lookup "gpio_port" socOut == Just 0)
     assert "whole-SoC sim resolves gpio ddr output"
-        (M.lookup "gpio_GpioPhys_gpioDdr" socOut == Just 0)
+        (M.lookup "gpio_ddr" socOut == Just 0)
 
     -- Typed peripheral → C header, end to end: the ramp's signed registers
     -- (declared via regField/roField @(Signed 8)) surface as int8_t.

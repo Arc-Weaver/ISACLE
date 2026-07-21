@@ -28,16 +28,12 @@ module Isacle.Periph.Ramp
     ) where
 
 import Prelude
-import Control.Monad.Fix (MonadFix)
-import Data.Proxy (Proxy(..))
-import Data.Word (Word32)
+import Data.Kind (Type)
 
-import Hdl.Net
-import Hdl.Class (regS)
+import Hdl.Monad (Hdl, registerEn)
 import Hdl.Sig
 import Hdl.Bits (Signed, Unsigned, KnownNat)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -91,15 +87,16 @@ rampDef curU = do
 -- feedback (current feeds rampDef feeds rampFSM feeds current).  Returns the
 -- current value unsigned-encoded, ready for the bus read mux.
 rampFSM
-    :: forall dom. KnownDom dom
+    :: forall (dom :: Type) m. (Hdl Sig m, KnownDom dom)
     => Sig dom Bool            -- ^ tick / advance enable
     -> Sig dom (Signed 8)      -- ^ setpoint (from rampDef)
     -> Sig dom (Signed 8)      -- ^ step     (from rampDef)
-    -> NetM (Sig dom (Unsigned 8))  -- ^ current value (unsigned-encoded for the bus)
+    -> m (Sig dom (Unsigned 8))  -- ^ current value (unsigned-encoded for the bus)
 rampFSM tick setpoint step = mdo
-    -- The signed 'current' register via the abstract 'regS'; 'withRepr' carries
-    -- the signed representation onto the wire; @mdo@ ties @cur@ to its next value.
-    cur0 <- regS (0 :: Signed 8) next
+    -- The signed 'current' register: advance on @tick@, hold otherwise.
+    -- 'withRepr' carries the signed representation onto the wire; @mdo@ ties @cur@
+    -- to its next value.
+    cur0 <- registerEn (0 :: Signed 8) tick moved
     let cur    = withRepr cur0 :: Sig dom (Signed 8)
         below  = cur .<. setpoint
         above  = setpoint .<. cur
@@ -108,7 +105,6 @@ rampFSM tick setpoint step = mdo
         upN    = mux (setpoint .<. up)   setpoint up
         downN  = mux (down .<. setpoint) setpoint down
         moved  = mux below upN (mux above downN cur)
-        next   = mux tick moved cur
     pure (asUnsigned cur)
 
 -- ---------------------------------------------------------------------------
@@ -118,9 +114,9 @@ rampFSM tick setpoint step = mdo
 -- | 'rampDef' with 'rampFSM' wired in via a recursive binding.  Use as the
 -- @ptDef@ in a 'PeriphToken'.  The ramp has no IRQ outputs.
 rampDefWithFSM
-    :: KnownDom dom
+    :: forall (dom :: Type) m. (Hdl Sig m, KnownDom dom)
     => Sig dom Bool                 -- ^ tick / advance enable
-    -> PeriphDef Ramp (Sig dom) NetM (Unsigned 8) ()
+    -> PeriphDef Ramp (Sig dom) m (Unsigned 8) ()
 rampDefWithFSM tick = mdo
     (setpoint, step) <- rampDef curU
     curU <- liftHdl (rampFSM tick setpoint step)

@@ -68,7 +68,7 @@ import GHC.Generics
     , (:*:)(..), (:+:)(..)
     , D, S, R, C
     , Selector, selName
-    , Constructor, conName
+    , Constructor
     )
 
 import Hdl.Net
@@ -549,11 +549,13 @@ instance (PortLayout f, PortLayout g) => PortLayout (f :*: g) where
             (y, ws'') = layoutDecode @g ws'
         in (x :*: y, ws'')
 
--- Constructor wrapper: prefix every field name with the constructor name.
+-- Constructor wrapper: pass through.  Field names are the port names, verbatim —
+-- an entity is an entity, whether it is the top level or a nested sub-entity, so
+-- ports are named exactly by their record fields (no constructor-name prefix).
+-- Field-name conventions (e.g. @hci*@/@hco*@ on a CPU, @sp*@ on a bus port) keep
+-- an entity's in/out pins distinct without one.
 instance {-# OVERLAPPING #-} (Constructor c, PortLayout f) => PortLayout (M1 C c f) where
-    layoutSpecs =
-        let cname = conName (undefined :: M1 C c f ())
-        in map (\p -> p { portName = cname ++ "_" ++ portName p }) (layoutSpecs @f)
+    layoutSpecs = layoutSpecs @f
     layoutEncode (M1 x) = layoutEncode x
     layoutDecode ws = let (x, ws') = layoutDecode @f ws in (M1 x, ws')
 

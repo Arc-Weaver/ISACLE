@@ -5,9 +5,10 @@ module Isacle.Periph.DMA
     ) where
 
 import Prelude
-import Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..), NetM)
+import Data.Kind (Type)
+import Hdl.Monad (Hdl, register)
 import Hdl.Sig
-import Hdl.Class (regS)
+import Hdl.Reduce (sigTrue, sigFalse)
 import Hdl.Prim (Unsigned)
 
 -- | DMA transfer engine state (used in simulation / pure testing).
@@ -39,8 +40,9 @@ data DMAState addr dat
 --   Read and write outputs are valid/address (or valid/address/data) triples
 --   rather than 'Maybe' wrappers, which cannot be synthesised directly.
 dmaEngine
-    :: forall dom addrW dat
-     . ( KnownDom dom
+    :: forall (dom :: Type) addrW dat m
+     . ( Hdl Sig m
+       , KnownDom dom
        , HdlType (Unsigned addrW)
        , Num (Sig dom (Unsigned addrW))
        , HdlType (Unsigned 16)
@@ -54,7 +56,7 @@ dmaEngine
        , Sig dom Bool                -- ^ startIncDst
        )
     -> Sig dom dat                   -- ^ bus read response (one cycle after read address)
-    -> NetM
+    -> m
         ( Sig dom Bool, Sig dom (Unsigned addrW)              -- dmaRd: (valid, addr)
         , Sig dom Bool, Sig dom (Unsigned addrW), Sig dom dat -- dmaWr: (valid, addr, dat)
         , Sig dom Bool                                         -- busy
@@ -63,18 +65,15 @@ dmaEngine
 dmaEngine (startVld, startSrc, startDst, startN, startIncSrc, startIncDst) rdData = mdo
 
     -- ── State registers ────────────────────────────────────────────────────────
-    stVld    <- regS False stVldNext
-    stSrc    <- regS 0     stSrcNext
-    stDst    <- regS 0     stDstNext
-    stCount  <- regS 0     stCountNext
-    stIncSrc <- regS False stIncSrcNext
-    stIncDst <- regS False stIncDstNext
+    stVld    <- register False stVldNext
+    stSrc    <- register 0     stSrcNext
+    stDst    <- register 0     stDstNext
+    stCount  <- register 0     stCountNext
+    stIncSrc <- register False stIncSrcNext
+    stIncDst <- register False stIncDstNext
 
     -- ── Combinational logic ────────────────────────────────────────────────────
-    let sigTrue  = SExpr $ do { out <- freshWire; emit $ NComb out (PLit 1 1) []; pure out }
-        sigFalse = SExpr $ do { out <- freshWire; emit $ NComb out (PLit 0 1) []; pure out }
-
-        zero16 = fromInteger 0 :: Sig dom (Unsigned 16)
+    let zero16 = fromInteger 0 :: Sig dom (Unsigned 16)
         one16  = fromInteger 1 :: Sig dom (Unsigned 16)
 
         -- Accept a new transfer when idle, valid start, and non-zero count

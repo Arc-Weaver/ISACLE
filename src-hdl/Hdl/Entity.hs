@@ -22,6 +22,7 @@ module Hdl.Entity
       -- * Elaboration
     , elaborate
     , elaborateDesign
+    , elaborateTop
     ) where
 
 import Prelude
@@ -141,6 +142,40 @@ elaborate EntityDef{..} = ElabEntity entityName portDecls nodes
         return wid
     emitOutput ps wid = emit $ NOutput wid (portName ps) (portWidth ps) (portDom ps)
     toDecl dir ps     = PortDecl (portName ps) dir (portWidth ps) (portDom ps)
+
+-- | Elaborate a __top-level__ design whose body runs in a monad layered over
+-- 'NetM' (e.g. the system builder's @StateT SysBuild NetM@).  Top-level ports are
+-- bound from the @Named@ input/output bundle __types__ using the __same__
+-- port-from-types resolution 'elaborate'/'instEntity' use for every sub-entity —
+-- an entity is an entity, so the top level needs no special-cased primitives.
+--
+-- @runBody@ receives the input bundle (built from freshly-allocated 'NInput'
+-- wires) and must return the output bundle (from which 'NOutput' nodes are
+-- emitted) paired with any extra result @r@ to thread out (e.g. accumulated build
+-- state).  Returns the output bundle, that extra result, and the full 'Design'
+-- (top entity under @name@ plus every sub-entity instantiated inside the body).
+elaborateTop
+    :: forall i o r. (Named i, Named o)
+    => String
+    -> (i -> NetM (o, r))
+    -> (o, r, Design)
+elaborateTop name runBody = (o, r, Map.insert name topNodes subDesign)
+  where
+    iSpecs = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
+    oSpecs = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))
+    ((o, r), topNodes, subDesign) = runNetM $ do
+        inWires  <- mapM allocInput iSpecs
+        (o', r') <- runBody (fromWireIds inWires)
+        outWires <- toWireIds o'
+        mapM_ (uncurry emitOutput) (zip oSpecs outWires)
+        pure (o', r')
+
+    setName n ps      = ps { portName = n }
+    allocInput ps     = do
+        wid <- freshWire
+        emit $ NInput wid (portName ps) (portWidth ps) (portDom ps)
+        return wid
+    emitOutput ps wid = emit $ NOutput wid (portName ps) (portWidth ps) (portDom ps)
 
 -- | Like 'elaborate', but also returns the full 'Design' — including any
 -- sub-entities instantiated via 'instEntity' inside the body.

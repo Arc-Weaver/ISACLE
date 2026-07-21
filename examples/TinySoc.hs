@@ -17,9 +17,13 @@
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE DeriveAnyClass      #-}
 module Main where
 
+import GHC.Generics (Generic)
 import Isacle.System.CLI
+import Isacle.System.HdlCircuit (GpioPhys(..))
 import Isacle.ISA.Chip          (Chip(..))
 import Isacle.ISA.Example.Tiny  (TinyCore, TinyAlu, tinyCPUDef, tinyISA)
 
@@ -28,14 +32,27 @@ tinyChip :: Chip TinyCore TinyAlu 8 8 8 8
 tinyChip = Chip tinyCPUDef tinyISA
 
 main :: IO ()
-main = systemMain "tiny_soc" $ do
+main = systemMain "tiny_soc" tinySoc
+
+-- The SoC's output pins: the GPIO PORT/DDR, named by the record fields.
+data TinySocOut = TinySocOut
+    { gpio_port :: Sig Sys (Unsigned 8)
+    , gpio_ddr  :: Sig Sys (Unsigned 8)
+    } deriving (Generic, Named)
+
+-- The SoC is a top-level entity: its input pin @gpio_in@ is the argument bundle
+-- and its output pins are the returned 'TinySocOut' — both bound by the entity
+-- flow.  'attachPeripheral' returns the GPIO's physical outputs, which we thread
+-- into the output record.
+tinySoc :: Port "gpio_in" (Sig Sys (Unsigned 8)) -> SysNet TinySocOut
+tinySoc (Port gpioIn) = do
     -- Deferred file read: the SysNet only *records* the request; the interpreter
     -- (systemMain) reads examples/prog.bin and re-runs with its bytes available.
     progBytes <- loadFileBytes "examples/prog.bin"
-    gpioIn  <- sysInput "gpio_in" :: SysNet (Sig Sys (Unsigned 8))
-    gpio    <- createGpio "gpio0" gpioIn
+    gpio0   <- createGpio "gpio0" gpioIn
     coderom <- createRom 256 (romFromBytes progBytes :: RomImage (Unsigned 8)) "coderom0"
     (codeBus, ()) <- createBus @_ @SimpleBus "codebus" (attachPeripheral 0x0  coderom >> pure ())
-    (dataBus, ()) <- createBus @_ @SimpleBus "databus" (attachPeripheral 0x60 gpio    >> pure ())
+    (dataBus, gpioOut) <- createBus @_ @SimpleBus "databus" (attachPeripheral 0x60 gpio0)
     dormant <- noIrq
     createHarvardCPU "cpu0" tinyChip codeBus dataBus dormant
+    pure TinySocOut { gpio_port = gpioPort gpioOut, gpio_ddr = gpioDdr gpioOut }

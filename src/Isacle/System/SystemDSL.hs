@@ -35,13 +35,11 @@ module Isacle.System.SystemDSL
       --  colliding with the spec-level 'Isacle.System.BusDef.Bus'.)
       -- * Bus protocols (signalling)
     , SimpleBus(..)    -- re-exported from Isacle.System.BusArch
+      -- | Attach a peripheral to a bus.  The peripheral becomes its own named
+      -- sub-entity; its physical outputs are __returned__ for the caller to thread
+      -- into the SoC's top-level output bundle.  The peripheral's bus protocol is
+      -- part of its 'PeriphToken' type and is unified with the bus's protocol here.
     , attachPeripheral
-      -- * Peripheral objects (entity/bus split)
-    , Peripheral
-    , mkPeripheral
-    , BusPeripheral(..)
-    , instantiate
-    , attachPeripheral'
       -- * System-level operations
     , createBus
     , createHarvardCPU
@@ -70,8 +68,6 @@ module Isacle.System.SystemDSL
       -- * Utilities
     , sigFalse
     , sigTrue
-    , sysInput
-    , sysOutput
       -- * System documentation
     , SysDoc(..)
     , BusSection(..)
@@ -96,17 +92,16 @@ import GHC.TypeLits (natVal, KnownNat, type (<=))
 import Hdl.Net
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
-import Hdl.Entity (EntityDef)
+import Hdl.Entity (EntityDef, elaborateTop)
 import Hdl.IO (entity, instanceOf)
-import Hdl.Class (inputS, outputS, connectSig, freshSig)
+import Hdl.Class (connectSig, freshSig)
 import Isacle.System.Periph
 import Isacle.System.Bus (Bus(..), BusMaster(..))
 import Isacle.System.BusArch
     (BusArch(..), SimpleBus(..), MasterReq(..), SlaveResp(..), BusChild)
 import Isacle.System.HdlCircuit
-    ( hdlOps, runPeriphNet, busPortIface, HdlPhys(..)
+    ( hdlOps, runPeriphNet, busPortIface
     , GpioPhys(..), UartPhys(..), TimerPhys(..)
-    , Peripheral(..), mkPeripheral
     )
 import Isacle.Periph.Interrupt (interruptArbiter)
 import Isacle.Periph.GPIO  (gpioDef, GPIO)
@@ -197,19 +192,6 @@ data PeriphToken (proto :: Type) p dom dat a = PeriphToken
     , ptAddrSize :: Word32
     }
 
--- | A peripheral placed into a system by 'instantiate' but not yet bound to a
--- bus.  Its entity is already built; its slave-port inputs are __fresh deferred
--- nets__ (driven by 'attachPeripheral' from the bus master via 'connectSig'),
--- and 'bperRData' is the read-data it drives back.  The register window decodes
--- __relative__ addresses (base 0); 'attachPeripheral' applies the base by driving
--- @spAddr@ with @masterAddr - base@.
-data BusPeripheral dom dat = BusPeripheral
-    { bperSlave :: SlavePort dom dat   -- ^ fresh nets, driven by attachPeripheral
-    , bperRData :: Sig dom dat         -- ^ read data driven by the peripheral
-    , bperSpec  :: PeriphSpec
-    , bperName  :: String
-    }
-
 -- ---------------------------------------------------------------------------
 -- SysNet monad
 -- ---------------------------------------------------------------------------
@@ -246,13 +228,13 @@ class MonadFix m => SysDSL m where
                      => Sig dom Bool -> [(Sig dom Bool, Integer)] -> m (IrqDriver dom caw)
     noIrq            :: forall (dom :: Type) caw. (KnownDom dom, KnownNat caw, Num (Sig dom (Unsigned caw)))
                      => m (IrqDriver dom caw)
-    createUart       :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    createUart       :: forall (dom :: Type) dat proto. (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom Bool -> m (PeriphToken proto UART dom dat (UartPhys dom))
     createGpio       :: (HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom dat -> m (PeriphToken proto GPIO dom dat (GpioPhys dom dat))
-    createTimer      :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    createTimer      :: forall (dom :: Type) dat proto. (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
                      => String -> Sig dom Bool -> m (PeriphToken proto Timer dom dat (TimerPhys dom))
-    createRamp       :: KnownDom dom
+    createRamp       :: forall (dom :: Type) proto. KnownDom dom
                      => String -> Sig dom Bool -> m (PeriphToken proto Ramp dom (Unsigned 8) ())
     createRam        :: (Num dat, Num (Sig dom dat))
                      => Int -> [Integer] -> String -> m (PeriphToken proto RAM dom dat ())
@@ -260,8 +242,6 @@ class MonadFix m => SysDSL m where
                      => Int -> RomImage dat -> String -> m (PeriphToken proto ROM dom dat ())
     loadFile         :: FilePath -> m String
     loadFileBytes    :: FilePath -> m [Word8]
-    sysInput         :: forall a dom. (KnownDom dom, HdlType a) => String -> m (Sig dom a)
-    sysOutput        :: forall a dom. (KnownDom dom, HdlType a) => String -> Sig dom a -> m ()
 
 instance SysDSL SysNet where
     createBus        = createBusImpl
@@ -276,8 +256,6 @@ instance SysDSL SysNet where
     createRom        = createRomImpl
     loadFile         = loadFileImpl
     loadFileBytes    = loadFileBytesImpl
-    sysInput         = sysInputImpl
-    sysOutput        = sysOutputImpl
 
 -- | Run a system description, returning the user result, the flat 'NetNode'
 -- list (for VHDL emission), and the system documentation.  Pure: no file
@@ -368,7 +346,7 @@ newtype BusDSL (proto :: Type) dom dat a = BusDSL (StateT (BusDSLState dom dat) 
 attachPeripheral
     :: forall proto p dom dat a.
        ( KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat)
-       , HdlPhys a, Named a )
+       , Named a )
     => Word32
     -> PeriphToken proto p dom dat a
     -> BusDSL proto dom dat a
@@ -384,8 +362,6 @@ attachPeripheral base token = BusDSL $ do
         (_, _, spec) = runPeriphNet hdlOps specBus (ptDef token)
         size  = case specSize spec of { 0 -> ptAddrSize token; n -> n }
         entry = PeriphEntry { peName = nm, peBase = base, peSpec = spec }
-        -- Top-level names for the physical outputs: @<instance>_<port>@.
-        physNames = [ nm ++ "_" ++ portName ps | ps <- portSpecs (Proxy @a) ]
         -- The peripheral's behaviour as a sub-entity body: decode the bus port,
         -- return its read-data signal and physical-output bundle (real emission).
         body :: SlavePort dom dat -> NetM (Sig dom dat, a)
@@ -400,8 +376,6 @@ attachPeripheral base token = BusDSL $ do
         (entity nm body :: EntityDef (SlavePort dom dat) (Sig dom dat, a))
         SlavePort { spReq   = mqReq   master, spWe    = mqWe    master
                   , spAddr  = mqAddr  master, spWData = mqWData master }
-    -- Promote the peripheral's physical outputs to top-level SoC ports.
-    lift $ emitPhysOuts physNames domInfo datW phys
 
     let slot = PeriphSlot
             { psName = nm, psBase = base, psSize = size, psSpec = spec
@@ -410,57 +384,9 @@ attachPeripheral base token = BusDSL $ do
     put st { bdsPeriph = bdsPeriph st ++ [entry]
            , bdsSlots  = bdsSlots  st ++ [slot]
            }
+    -- Return the peripheral's physical outputs — the caller threads them into the
+    -- SoC's top-level output bundle (no ad-hoc top-port promotion).
     pure phys
-
-  where
-    domInfo  = domId   (Proxy @dom)
-    datW     = fromIntegral (natVal (Proxy @(Width dat)))
-
--- ---------------------------------------------------------------------------
--- Peripheral objects: instantiate + attach (the entity/bus split)
--- ---------------------------------------------------------------------------
-
--- | Place a 'Peripheral' object into the system: elaborate its body once (bus
--- decoded relative to base 0, against __fresh deferred slave nets__), returning a
--- 'BusPeripheral' handle plus the peripheral's physical outputs @o@.  The caller
--- wires @o@ (e.g. 'sysOutput') and later connects the handle to a bus with
--- 'attachPeripheral'.  This owns entity construction + physical I/O — attach owns
--- only the bus.
-instantiate :: forall dom dat o. (KnownDom dom, HdlType dat, Num dat)
-            => Peripheral Sig dom NetM dat o -> SysNet (BusPeripheral dom dat, o)
-instantiate (Peripheral name body) = SysNet $ lift $ do
-    req  <- freshSig :: NetM (Sig dom Bool)
-    we   <- freshSig :: NetM (Sig dom Bool)
-    addr <- freshSig :: NetM (Sig dom (Unsigned 32))
-    wdat <- freshSig :: NetM (Sig dom dat)
-    let busP = busPortIface req we addr wdat 0
-    (o, rd, spec) <- runPeriphDef hdlOps busP body
-    pure ( BusPeripheral (SlavePort req we addr wdat) rd spec name, o )
-
--- | Connect an instantiated 'BusPeripheral' to a bus — __bus wiring only__.
--- Drives its deferred slave nets from the bus master (relative addressing:
--- @spAddr = masterAddr - base@) and registers its read-data window in the mux.
-attachPeripheral' :: forall proto dom dat.
-       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom (Unsigned 32)))
-    => Word32 -> BusPeripheral dom dat -> BusDSL proto dom dat ()
-attachPeripheral' base bp = BusDSL $ do
-    st <- get
-    let master  = bdsMaster st
-        sp      = bperSlave bp
-        spec    = bperSpec bp
-        size    = case specSize spec of { 0 -> 1; n -> n }
-        relAddr = mqAddr master - fromIntegral base
-    -- Drive the deferred slave-port nets from the master.
-    lift $ connectSig (spReq   sp) (mqReq   master)
-    lift $ connectSig (spWe    sp) (mqWe    master)
-    lift $ connectSig (spAddr  sp) relAddr
-    lift $ connectSig (spWData sp) (mqWData master)
-    let entry = PeriphEntry { peName = bperName bp, peBase = base, peSpec = spec }
-        slot  = PeriphSlot { psName = bperName bp, psBase = base, psSize = size
-                           , psSpec = spec
-                           , psResp = SlaveResp { srRData = bperRData bp, srStall = sigFalse } }
-    put st { bdsPeriph = bdsPeriph st ++ [entry]
-           , bdsSlots  = bdsSlots  st ++ [slot] }
 
 -- ---------------------------------------------------------------------------
 -- createBus
@@ -773,30 +699,41 @@ alias dst src = emit $ NComb dst POr [src, src]
 
 -- | Run a system description, returning the full 'Design' (top entity plus
 -- any sub-entities such as RAM blocks) ready for 'emitVhdlDesignFiles'.
--- Apply @dom@ and @dat@ as visible type arguments to disambiguate:
--- @execSystemDSL \@Sys \@(Unsigned 8) "top" mySystem@
-execSystemDSL :: forall a. String -> SysNet a -> Design
-execSystemDSL name (SysNet st) =
-    execDesign name (fmap fst (runStateT st emptyBuild))
+--
+-- A system is a top-level __entity__: its body is @i -> 'SysNet' o@, where the
+-- input bundle @i@ and output bundle @o@ are 'Named' records of typed 'Port's.
+-- Top-level pins are bound from those types via the ordinary entity-elaboration
+-- path (see 'Hdl.Entity.elaborateTop') — no special input/output primitives.  A
+-- portless SoC is just @\\() -> …@ (both bundles @()@).
+execSystemDSL :: forall i o. (Named i, Named o) => String -> (i -> SysNet o) -> Design
+execSystemDSL name body = design
+  where (_, design, _, _) = runSystemDesignWith Map.empty name body
 
--- | Run a system description once, returning the user result, the full 'Design'
+-- | Run a system description once, returning the output bundle, the full 'Design'
 -- (top entity plus sub-entities, for VHDL emission), and the 'SysDoc' (for the
 -- memory map / C header / linker artifacts).  A single monad pass, so callers
 -- that need every output — e.g. 'Isacle.System.Emit.writeSystem' — do not run
 -- the description twice.
-runSystemDesign :: forall a. String -> SysNet a -> (a, Design, SysDoc)
-runSystemDesign name sys = (a, design, doc)
-  where (a, design, doc, _reqs) = runSystemDesignWith Map.empty name sys
+runSystemDesign :: forall i o. (Named i, Named o) => String -> (i -> SysNet o) -> (o, Design, SysDoc)
+runSystemDesign name body = (o, design, doc)
+  where (o, design, doc, _reqs) = runSystemDesignWith Map.empty name body
 
 -- | 'runSystemDesign' with a resolved file environment (from the IO
 -- interpreter's harvest pass) and, additionally, the list of paths the system
 -- requested via 'loadFile' / 'loadFileBytes'.  Used to drive the two-pass
 -- deferred-load resolution in 'Isacle.System.Emit'.
+--
+-- The top-level ports come from the @Named@ @i@/@o@ bundle types: the entity
+-- flow allocates 'NInput' wires, hands them to the body as @i@, then drives
+-- 'NOutput' from the returned @o@.
 runSystemDesignWith
-    :: forall a. FileEnv -> String -> SysNet a -> (a, Design, SysDoc, [FilePath])
-runSystemDesignWith env name (SysNet st) = (a, design, sbDoc b, reverse (sbReqs b))
+    :: forall i o. (Named i, Named o)
+    => FileEnv -> String -> (i -> SysNet o) -> (o, Design, SysDoc, [FilePath])
+runSystemDesignWith env name body = (o, design, sbDoc b, reverse (sbReqs b))
   where
-    ((a, b), design) = runDesign name (runStateT st (emptyBuildWith env))
+    (o, b, design) = elaborateTop name $ \i ->
+        let SysNet st = body i
+        in runStateT st (emptyBuildWith env)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral constructors
@@ -807,7 +744,7 @@ runSystemDesignWith env name (SysNet st) = (a, design, sbDoc b, reverse (sbReqs 
 -- Physical outputs (TX, rxIrq, txIrq) are stubs until a serial-FSM
 -- sub-component is implemented.
 createUartImpl
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat proto. (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> Sig dom Bool                  -- ^ RX serial line
     -> SysNet (PeriphToken proto UART dom dat (UartPhys dom))
@@ -837,7 +774,8 @@ createGpioImpl name pins = pure $ PeriphToken
 -- Physical outputs (overflow IRQ, compare-match IRQ) are stubs until a
 -- counter-FSM sub-component is implemented.
 createTimerImpl
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat proto.
+       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
     => String
     -> Sig dom Bool                  -- ^ tick / count enable
     -> SysNet (PeriphToken proto Timer dom dat (TimerPhys dom))
@@ -854,7 +792,7 @@ createTimerImpl name tick = pure $ PeriphToken
 -- ramp moves its CURRENT value toward SETPOINT by STEP each tick.  Register
 -- map: 0 SETPOINT (RW), 1 STEP (RW), 2 CURRENT (RO).
 createRampImpl
-    :: KnownDom dom
+    :: forall (dom :: Type) proto. KnownDom dom
     => String
     -> Sig dom Bool                  -- ^ tick / advance enable
     -> SysNet (PeriphToken proto Ramp dom (Unsigned 8) ())
@@ -957,27 +895,10 @@ createIrqImpl enable srcs = SysNet $ lift $ do
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Emit a top-level output port from within 'SysNet'.
--- The signal type @a@ may differ from the bus data type @dat@
--- (e.g. expose a 'Bool' TX pin alongside 8-bit GPIO).
-sysOutputImpl :: forall a dom.
-             (KnownDom dom, HdlType a)
-          => String -> Sig dom a -> SysNet ()
-sysOutputImpl name sig = SysNet $ lift $ outputS @dom @a name sig
-
--- | Declare a top-level __input__ port and return its signal — the dual of
--- 'sysOutput'.  Wire the result into a peripheral constructor (e.g. GPIO pin
--- inputs, UART RX) so the SoC actually has data inputs rather than tying them to
--- constants:
---
--- @
--- gpioIn <- sysInput \"gpio_a_in\"
--- gpioA  <- createGpio \"gpio_a\" gpioIn
--- @
-sysInputImpl :: forall a dom.
-            (KnownDom dom, HdlType a)
-         => String -> SysNet (Sig dom a)
-sysInputImpl name = SysNet $ lift $ inputS @dom @a name
+-- Top-level ports are no longer declared with ad-hoc @sysInput@/@sysOutput@
+-- primitives: a system is an entity @i -> 'SysNet' o@, and its pins are bound
+-- from the @Named@ @i@/@o@ bundle types by 'Hdl.Entity.elaborateTop' (driven from
+-- 'runSystemDesignWith') — the same port-from-types path every sub-entity uses.
 
 -- | Constant-false Bool signal (1-bit zero literal).
 sigFalse :: Sig dom Bool

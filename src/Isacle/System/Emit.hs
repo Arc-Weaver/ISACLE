@@ -36,6 +36,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
 import Hdl.Net (Design)
+import Hdl.Types (Named)
 import Hdl.Emit.Vhdl (emitVhdlDesign)
 import Isacle.System.SystemDSL
     (SysNet, SysDoc, FileEnv, runSystemDesignWith)
@@ -86,13 +87,13 @@ data SystemArtifacts = SystemArtifacts
 -- | Run a system once and render the artifacts its 'GenOptions' request.  Pure —
 -- no disk access, so any 'Isacle.System.SystemDSL.loadFile' yields @""@.  Use
 -- 'writeSystem' (or 'resolveFiles' + 'renderSystemWith') to resolve file loads.
-renderSystem :: GenOptions -> String -> SysNet a -> SystemArtifacts
+renderSystem :: (Named i, Named o) => GenOptions -> String -> (i -> SysNet o) -> SystemArtifacts
 renderSystem = renderSystemWith Map.empty
 
 -- | 'renderSystem' with a resolved file environment (see 'resolveFiles'), so
 -- deferred 'Isacle.System.SystemDSL.loadFile' / 'loadFileBytes' calls see real
 -- contents.
-renderSystemWith :: FileEnv -> GenOptions -> String -> SysNet a -> SystemArtifacts
+renderSystemWith :: (Named i, Named o) => FileEnv -> GenOptions -> String -> (i -> SysNet o) -> SystemArtifacts
 renderSystemWith env opts name sys = SystemArtifacts
     { saDesign = design
     , saDoc    = doc
@@ -112,7 +113,7 @@ renderSystemWith env opts name sys = SystemArtifacts
 -- empty environment), those files are read, and the resulting 'FileEnv' is
 -- returned for a real render pass.  (The set of requested paths must not depend
 -- on file contents — see 'Isacle.System.SystemDSL.loadFile'.)
-resolveFiles :: String -> SysNet a -> IO FileEnv
+resolveFiles :: (Named i, Named o) => String -> (i -> SysNet o) -> IO FileEnv
 resolveFiles name sys = do
     let (_, _, _, reqs) = runSystemDesignWith Map.empty name sys
     entries <- forM (nub reqs) $ \p -> do
@@ -127,13 +128,13 @@ resolveFiles name sys = do
 -- | Render a system and write the requested artifacts under @dir@, printing a
 -- one-line-per-file summary.  @name@ is the top-entity / file basename.  Emits
 -- every artifact ('defaultGenOptions'); use 'writeSystemWith' to select.
-writeSystem :: FilePath -> String -> SysNet a -> IO ()
+writeSystem :: (Named i, Named o) => FilePath -> String -> (i -> SysNet o) -> IO ()
 writeSystem = writeSystemWith defaultGenOptions
 
 -- | 'writeSystem' with explicit 'GenOptions'.  Resolves deferred file loads
 -- ('resolveFiles') before rendering, so 'Isacle.System.SystemDSL.loadFile' sees
 -- real contents.
-writeSystemWith :: GenOptions -> FilePath -> String -> SysNet a -> IO ()
+writeSystemWith :: (Named i, Named o) => GenOptions -> FilePath -> String -> (i -> SysNet o) -> IO ()
 writeSystemWith opts dir name sys = do
     createDirectoryIfMissing True dir
     env <- resolveFiles name sys

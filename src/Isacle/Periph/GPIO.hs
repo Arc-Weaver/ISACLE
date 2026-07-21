@@ -3,18 +3,12 @@ module Isacle.Periph.GPIO
       GPIO
       -- * PeriphDef description (single source of truth)
     , gpioDef
-      -- * Peripheral object (entity/bus split)
-    , gpio
-      -- * Standalone circuit wrapper
-    , gpioUnit
     ) where
 
 import Prelude hiding (read)
-import Data.Word (Word32)
-import Hdl.Sig (KnownDom, HdlType, Sig, Signal, (.&.), (.|.), sigComplement)
+import Hdl.Sig (HdlType)
 import Hdl.Prim  (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface, Peripheral, mkPeripheral)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -55,52 +49,3 @@ gpioDef pinsIn = do
     -- Reinterpret the typed register values back to the bus data width for the
     -- physical output bundle the system wires generically.
     (,) <$> toBusData portV <*> toBusData ddrV
-
--- ---------------------------------------------------------------------------
--- Peripheral object — the hardware-correct entity/bus split
--- ---------------------------------------------------------------------------
-
--- | GPIO as a peripheral object: its physical pin input @gpio_in@ is a real
--- input port (declared with 'input'), and it returns its physical outputs
--- @(oe, pin_out)@ = @(dir register, data register)@.  Reading the data register
--- returns the live pin on input bits and the latched value on output bits —
--- @(pin & ~dir) | (data & dir)@ — the standard tristate read-back.
---
---   offset 0  data  RW  output latch / pin read-back
---   offset 1  dir   RW  direction (1 = output ⇒ drives pin_out, else input)
-gpio :: (Signal s, Monad m)
-     => s dom (Unsigned 8)          -- ^ physical pin input (from the caller)
-     -> Peripheral s dom m (Unsigned 8) (s dom (Unsigned 8), s dom (Unsigned 8))
-gpio gpioIn = mkPeripheral "gpio" $ do
-    pinReg    <- declareRegVector @8 "PIN"    -- offset 0: read-only pin state
-    dirReg    <- declareRegVector @8 "DDR"    -- offset 1: direction (1 = output)
-    dataReg   <- declareRegVector @8 "PORT"   -- offset 2: output latch
-    writeDir  <- write dirReg
-    writeData <- write dataReg
-    -- Reading PIN returns the live pin on input bits, the latched value on output
-    -- bits — the standard tristate read-back @(pin & ~dir) | (data & dir)@.
-    read pinReg  ((gpioIn .&. sigComplement writeDir) .|. (writeData .&. writeDir))
-    read dirReg  writeDir
-    read dataReg writeData
-    return (writeDir, writeData)   -- (DDR = oe, PORT = pin_out)
-
--- ---------------------------------------------------------------------------
--- Standalone circuit wrapper
--- ---------------------------------------------------------------------------
-
--- | Memory-mapped GPIO port built from 'gpioDef'.
---   Accepts raw bus signals and returns (rdData, PORT latch, DDR).
---   For use via 'attachPeripheral' in 'SysDSL' prefer 'createGpio'.
-gpioUnit
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
-    => Word32                          -- ^ peripheral base address
-    -> Sig dom dat                     -- ^ physical pin inputs
-    -> Sig dom (Unsigned 32)           -- ^ bus write address
-    -> Sig dom dat                     -- ^ bus write data
-    -> Sig dom Bool                    -- ^ bus write enable
-    -> Sig dom (Unsigned 32)           -- ^ bus read address
-    -> (Sig dom dat, Sig dom dat, Sig dom dat)  -- ^ (rdData, PORT, DDR)
-gpioUnit base pinsIn wrAddr wrData wrEn rdAddr =
-    let bus              = hdlBusIface wrAddr wrData wrEn rdAddr base
-        ((port, ddr), rdData, _spec) = runPeriphNet hdlOps bus (gpioDef pinsIn)
-    in (rdData, port, ddr)

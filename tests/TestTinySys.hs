@@ -39,8 +39,9 @@ prog = [ 0x46   -- 0: LDI r0, 6    -- r0 = 6
        , 0xC9   -- 9: JMP 9        -- halt (infinite self-loop)
        ]
 
-mySystem :: SysNet ()
-mySystem = do
+-- Portless system (GPIO input tied to a constant): the top entity takes @()@.
+mySystem :: () -> SysNet ()
+mySystem () = do
     gpio <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8))
     coderom <- createRom 256 (RomImage prog :: RomImage (Unsigned 8)) "coderom0"
     (codeBus, ()) <- createBus @_ @SimpleBus "codebus" $ do

@@ -65,8 +65,10 @@ reduceToHdl :: SysNet a -> (a, [NetNode])
 reduceToHdl dsl = let (a, nodes, _) = runSystemDSL dsl in (a, nodes)
 
 -- | Reduce to the full 'Design' (top entity + sub-entities) for VHDL emission.
+-- Wraps the raw system computation as a __portless__ top entity (@() -> SysNet ()@)
+-- — signals here are supplied as Haskell arguments, not top-level ports.
 reduceToDesign :: forall a. String -> SysNet a -> Design
-reduceToDesign = execSystemDSL
+reduceToDesign name sys = execSystemDSL name (\() -> sys >> pure ())
 
 -- | Reduce to the introspectable topology document (BU5).
 reduceToDoc :: SysNet a -> SysDoc

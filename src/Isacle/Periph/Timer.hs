@@ -12,16 +12,12 @@ module Isacle.Periph.Timer
 
 import Prelude
 import Control.Monad.Fix (MonadFix)
-import Data.Word (Word32)
-import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal)
+import Data.Kind (Type)
 
-import Hdl.Net
-import Hdl.Class (regS)
+import Hdl.Monad (Hdl, registerEn)
 import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, runPeriphNet, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -81,31 +77,34 @@ timerDef cntSig = do
 --   emission so the feedback signal (cnt feeding timerDef feeding counterFSM
 --   feeding cnt) is safe.
 counterFSM
-    :: forall dom dat.
-       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat m.
+       (Hdl Sig m, KnownDom dom, HdlType dat, Num dat)
     => Sig dom Bool           -- ^ tick / count enable
     -> Sig dom dat            -- ^ TCCR (from timerDef)
     -> Sig dom dat            -- ^ OCR  (from timerDef)
     -> Sig dom dat            -- ^ TCNT preset value (from timerDef onWriteStrobe)
     -> Sig dom Bool           -- ^ TCNT write strobe (from timerDef)
-    -> NetM (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
+    -> m (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
 counterFSM tick tccr ocr tcntPreset tcntWritten = mdo
-    -- The counter register — the abstract 'regS' (deferred feedback); @mdo@ ties
-    -- @cnt@ to the next value it computes from itself.
-    cnt <- regS (0 :: dat) cntNext
-    let ctcMode = sigBit 0 tccr
-        atTop   = cnt .==. ocr
-        atMax   = cnt .==. maxVal
-        cntInc  = cnt + 1
-        cntTick = mux (ctcMode .&&. atTop) 0
-                      (mux (sigNot ctcMode .&&. atMax) 0 cntInc)
-        cntNext = mux tcntWritten tcntPreset (mux tick cntTick cnt)
-        ovf = tick .&&. sigNot ctcMode .&&. atMax .&&. sigNot tcntWritten
-        cmp = tick .&&. ctcMode        .&&. atTop .&&. sigNot tcntWritten
-    pure (cnt, ovf, cmp)
-  where
-    w      = fromIntegral (natVal (Proxy @(Width dat)))
-    maxVal = fromInteger (2^w - 1) :: Sig dom dat
+    -- The counter: advance on a tick, load on a TCNT write, hold otherwise.
+    cnt <- registerEn 0 advance nextCnt
+    let -- Decode the current state.
+        ctcMode     = sigBit 0 tccr           -- TCCR bit 0: clear-timer-on-compare
+        incremented = cnt + 1                 -- wraps to 0 automatically at 2^w
+        reachedOcr  = cnt .==. ocr            -- compare match (CTC's top)
+        reachedMax  = incremented .==. 0      -- free-running wrap (next tick is zero)
+
+        -- Next count: CTC clears at OCR; normal mode wraps naturally.  A TCNT
+        -- write preempts either and loads the preset.
+        counted = mux (ctcMode .&&. reachedOcr) 0 incremented
+        nextCnt = mux tcntWritten tcntPreset counted
+        advance = tick .||. tcntWritten
+
+        -- Interrupts fire only on a real tick (a software preset is not a tick).
+        ticking = tick .&&. sigNot tcntWritten
+        ovfIrq  = ticking .&&. sigNot ctcMode .&&. reachedMax
+        cmpIrq  = ticking .&&. ctcMode        .&&. reachedOcr
+    pure (cnt, ovfIrq, cmpIrq)
 
 -- ---------------------------------------------------------------------------
 -- Combined PeriphDef with counter FSM
@@ -115,9 +114,10 @@ counterFSM tick tccr ocr tcntPreset tcntWritten = mdo
 -- Use this as the @ptDef@ in a 'PeriphToken' so that 'attachPeripheral'
 -- gets real overflow and compare-match outputs instead of stubs.
 timerDefWithFSM
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat m.
+       (Hdl Sig m, KnownDom dom, HdlType dat, Num dat)
     => Sig dom Bool              -- ^ tick / count enable
-    -> PeriphDef Timer (Sig dom) NetM dat (Sig dom Bool, Sig dom Bool)
+    -> PeriphDef Timer (Sig dom) m dat (Sig dom Bool, Sig dom Bool)
                                  -- ^ (ovfIrq, cmpIrq)
 timerDefWithFSM tick = mdo
     (tccr, ocr, tcntPreset, tcntWritten) <- timerDef cnt
