@@ -9,7 +9,7 @@ import qualified Data.Map.Strict as Map
 import System.Directory (createDirectoryIfMissing)
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Hdl.Emit.Vhdl (emitVhdlDesignFiles)
 import Isacle.System.SystemDSL
@@ -39,14 +39,15 @@ prog = [ 0x46   -- 0: LDI r0, 6    -- r0 = 6
        , 0xC9   -- 9: JMP 9        -- halt (infinite self-loop)
        ]
 
-mySystem :: SysDSL ()
-mySystem = do
+-- Portless system (GPIO input tied to a constant): the top entity takes @()@.
+mySystem :: () -> SysNet ()
+mySystem () = do
     gpio <- createGpio "gpio0" (0 :: Sig Sys (Unsigned 8))
     coderom <- createRom 256 (RomImage prog :: RomImage (Unsigned 8)) "coderom0"
-    (codeBus, ()) <- createBus @SimpleBus "codebus" $ do
+    (codeBus, ()) <- createBus @_ @SimpleBus "codebus" $ do
         _ <- attachPeripheral 0x0 coderom
         return ()
-    (dataBus, ()) <- createBus @SimpleBus "databus" $ do
+    (dataBus, ()) <- createBus @_ @SimpleBus "databus" $ do
         _ <- attachPeripheral 0x60 gpio
         return ()
     dormant <- noIrq

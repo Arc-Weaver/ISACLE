@@ -29,7 +29,7 @@ import GHC.TypeLits (natVal, KnownNat)
 
 import Hdl.Net
 import qualified Hdl.Net as N
-import Hdl.Types (KnownDom(..), Sig(..), HdlType, mux)
+import Hdl.Sig (KnownDom(..), Sig(..), HdlType, mux)
 import Hdl.Prim (Unsigned)
 import Hdl.Class (connectSig)
 import Isacle.Cache.Config (CacheConfig(..))

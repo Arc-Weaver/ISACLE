@@ -2,18 +2,16 @@
 {-# LANGUAGE DefaultSignatures    #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Hdl.Types
-    ( -- * Per-signal domain tags
-      Sig(..)
-    , Signal(..)
-    , materialize
-      -- * Representation tagging
-    , withRepr
-    , sigReinterpret
+    ( -- * The abstract combinational signal surface
+      Signal(..)
       -- * Combinational operations
     , (.==.)
     , (.<.)
     , (.&&.)
     , (.||.)
+    , (.&.)
+    , (.|.)
+    , sigComplement
     , sigAnd
     , sigOr
     , sigNot
@@ -38,7 +36,8 @@ module Hdl.Types
       -- * Operation classes on HdlType values (lifted to signals)
     , HdlEq(..)
     , HdlOrd(..)
-    , HdlPorts(..)
+    , Named(..)
+    , Port(..)
     , PortSpec(..)
       -- * Generic derivation support (satisfy derived-instance constraints)
     , PortLayout(..)
@@ -58,50 +57,21 @@ module Hdl.Types
     ) where
 
 import Prelude
-import GHC.TypeLits (KnownNat, Nat, natVal, type (+))
-import Data.Bits ((.&.), (.|.), shiftL, shiftR)
+import GHC.TypeLits (KnownNat, Nat, natVal, type (+), Symbol, KnownSymbol, symbolVal)
+import Data.Bits (shiftL, shiftR)
+import qualified Data.Bits as B
 import Data.Kind (Type)
 import Data.Proxy (Proxy(..))
-import System.Mem.StableName (makeStableName)
-import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics
     ( Generic, Rep, from, to
     , M1(..), K1(..), U1(..)
     , (:*:)(..), (:+:)(..)
     , D, S, R, C
     , Selector, selName
-    , Constructor, conName
+    , Constructor
     )
 
 import Hdl.Net
-
--- ---------------------------------------------------------------------------
--- Per-signal clock domain
--- ---------------------------------------------------------------------------
-
-data Sig (dom :: k) (a :: Type)
-    = SWire WireId
-    | SExpr (NetM WireId)
-
-materialize :: Sig dom a -> NetM WireId
-materialize (SWire wid) = pure wid
-materialize (SExpr m)   = memoSExpr m sn
-  where sn = unsafePerformIO (makeStableName m)
-
--- ---------------------------------------------------------------------------
--- Num instance — combinational arithmetic
--- ---------------------------------------------------------------------------
-
-primSig2 :: PrimOp -> Sig dom a -> Sig dom b -> Sig dom c
-primSig2 op a b = SExpr $ do
-    wa <- materialize a
-    wb <- materialize b
-    lookupOrEmit op [wa, wb]
-
-primSig1 :: PrimOp -> Sig dom a -> Sig dom b
-primSig1 op a = SExpr $ do
-    wa <- materialize a
-    lookupOrEmit op [wa]
 
 -- ---------------------------------------------------------------------------
 -- Signal — the combinational signal surface, abstract over the interpreter
@@ -143,37 +113,8 @@ class Signal (sig :: k -> Type -> Type) where
     -- seams (instruction word / bus wires viewed at the demanded width).
     sigRetype :: (HdlType a, HdlType b) => sig dom a -> sig dom b
 
-instance Signal Sig where
-    sigPrim1 = primSig1
-    sigPrim2 = primSig2
-    sigPrim3 op a b c = SExpr $ do
-        wa <- materialize a
-        wb <- materialize b
-        wc <- materialize c
-        lookupOrEmit op [wa, wb, wc]
-    sigLitW v w = SExpr (lookupOrEmit (PLit v w) [])
-    sigRetype (SWire w) = SWire w
-    sigRetype (SExpr m) = SExpr m
-
--- | Tag a typed signal's wire with its representation (from 'hdlRepr'), so the
--- emitter declares it with the right VHDL signal type.  Apply where a typed
--- value originates (ports, registers) — the emitter then propagates the tag
--- through combinational ops, so intermediate results inherit it.
-withRepr :: forall dom a. HdlType a => Sig dom a -> Sig dom a
-withRepr s = SExpr $ do
-    w <- materialize s
-    reprWire w (hdlRepr (Proxy @a))
-    pure w
-
--- | Reinterpret a signal's bits as another representation of the /same width/
--- (e.g. @Unsigned n@ ↔ @Signed n@).  Unlike 'withRepr', which retags a leaf
--- wire in place, this emits a distinct cast wire (VHDL @signed(..)@\/@unsigned(..)@),
--- so the source wire keeps its own representation and may still be used under it.
--- This is the seam to cross between an unsigned bus and a signed datapath.
-sigReinterpret :: forall b dom a. HdlType b => Sig dom a -> Sig dom b
-sigReinterpret s = SExpr $ do
-    w <- materialize s
-    lookupOrEmit (PReinterpret (hdlRepr (Proxy @b))) [w]
+-- (The concrete @instance Signal Sig@, 'withRepr', and 'sigReinterpret' live in
+-- "Hdl.Sig" — they are the netlist backend's realisation and reference 'NetM'.)
 
 -- ---------------------------------------------------------------------------
 -- Comparison and logical operations
@@ -203,6 +144,21 @@ sigOr = sigPrim2 POr
 
 sigNot :: Signal sig => sig dom Bool -> sig dom Bool
 sigNot = sigPrim1 PNot
+
+-- | Bitwise AND/OR/NOT on a multi-bit word (same 'PAnd'/'POr'/'PNot' primitives —
+-- @numeric_std@ overloads @and@/@or@/@not@ bitwise on @unsigned@).  For the
+-- masking logic peripherals do (GPIO pin/direction mux, etc.).
+infixr 3 .&.
+(.&.) :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
+(.&.) = sigPrim2 PAnd
+
+infixr 2 .|.
+(.|.) :: (Signal sig, HdlType a) => sig dom a -> sig dom a -> sig dom a
+(.|.) = sigPrim2 POr
+
+-- | Bitwise complement of a multi-bit word.
+sigComplement :: (Signal sig, HdlType a) => sig dom a -> sig dom a
+sigComplement = sigPrim1 PNot
 
 -- | Multiplexer: @mux sel t f@ chooses @t@ when @sel@ is high, @f@ otherwise.
 mux :: (Signal sig, HdlType a) => sig dom Bool -> sig dom a -> sig dom a -> sig dom a
@@ -275,16 +231,7 @@ sigResize = sigPrim1 (PResize (fromIntegral (natVal (Proxy @m))))
 
 -- ---------------------------------------------------------------------------
 
-instance (HdlType a, Num a) => Num (Sig dom a) where
-    (+)    = primSig2 PAdd
-    (-)    = primSig2 PSub
-    (*)    = primSig2 PMul
-    negate = primSig1 PNot
-    abs    = id
-    signum = const (SExpr $ lookupOrEmit (PLit 1 w) [])
-      where w = fromIntegral (natVal (Proxy @(Width a)))
-    fromInteger n = SExpr $ lookupOrEmit (PLit n w) []
-      where w = fromIntegral (natVal (Proxy @(Width a)))
+-- (The concrete @instance Num (Sig dom a)@ lives in "Hdl.Sig".)
 
 -- ---------------------------------------------------------------------------
 -- Synthesizability
@@ -355,8 +302,8 @@ instance HdlType a => GHdlType (K1 r a) where
 
 instance (GHdlType f, GHdlType g) => GHdlType (f :*: g) where
     gWidth            = gWidth @f + gWidth @g
-    gToBits (x :*: y) = (gToBits x `shiftL` gWidth @g) .|. gToBits y
-    gFromBits n       = gFromBits (n `shiftR` wg) :*: gFromBits (n .&. ((1 `shiftL` wg) - 1))
+    gToBits (x :*: y) = (gToBits x `shiftL` gWidth @g) B..|. gToBits y
+    gFromBits n       = gFromBits (n `shiftR` wg) :*: gFromBits (n B..&. ((1 `shiftL` wg) - 1))
       where wg = gWidth @g
 
 -- | Derived 'toBits' for a record: pack fields MSB-first in field order.
@@ -478,21 +425,25 @@ data PortSpec = PortSpec
 -- convert between Haskell signal bundles and flat lists of wire identifiers.
 --
 -- For any Haskell record whose fields are all 'Sig' values (or other
--- 'HdlPorts' bundles), the four methods can be derived automatically:
+-- 'Named' bundles), the four methods can be derived automatically:
 --
 -- @
 -- data MyPorts = MyPorts { foo :: Sig SysClk (Unsigned 8), bar :: Sig SysClk Bool }
---   deriving (Generic, HdlPorts)
+--   deriving (Generic, Named)
 -- @
-class HdlPorts a where
+class Named a where
     -- | Number of wires in this port bundle.
     portCount   :: Proxy a -> Int
     -- | Port metadata in bundle order.  Each element knows its own domain.
     portSpecs   :: Proxy a -> [PortSpec]
+    -- | Port names in bundle order (defaults to the 'portSpecs' names).
+    portNames   :: Proxy a -> [String]
     -- | Materialize all signals in the bundle to a flat wire list.
     toWireIds   :: a -> NetM [WireId]
     -- | Wrap a flat list of wire IDs back into a bundle (output side).
     fromWireIds :: [WireId] -> a
+
+    portNames p = map portName (portSpecs p)
 
     default portCount   :: (Generic a, PortLayout (Rep a)) => Proxy a -> Int
     portCount _ = length (layoutSpecs @(Rep a))
@@ -506,36 +457,44 @@ class HdlPorts a where
     default fromWireIds :: (Generic a, PortLayout (Rep a)) => [WireId] -> a
     fromWireIds ws = to (fst (layoutDecode @(Rep a) ws))
 
-instance HdlPorts () where
+instance Named () where
     portCount   _ = 0
     portSpecs   _ = []
     toWireIds   _ = return []
     fromWireIds _ = ()
 
-instance (HdlType a, KnownDom dom) => HdlPorts (Sig dom a) where
-    portCount _ = 1
-    portSpecs _ = [PortSpec
-        { portName  = "sig"
-        , portWidth = fromIntegral (natVal (Proxy :: Proxy (Width a)))
-        , portDom   = domId (Proxy @dom) }]
-    toWireIds sig     = (:[]) <$> materialize sig
-    fromWireIds [w]   = SWire w
-    fromWireIds _     = error "HdlPorts (Sig): fromWireIds: wrong wire count"
+-- | A port whose name is carried at the __type level__ — so an input's port
+-- name exists before its signal value does (the framework allocates the port,
+-- then hands the body the signal).  Symmetric for inputs and outputs:
+-- @Port \"gpio_a_in\" (Sig dom (Unsigned 8))@.  Wraps a single-wire bundle @a@
+-- and overrides its port name with the type-level 'Symbol'.
+newtype Port (name :: Symbol) a = Port { unPort :: a }
 
-instance (HdlPorts a, HdlPorts b) => HdlPorts (a, b) where
+instance (KnownSymbol name, Named a) => Named (Port name a) where
+    portCount   _        = portCount (Proxy @a)
+    portSpecs   _        = [ p { portName = symbolVal (Proxy @name) }
+                           | p <- portSpecs (Proxy @a) ]
+    toWireIds   (Port a) = toWireIds a
+    fromWireIds ws       = Port (fromWireIds ws)
+
+-- (The concrete @instance Named (Sig dom a)@ lives in "Hdl.Sig".)
+
+instance (Named a, Named b) => Named (a, b) where
     portCount _ = portCount (Proxy @a) + portCount (Proxy @b)
     portSpecs _ = portSpecs (Proxy @a) ++ portSpecs (Proxy @b)
+    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b)) - 1] ]
     toWireIds (a, b) = (++) <$> toWireIds a <*> toWireIds b
     fromWireIds ws =
         let n = portCount (Proxy @a)
             (wa, wb) = splitAt n ws
         in (fromWireIds wa, fromWireIds wb)
 
-instance (HdlPorts a, HdlPorts b, HdlPorts c) => HdlPorts (a, b, c) where
+instance (Named a, Named b, Named c) => Named (a, b, c) where
     portCount _ = portCount (Proxy @a) + portCount (Proxy @b) + portCount (Proxy @c)
     portSpecs _ = portSpecs (Proxy @a)
                ++ portSpecs (Proxy @b)
                ++ portSpecs (Proxy @c)
+    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b, c)) - 1] ]
     toWireIds (a, b, c) = (\x y z -> x ++ y ++ z)
         <$> toWireIds a <*> toWireIds b <*> toWireIds c
     fromWireIds ws =
@@ -549,7 +508,7 @@ instance (HdlPorts a, HdlPorts b, HdlPorts c) => HdlPorts (a, b, c) where
 -- Generic port bundle machinery
 -- ---------------------------------------------------------------------------
 
--- | Generic traversal for 'HdlPorts' derivation.  Users never write instances
+-- | Generic traversal for 'Named' derivation.  Users never write instances
 -- of this class directly; it is satisfied automatically by the structure of
 -- any @deriving Generic@ data type.
 class PortLayout (f :: Type -> Type) where
@@ -569,7 +528,7 @@ instance {-# OVERLAPPABLE #-} PortLayout f => PortLayout (M1 i m f) where
     layoutDecode ws = let (x, ws') = layoutDecode @f ws in (M1 x, ws')
 
 -- Selector field: use the Haskell field name as the port name.
-instance {-# OVERLAPPING #-} (Selector s, HdlPorts a)
+instance {-# OVERLAPPING #-} (Selector s, Named a)
       => PortLayout (M1 S s (K1 R a)) where
     layoutSpecs =
         let nm    = selName (undefined :: M1 S s (K1 R a) ())
@@ -590,11 +549,13 @@ instance (PortLayout f, PortLayout g) => PortLayout (f :*: g) where
             (y, ws'') = layoutDecode @g ws'
         in (x :*: y, ws'')
 
--- Constructor wrapper: prefix every field name with the constructor name.
+-- Constructor wrapper: pass through.  Field names are the port names, verbatim —
+-- an entity is an entity, whether it is the top level or a nested sub-entity, so
+-- ports are named exactly by their record fields (no constructor-name prefix).
+-- Field-name conventions (e.g. @hci*@/@hco*@ on a CPU, @sp*@ on a bus port) keep
+-- an entity's in/out pins distinct without one.
 instance {-# OVERLAPPING #-} (Constructor c, PortLayout f) => PortLayout (M1 C c f) where
-    layoutSpecs =
-        let cname = conName (undefined :: M1 C c f ())
-        in map (\p -> p { portName = cname ++ "_" ++ portName p }) (layoutSpecs @f)
+    layoutSpecs = layoutSpecs @f
     layoutEncode (M1 x) = layoutEncode x
     layoutDecode ws = let (x, ws') = layoutDecode @f ws in (M1 x, ws')
 

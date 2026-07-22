@@ -10,7 +10,7 @@ import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 import qualified Data.Map.Strict as Map
 import Hdl.Net (DomId(..), ClockEdge(..), ResetPolarity(..), runNetM, NetM, freshWire, emit, NetNode(..))
-import Hdl.Types (KnownDom(..), Sig(..), materialize)
+import Hdl.Sig (KnownDom(..), Sig(..), materialize)
 import Hdl.Emit.Vhdl (emitVhdl)
 import Isacle.ISA.Backend.SynthVnCPU (synthVonNeumannCPU', VnMemIface(..))
 import Isacle.ISA.Example.TinyVN (tinyVnCPUDef, tinyVnISA, TinyVnCore)

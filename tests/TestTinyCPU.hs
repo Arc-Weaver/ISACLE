@@ -9,7 +9,7 @@ import GHC.TypeLits (natVal)
 import System.Directory (createDirectoryIfMissing)
 
 import Hdl.Bits (Unsigned)
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Net (DomId(..), ClockEdge(..), ResetPolarity(..), execDesign, NetM, freshWire, emit, NetNode(..))
 import Hdl.Emit.Vhdl
 import Isacle.ISA.Backend.SynthCPU (synthHarvardCPU', CpuMemIface(..))

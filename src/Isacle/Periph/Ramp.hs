@@ -25,19 +25,15 @@ module Isacle.Periph.Ramp
     , rampFSM
       -- * Combined PeriphDef with FSM wired in
     , rampDefWithFSM
-      -- * Standalone circuit wrapper
-    , rampUnit
     ) where
 
 import Prelude
-import Data.Proxy (Proxy(..))
-import Data.Word (Word32)
+import Data.Kind (Type)
 
-import Hdl.Net
-import Hdl.Types
+import Hdl.Monad (Hdl, registerEn)
+import Hdl.Sig
 import Hdl.Bits (Signed, Unsigned, KnownNat)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -66,8 +62,8 @@ asUnsigned = sigReinterpret
 -- by 'rampFSM'.  Returns the signed @(setpoint, step)@ control signals for the
 -- FSM to consume.
 rampDef
-    :: Sig dom (Unsigned 8)        -- ^ current value (from 'rampFSM')
-    -> PeriphDef Ramp (Sig dom) (Unsigned 8)
+    :: Monad m => Sig dom (Unsigned 8)        -- ^ current value (from 'rampFSM')
+    -> PeriphDef Ramp (Sig dom) m (Unsigned 8)
                  (Sig dom (Signed 8), Sig dom (Signed 8))
 rampDef curU = do
     -- Fused typed PE2 combinators — and a signed-register exercise (regField/
@@ -91,33 +87,25 @@ rampDef curU = do
 -- feedback (current feeds rampDef feeds rampFSM feeds current).  Returns the
 -- current value unsigned-encoded, ready for the bus read mux.
 rampFSM
-    :: forall dom. KnownDom dom
+    :: forall (dom :: Type) m. (Hdl Sig m, KnownDom dom)
     => Sig dom Bool            -- ^ tick / advance enable
     -> Sig dom (Signed 8)      -- ^ setpoint (from rampDef)
     -> Sig dom (Signed 8)      -- ^ step     (from rampDef)
-    -> Sig dom (Unsigned 8)    -- ^ current value (unsigned-encoded for the bus)
-rampFSM tick setpoint step = asUnsigned cur
-  where
-    domInfo = domId (Proxy @dom)
-
-    cur :: Sig dom (Signed 8)
-    cur = SExpr $ do
-        outWid <- freshWire
-        reprWire outWid RSigned
-        let curSig = SWire outWid :: Sig dom (Signed 8)
-            below  = curSig .<. setpoint
-            above  = setpoint .<. curSig
-            up     = curSig + step
-            down   = curSig - step
-            -- clamp the final step onto the setpoint
-            upN    = mux (setpoint .<. up)   setpoint up
-            downN  = mux (down .<. setpoint) setpoint down
-            moved  = mux below upN (mux above downN curSig)
-            next   = mux tick moved curSig
-        defer $ do
-            nextWid <- materialize next
-            emit $ NReg outWid nextWid Nothing (SomeBits 0 8) domInfo
-        pure outWid
+    -> m (Sig dom (Unsigned 8))  -- ^ current value (unsigned-encoded for the bus)
+rampFSM tick setpoint step = mdo
+    -- The signed 'current' register: advance on @tick@, hold otherwise.
+    -- 'withRepr' carries the signed representation onto the wire; @mdo@ ties @cur@
+    -- to its next value.
+    cur0 <- registerEn (0 :: Signed 8) tick moved
+    let cur    = withRepr cur0 :: Sig dom (Signed 8)
+        below  = cur .<. setpoint
+        above  = setpoint .<. cur
+        up     = cur + step
+        down   = cur - step
+        upN    = mux (setpoint .<. up)   setpoint up
+        downN  = mux (down .<. setpoint) setpoint down
+        moved  = mux below upN (mux above downN cur)
+    pure (asUnsigned cur)
 
 -- ---------------------------------------------------------------------------
 -- Combined PeriphDef with ramp FSM
@@ -126,35 +114,17 @@ rampFSM tick setpoint step = asUnsigned cur
 -- | 'rampDef' with 'rampFSM' wired in via a recursive binding.  Use as the
 -- @ptDef@ in a 'PeriphToken'.  The ramp has no IRQ outputs.
 rampDefWithFSM
-    :: KnownDom dom
+    :: forall (dom :: Type) m. (Hdl Sig m, KnownDom dom)
     => Sig dom Bool                 -- ^ tick / advance enable
-    -> PeriphDef Ramp (Sig dom) (Unsigned 8) ()
+    -> PeriphDef Ramp (Sig dom) m (Unsigned 8) ()
 rampDefWithFSM tick = mdo
     (setpoint, step) <- rampDef curU
-    let curU = rampFSM tick setpoint step
+    curU <- liftHdl (rampFSM tick setpoint step)
     return ()
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
--- | Memory-mapped ramp built from 'rampDef' + 'rampFSM'.
---
---   base + 0  SETPOINT
---   base + 1  STEP
---   base + 2  CURRENT (read = current value)
-rampUnit
-    :: KnownDom dom
-    => Word32                          -- ^ peripheral base address
-    -> Sig dom Bool                    -- ^ tick / advance enable
-    -> Sig dom (Unsigned 32)           -- ^ bus write address
-    -> Sig dom (Unsigned 8)            -- ^ bus write data
-    -> Sig dom Bool                    -- ^ bus write enable
-    -> Sig dom (Unsigned 32)           -- ^ bus read address
-    -> Sig dom (Unsigned 8)            -- ^ read data
-rampUnit base tick wrAddr wrData wrEn rdAddr = rdData
-  where
-    bus = hdlBusIface wrAddr wrData wrEn rdAddr base
-    ((setpoint, step), rdData, _spec) =
-        runPeriphDef hdlOps bus (rampDef curU)
-    curU = rampFSM tick setpoint step
+-- (The legacy standalone @rampUnit@ wrapper was removed — use 'rampDefWithFSM'
+--  as a 'PeriphToken' def via 'createRamp'.)

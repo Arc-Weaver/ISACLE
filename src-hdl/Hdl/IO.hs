@@ -1,27 +1,29 @@
 {-# LANGUAGE FlexibleContexts #-}
--- | 'HdlIO' — the entity typeclass: how a backend creates ('bind') and
--- instantiates ('entity') entities.  The synthesis backend ('Entity') is the
--- instance below; sim / vhdl / verilog become further instances.
+-- | 'Entity' — the encapsulation typeclass: how a backend creates ('entity')
+-- and instantiates ('instanceOf') entities.  The synthesis backend ('EntityDef')
+-- is the instance below; sim / vhdl / verilog become further instances.
 module Hdl.IO
-    ( HdlIO(..)
+    ( Entity(..)
     ) where
 
 import Prelude
 
 import Hdl.Net    (NetM)
-import Hdl.Entity (Entity, PortRef)
+import Hdl.Entity (EntityDef)
+import Hdl.Types  (Named)
 import qualified Hdl.Entity as E
 import Hdl.Class  (instEntity)
 
--- | A backend's entity representation @h i o@ (input bundle @i@, output @o@):
--- 'bind' builds one from a body, 'entity' instantiates one into the current
--- design.  Both interfaces are 'PortRef' records (port names from fields).
-class HdlIO h where
-    -- | Build an entity from a name and its body.
-    bind   :: String -> (i -> NetM o) -> h i o
-    -- | Instantiate an entity as a named sub-instance, wiring inputs → outputs.
-    entity :: (PortRef i, PortRef o) => String -> h i o -> i -> NetM o
+-- | A backend's encapsulated entity @e i o@ (input bundle @i@, output @o@):
+-- 'entity' builds one from a body, 'instanceOf' instantiates one into the
+-- current design.  Both interfaces are 'Named' records (port names from fields).
+class Entity e where
+    -- | Build (encapsulate) an entity from a name and its body.
+    entity     :: String -> (i -> NetM o) -> e i o
+    -- | Instantiate an entity as a named sub-instance, wiring inputs → outputs
+    -- (models VHDL @u : entity work.foo@).
+    instanceOf :: (Named i, Named o) => String -> e i o -> i -> NetM o
 
-instance HdlIO Entity where
-    bind                  = E.entity
-    entity label e inputs = instEntity e label inputs
+instance Entity EntityDef where
+    entity                    = E.entityDef
+    instanceOf label e inputs = instEntity e label inputs

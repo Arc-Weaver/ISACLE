@@ -1,4 +1,4 @@
--- | Command-line entry point for a 'SysDSL' system.
+-- | Command-line entry point for a 'SysNet' system.
 --
 -- The minimal-boilerplate path: a whole system file is one import and one call,
 -- with the system constructed inline and handed straight to 'systemMain'.
@@ -29,6 +29,9 @@ module Isacle.System.CLI
     , DomId(..), ClockEdge(..), ResetPolarity(..)
     , Sig(..)
     , Unsigned, Signed
+      -- * Top-level ports (for the entity-style @i -> SysNet o@ system body)
+    , Named
+    , Port(..)
     ) where
 
 import Prelude
@@ -39,7 +42,8 @@ import System.Exit (exitFailure, exitSuccess)
 import qualified Data.Map.Strict as Map
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
+import Hdl.Types (Named, Port(..))
 import Hdl.Prim  (Unsigned)
 import Hdl.Bits  (Signed)
 import Isacle.System.SystemDSL
@@ -124,7 +128,7 @@ usage prog = unlines
 -- | Parse argv and generate the requested artifacts for @sys@.  @name@ is the
 -- default top-entity name (overridable with @--name@); the default output
 -- directory is @build/\<name\>@.
-systemMain :: String -> SysDSL a -> IO ()
+systemMain :: (Named i, Named o) => String -> (i -> SysNet o) -> IO ()
 systemMain name sys = do
     args <- getArgs
     case parseArgs name args of

@@ -18,12 +18,8 @@
 -- 'HDL' is the concrete synthesis instance (over 'NetM'); naming rides on the
 -- value type via 'Named' so signals carry their name to the emitter.
 module Hdl.Monad
-    ( -- * Named values
-      Named(..)
-    , name
-    , erase
-      -- * The Hdl typeclass (netlist instance: Hdl Sig NetM)
-    , Hdl(..)
+    ( -- * The Hdl typeclass (netlist instance: Hdl Sig NetM)
+      Hdl(..)
       -- * State-machine combinators
     , mealy
     , moore
@@ -40,39 +36,9 @@ import qualified Data.Map.Strict as Map
 
 import Hdl.Net   (NetM, freshWire, emit, defer, hintWire,
                   NetNode(NReg, NRegFile, NRegFileRead), SomeBits(..))
-import Hdl.Types (Sig(..), Signal(sigLitW), materialize, mux, (.==.), (.<.),
+import Hdl.Sig   (Sig(..), materialize)
+import Hdl.Types (Signal(sigLitW), mux, (.==.), (.<.),
                   sigNot, (.&&.), HdlType(..), HdlOrd, KnownDom(..))
-
--- ---------------------------------------------------------------------------
--- Named — a representation-identical marker on the value type
--- ---------------------------------------------------------------------------
-
--- | A name marker carried on a signal's /value/ type: @Sig dom (Named a)@ is the
--- same wire as @Sig dom a@ with a name attached (in the netlist), the type only
--- tracking that it is named.  Erases to identical bits, so zero hardware cost.
-newtype Named a = Named { unNamed :: a }
-
-instance HdlType a => HdlType (Named a) where
-    type Width (Named a) = Width a
-    toBits (Named x) = toBits x
-    fromBits         = Named . fromBits
-    hdlRepr _        = hdlRepr (Proxy @a)
-
--- | Attach a name to a signal (outputs): @plain -> named@, emitting the name
--- onto the underlying wire so the VHDL signal is named, not @wN@.
-name :: KnownDom dom => String -> Sig dom a -> Sig dom (Named a)
-name nm s = SExpr $ do
-    w <- materialize s
-    hintWire w nm
-    pure w
-
--- | Erase a name (inputs): hand the body the plain signal within a continuation,
--- so the name can seed a scope for the derived logic.  The inverse of 'name'.
-erase :: Sig dom (Named a) -> (Sig dom a -> m r) -> m r
-erase s k = k (retype s)
-  where
-    retype (SWire w) = SWire w
-    retype (SExpr m) = SExpr m
 
 -- ---------------------------------------------------------------------------
 -- Hdl — the fundamental monad-level hardware surface

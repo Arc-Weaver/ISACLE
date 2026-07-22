@@ -2,17 +2,13 @@
 {-# LANGUAGE DefaultSignatures    #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Hdl.Entity
-    ( -- * Port reference
-      PortRef(..)
-      -- * Generic derivation support
-    , PortLabels(..)
-      -- * Port mapping between bundles
-    , PortMap
+    ( -- * Port mapping between bundles
+      PortMap
       -- * Behavioral description
     , hdl
-      -- * Entity construction
-    , Entity
-    , entity
+      -- * EntityDef construction
+    , EntityDef
+    , entityDef
     , entityName
     , entityBody
       -- * Synthesis override
@@ -21,11 +17,12 @@ module Hdl.Entity
       -- * Elaborated port declaration
     , Dir(..)
     , PortDecl(..)
-      -- * Elaborated entity
+      -- * Elaborated entityDef
     , ElabEntity(..)
       -- * Elaboration
     , elaborate
     , elaborateDesign
+    , elaborateTop
     ) where
 
 import Prelude
@@ -42,80 +39,8 @@ import GHC.Generics
     )
 
 import Hdl.Net
+import Hdl.Sig   (Sig)
 import Hdl.Types
-
--- ---------------------------------------------------------------------------
--- PortRef
--- ---------------------------------------------------------------------------
-
--- ---------------------------------------------------------------------------
--- PortLabels — Generic traversal for port name derivation
--- ---------------------------------------------------------------------------
-
--- | Generic traversal that extracts Haskell record field names as port names.
--- Users never write instances of this class; it is satisfied automatically by
--- @deriving Generic@.
-class PortLabels (f :: Type -> Type) where
-    portLabels :: [String]
-
-instance PortLabels U1 where portLabels = []
-
-instance {-# OVERLAPPABLE #-} PortLabels f => PortLabels (M1 i m f) where
-    portLabels = portLabels @f
-
-instance {-# OVERLAPPING #-} Selector s => PortLabels (M1 S s (K1 R a)) where
-    portLabels = [selName (undefined :: M1 S s (K1 R a) ())]
-
-instance (PortLabels f, PortLabels g) => PortLabels (f :*: g) where
-    portLabels = portLabels @f ++ portLabels @g
-
-instance {-# OVERLAPPING #-} (Constructor c, PortLabels f) => PortLabels (M1 C c f) where
-    portLabels =
-        let cname = conName (undefined :: M1 C c f ())
-        in map (\n -> cname ++ "_" ++ n) (portLabels @f)
-
--- SumLabels mirrors SumLayout: collect all field labels without adding inner
--- tag entries, so that PortLabels (f :+: g) emits exactly one "tag".
-class SumLabels (f :: Type -> Type) where
-    sumLabels :: [String]
-
-instance {-# OVERLAPPING #-} (Constructor c, PortLabels f) => SumLabels (M1 C c f) where
-    sumLabels = portLabels @(M1 C c f)
-
-instance (SumLabels f, SumLabels g) => SumLabels (f :+: g) where
-    sumLabels = sumLabels @f ++ sumLabels @g
-
-instance (SumLabels f, SumLabels g) => PortLabels (f :+: g) where
-    portLabels = "tag" : sumLabels @f ++ sumLabels @g
-
--- ---------------------------------------------------------------------------
--- PortRef
--- ---------------------------------------------------------------------------
-
--- | A port bundle with declared port names.
--- Named record types can derive this automatically alongside 'HdlPorts':
---
--- @
--- data MyPorts = MyPorts { foo :: Sig SysClk Bool, bar :: Sig SysClk (Unsigned 8) }
---   deriving (Generic, HdlPorts, PortRef)
--- @
-class HdlPorts a => PortRef a where
-    portNames :: Proxy a -> [String]
-
-    default portNames :: (Generic a, PortLabels (Rep a)) => Proxy a -> [String]
-    portNames _ = portLabels @(Rep a)
-
-instance PortRef () where
-    portNames _ = []
-
-instance (HdlType a, KnownDom dom) => PortRef (Sig dom a) where
-    portNames _ = ["p"]
-
-instance (PortRef a, PortRef b) => PortRef (a, b) where
-    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b)) - 1] ]
-
-instance (PortRef a, PortRef b, PortRef c) => PortRef (a, b, c) where
-    portNames _ = [ "p" ++ show i | i <- [0 .. portCount (Proxy @(a, b, c)) - 1] ]
 
 -- ---------------------------------------------------------------------------
 -- PortMap
@@ -123,8 +48,8 @@ instance (PortRef a, PortRef b, PortRef c) => PortRef (a, b, c) where
 
 -- | Structural compatibility between two port bundles for synthesis
 -- substitution.  @PortMap i vi@ declares that our ports @i@ map onto
--- vendor ports @vi@.
-class (PortRef i, PortRef vi) => PortMap i vi
+-- vendor ports @vi@.  (Port names come from 'Named'.)
+class (Named i, Named vi) => PortMap i vi
 
 -- ---------------------------------------------------------------------------
 -- Port declarations
@@ -143,7 +68,7 @@ data PortDecl = PortDecl
 -- ElabEntity
 -- ---------------------------------------------------------------------------
 
--- | An elaborated entity: port declarations and the flat node list.
+-- | An elaborated entityDef: port declarations and the flat node list.
 -- This is the form consumed by the VHDL emitter.
 data ElabEntity = ElabEntity
     { elabName  :: String
@@ -152,15 +77,15 @@ data ElabEntity = ElabEntity
     } deriving (Show)
 
 -- ---------------------------------------------------------------------------
--- Entity
+-- EntityDef
 -- ---------------------------------------------------------------------------
 
--- | A first-class HDL entity.
+-- | A first-class HDL entityDef.
 --
 -- 'entityBody' is the behavioral simulation model.
 -- 'entitySynth', when present, substitutes a vendor primitive at synthesis;
 -- the port mapping is expressed as type-safe functions between bundles.
-data Entity i o = Entity
+data EntityDef i o = EntityDef
     { entityName  :: String
     , entityBody  :: i -> NetM o   -- ^ the netlist-backend body (pass 2: polymorphic @Hdl s m@)
     , entitySynth :: Maybe (SynthTarget i o)
@@ -173,7 +98,7 @@ data Entity i o = Entity
 data SynthTarget i o = forall vi vo.
     ( PortMap i vi
     , PortMap vo o
-    ) => SynthTarget (Entity vi vo)
+    ) => SynthTarget (EntityDef vi vo)
 
 -- ---------------------------------------------------------------------------
 -- Smart constructors
@@ -184,22 +109,22 @@ data SynthTarget i o = forall vi vo.
 hdl :: (i -> NetM o) -> (i -> NetM o)
 hdl = id
 
--- | Build an entity from a name and its behavioral description.
-entity :: String -> (i -> NetM o) -> Entity i o
-entity name body = Entity name body Nothing
+-- | Build an entityDef from a name and its behavioral description.
+entityDef :: String -> (i -> NetM o) -> EntityDef i o
+entityDef name body = EntityDef name body Nothing
 
--- | Attach a vendor synthesis target to an entity.
-withSynth :: Entity i o -> SynthTarget i o -> Entity i o
+-- | Attach a vendor synthesis target to an entityDef.
+withSynth :: EntityDef i o -> SynthTarget i o -> EntityDef i o
 withSynth e s = e { entitySynth = Just s }
 
 -- ---------------------------------------------------------------------------
 -- Elaboration
 -- ---------------------------------------------------------------------------
 
--- | Elaborate an entity: allocate input wires, run the behavioral body,
+-- | Elaborate an entityDef: allocate input wires, run the behavioral body,
 -- emit 'NInput'/'NOutput' nodes, and return the fully described 'ElabEntity'.
-elaborate :: forall i o. (PortRef i, PortRef o) => Entity i o -> ElabEntity
-elaborate Entity{..} = ElabEntity entityName portDecls nodes
+elaborate :: forall i o. (Named i, Named o) => EntityDef i o -> ElabEntity
+elaborate EntityDef{..} = ElabEntity entityName portDecls nodes
   where
     iSpecs    = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
     oSpecs    = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))
@@ -218,11 +143,45 @@ elaborate Entity{..} = ElabEntity entityName portDecls nodes
     emitOutput ps wid = emit $ NOutput wid (portName ps) (portWidth ps) (portDom ps)
     toDecl dir ps     = PortDecl (portName ps) dir (portWidth ps) (portDom ps)
 
+-- | Elaborate a __top-level__ design whose body runs in a monad layered over
+-- 'NetM' (e.g. the system builder's @StateT SysBuild NetM@).  Top-level ports are
+-- bound from the @Named@ input/output bundle __types__ using the __same__
+-- port-from-types resolution 'elaborate'/'instEntity' use for every sub-entity —
+-- an entity is an entity, so the top level needs no special-cased primitives.
+--
+-- @runBody@ receives the input bundle (built from freshly-allocated 'NInput'
+-- wires) and must return the output bundle (from which 'NOutput' nodes are
+-- emitted) paired with any extra result @r@ to thread out (e.g. accumulated build
+-- state).  Returns the output bundle, that extra result, and the full 'Design'
+-- (top entity under @name@ plus every sub-entity instantiated inside the body).
+elaborateTop
+    :: forall i o r. (Named i, Named o)
+    => String
+    -> (i -> NetM (o, r))
+    -> (o, r, Design)
+elaborateTop name runBody = (o, r, Map.insert name topNodes subDesign)
+  where
+    iSpecs = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
+    oSpecs = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))
+    ((o, r), topNodes, subDesign) = runNetM $ do
+        inWires  <- mapM allocInput iSpecs
+        (o', r') <- runBody (fromWireIds inWires)
+        outWires <- toWireIds o'
+        mapM_ (uncurry emitOutput) (zip oSpecs outWires)
+        pure (o', r')
+
+    setName n ps      = ps { portName = n }
+    allocInput ps     = do
+        wid <- freshWire
+        emit $ NInput wid (portName ps) (portWidth ps) (portDom ps)
+        return wid
+    emitOutput ps wid = emit $ NOutput wid (portName ps) (portWidth ps) (portDom ps)
+
 -- | Like 'elaborate', but also returns the full 'Design' — including any
 -- sub-entities instantiated via 'instEntity' inside the body.
 -- Use this for hierarchical designs.
-elaborateDesign :: forall i o. (PortRef i, PortRef o) => Entity i o -> (ElabEntity, Design)
-elaborateDesign Entity{..} = (ElabEntity entityName portDecls topNodes, fullDesign)
+elaborateDesign :: forall i o. (Named i, Named o) => EntityDef i o -> (ElabEntity, Design)
+elaborateDesign EntityDef{..} = (ElabEntity entityName portDecls topNodes, fullDesign)
   where
     iSpecs    = zipWith setName (portNames (Proxy @i)) (portSpecs (Proxy @i))
     oSpecs    = zipWith setName (portNames (Proxy @o)) (portSpecs (Proxy @o))

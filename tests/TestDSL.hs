@@ -7,7 +7,7 @@ import Numeric (showHex)
 import System.Exit (exitFailure)
 
 import Hdl.Net   (DomId(..), ClockEdge(..), ResetPolarity(..))
-import Hdl.Types (KnownDom(..), Sig(..))
+import Hdl.Sig (KnownDom(..), Sig(..))
 import Hdl.Prim  (Unsigned)
 import Isacle.System.SystemDSL
 import Isacle.System.HdlCircuit (GpioPhys(..), UartPhys(..))
@@ -32,7 +32,7 @@ instance KnownDom Clk where
 mySystem
     :: Sig Clk Bool
     -> Sig Clk (Unsigned 8)
-    -> SysDSL
+    -> SysNet
               (Sig Clk Bool, Sig Clk (Unsigned 8), Sig Clk (Unsigned 8))
 mySystem rxPin gpioIn = do
     uart <- createUart "uart" rxPin

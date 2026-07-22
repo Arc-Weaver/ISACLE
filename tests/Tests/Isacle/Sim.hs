@@ -10,7 +10,7 @@ import qualified Data.Map.Strict as M
 import System.Exit (exitFailure)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Class (inputS, outputS)
 import Hdl.Bits  (Signed)
 import Hdl.Prim  (Unsigned)
@@ -55,7 +55,8 @@ runSimTests = do
             sp   <- inputS @D @(Signed 8) "sp"
             st   <- inputS @D @(Signed 8) "st"
             tick <- inputS @D @Bool "tick"
-            outputS @D @(Unsigned 8) "cur" (rampFSM @D tick (withRepr sp) (withRepr st))
+            cur  <- rampFSM @D tick (withRepr sp) (withRepr st)
+            outputS @D @(Unsigned 8) "cur" cur
         rtrace = map (M.findWithDefault (-1) "cur")
                      (simulateDesign (ramp M.! "ramp")
                                      (M.fromList [("sp", 250), ("st", 2), ("tick", 1)]) 6)

@@ -6,11 +6,11 @@ import qualified Data.Map.Strict as Map
 import GHC.Generics (Generic)
 
 import Hdl.Net
-import Hdl.Types
+import Hdl.Sig
 import Hdl.Prim
 import Hdl.Class
-import Hdl.Entity hiding (entity)
-import Hdl.IO (bind, entity)
+import Hdl.Entity
+import Hdl.IO (entity, instanceOf)
 import Hdl.Emit.Vhdl
 
 -- ---------------------------------------------------------------------------
@@ -26,8 +26,8 @@ instance KnownDom SysClk where
 -- 8-bit free-running counter; output high while counter < duty.
 -- ---------------------------------------------------------------------------
 
-pwmGen :: Entity (Sig SysClk (Unsigned 8)) (Sig SysClk Bool)
-pwmGen = bind "pwm_gen" (hdl go)
+pwmGen :: EntityDef (Sig SysClk (Unsigned 8)) (Sig SysClk Bool)
+pwmGen = entity "pwm_gen" (hdl go)
   where
     go duty = mdo
         count <- regS 0 (count + 1) >>= named "count"
@@ -37,8 +37,8 @@ pwmGen = bind "pwm_gen" (hdl go)
 -- 2. Rising / falling edge detector
 -- ---------------------------------------------------------------------------
 
-edgeDetect :: Entity (Sig SysClk Bool) (Sig SysClk Bool, Sig SysClk Bool)
-edgeDetect = bind "edge_detect" (hdl go)
+edgeDetect :: EntityDef (Sig SysClk Bool) (Sig SysClk Bool, Sig SysClk Bool)
+edgeDetect = entity "edge_detect" (hdl go)
   where
     go sig_in = do
         delayed <- regS False sig_in >>= named "delayed"
@@ -51,11 +51,11 @@ edgeDetect = bind "edge_detect" (hdl go)
 -- op[1:0]: 00 = add, 01 = sub, 10 = and, 11 = or
 -- ---------------------------------------------------------------------------
 
-simpleAlu :: Entity ( Sig SysClk (Unsigned 8)
+simpleAlu :: EntityDef ( Sig SysClk (Unsigned 8)
                     , Sig SysClk (Unsigned 8)
                     , Sig SysClk (Unsigned 2) )
                     ( Sig SysClk (Unsigned 8) )
-simpleAlu = bind "simple_alu" (hdl go)
+simpleAlu = entity "simple_alu" (hdl go)
   where
     go (a, b, op) =
         named "result" $
@@ -67,11 +67,11 @@ simpleAlu = bind "simple_alu" (hdl go)
 -- 4. Accumulator with saturating add
 -- ---------------------------------------------------------------------------
 
-saturatingAccum :: Entity ( Sig SysClk (Unsigned 16)
+saturatingAccum :: EntityDef ( Sig SysClk (Unsigned 16)
                           , Sig SysClk Bool
                           , Sig SysClk (Unsigned 16) )
                           ( Sig SysClk (Unsigned 16) )
-saturatingAccum = bind "sat_accum" (hdl go)
+saturatingAccum = entity "sat_accum" (hdl go)
   where
     go (din, en, max_val) = mdo
         let added   = acc + din
@@ -90,10 +90,10 @@ data RamPorts = RamPorts
     , wrAddr :: Sig SysClk (Unsigned 5)
     , wrData :: Sig SysClk (Unsigned 8)
     , wrEn   :: Sig SysClk Bool
-    } deriving (Generic, HdlPorts, PortRef)
+    } deriving (Generic, Named)
 
-regFile32x8 :: Entity RamPorts (Sig SysClk (Unsigned 8))
-regFile32x8 = bind "reg_file_32x8" (hdl go)
+regFile32x8 :: EntityDef RamPorts (Sig SysClk (Unsigned 8))
+regFile32x8 = entity "reg_file_32x8" (hdl go)
   where
     go RamPorts{..} = ram 32 [] rdAddr wrAddr wrData wrEn
 
@@ -101,8 +101,8 @@ regFile32x8 = bind "reg_file_32x8" (hdl go)
 -- 6. ROM lookup table: 4-bit address → 8-bit sine approximation
 -- ---------------------------------------------------------------------------
 
-sineLut :: Entity (Sig SysClk (Unsigned 4)) (Sig SysClk (Unsigned 8))
-sineLut = bind "sine_lut" (hdl go)
+sineLut :: EntityDef (Sig SysClk (Unsigned 4)) (Sig SysClk (Unsigned 8))
+sineLut = entity "sine_lut" (hdl go)
   where
     go phase = rom 16 table phase
     table = [0, 50, 98, 142, 180, 210, 233, 246, 255,
@@ -112,18 +112,18 @@ sineLut = bind "sine_lut" (hdl go)
 -- 7. Hierarchical design: two adder instances feeding a pipeline register
 -- ---------------------------------------------------------------------------
 
-adder8 :: Entity (Sig SysClk (Unsigned 8), Sig SysClk (Unsigned 8))
+adder8 :: EntityDef (Sig SysClk (Unsigned 8), Sig SysClk (Unsigned 8))
                  (Sig SysClk (Unsigned 8))
-adder8 = bind "adder8" $ hdl $ \(a, b) -> return (a + b)
+adder8 = entity "adder8" $ hdl $ \(a, b) -> return (a + b)
 
 data PipeIn = PipeIn
     { pX :: Sig SysClk (Unsigned 8)
     , pY :: Sig SysClk (Unsigned 8)
     , pZ :: Sig SysClk (Unsigned 8)
-    } deriving (Generic, HdlPorts, PortRef)
+    } deriving (Generic, Named)
 
-pipelineAdder :: Entity PipeIn (Sig SysClk (Unsigned 8))
-pipelineAdder = bind "pipeline_top" (hdl go)
+pipelineAdder :: EntityDef PipeIn (Sig SysClk (Unsigned 8))
+pipelineAdder = entity "pipeline_top" (hdl go)
   where
     go PipeIn{..} = do
         s0 <- entity "u_add0" adder8 (pX, pY)
@@ -135,25 +135,25 @@ pipelineAdder = bind "pipeline_top" (hdl go)
 -- synthesis targets and are simpler to write when readability isn't a priority.
 -- ---------------------------------------------------------------------------
 
-pwmGenBare :: Entity (Sig SysClk (Unsigned 8)) (Sig SysClk Bool)
-pwmGenBare = bind "pwm_gen_bare" (hdl go)
+pwmGenBare :: EntityDef (Sig SysClk (Unsigned 8)) (Sig SysClk Bool)
+pwmGenBare = entity "pwm_gen_bare" (hdl go)
   where
     go duty = mdo
         count <- regS 0 (count + 1)
         return (count .<. duty)
 
-edgeDetectBare :: Entity (Sig SysClk Bool) (Sig SysClk Bool, Sig SysClk Bool)
-edgeDetectBare = bind "edge_detect_bare" (hdl go)
+edgeDetectBare :: EntityDef (Sig SysClk Bool) (Sig SysClk Bool, Sig SysClk Bool)
+edgeDetectBare = entity "edge_detect_bare" (hdl go)
   where
     go sig_in = do
         delayed <- regS False sig_in
         return (sig_in .&&. sigNot delayed, sigNot sig_in .&&. delayed)
 
-saturatingAccumBare :: Entity ( Sig SysClk (Unsigned 16)
+saturatingAccumBare :: EntityDef ( Sig SysClk (Unsigned 16)
                               , Sig SysClk Bool
                               , Sig SysClk (Unsigned 16) )
                               ( Sig SysClk (Unsigned 16) )
-saturatingAccumBare = bind "sat_accum_bare" (hdl go)
+saturatingAccumBare = entity "sat_accum_bare" (hdl go)
   where
     go (din, en, max_val) = mdo
         let added   = acc + din
@@ -172,23 +172,23 @@ data BusReq
     = BusWrite { reqAddr :: Sig SysClk (Unsigned 16)
                , reqData :: Sig SysClk (Unsigned 8) }
     | BusRead  { reqAddr :: Sig SysClk (Unsigned 16) }
-    deriving (Generic, HdlPorts, PortRef)
+    deriving (Generic, Named)
 
 -- Produces a write transaction: tag=0, both fields driven.
-genWrite :: Entity (Sig SysClk (Unsigned 16), Sig SysClk (Unsigned 8)) BusReq
-genWrite = bind "gen_write" (hdl go)
+genWrite :: EntityDef (Sig SysClk (Unsigned 16), Sig SysClk (Unsigned 8)) BusReq
+genWrite = entity "gen_write" (hdl go)
   where go (addr, dat) = return BusWrite { reqAddr = addr, reqData = dat }
 
 -- Produces a read transaction: tag=1, reqData zero-padded.
-genRead :: Entity (Sig SysClk (Unsigned 16)) BusReq
-genRead = bind "gen_read" (hdl go)
+genRead :: EntityDef (Sig SysClk (Unsigned 16)) BusReq
+genRead = entity "gen_read" (hdl go)
   where go addr = return BusRead { reqAddr = addr }
 
 -- Latches write address and data one cycle.
 -- BusWrite is the first constructor so fromWireIds wires up both reqAddr and
 -- reqData; for a BusRead the reqData field is zero (padding from genRead).
-writeLatch :: Entity BusReq (Sig SysClk (Unsigned 16), Sig SysClk (Unsigned 8))
-writeLatch = bind "write_latch" (hdl go)
+writeLatch :: EntityDef BusReq (Sig SysClk (Unsigned 16), Sig SysClk (Unsigned 8))
+writeLatch = entity "write_latch" (hdl go)
   where
     go req = do
         addrR <- regS 0 (reqAddr req) >>= named "addr_r"
@@ -206,19 +206,19 @@ data UartCmd
     | UartSetBaud { baudDiv  :: Sig SysClk (Unsigned 16) }
     | UartDiscard { discardN :: Sig SysClk (Unsigned 4) }
     | UartReset   { delayUs  :: Sig SysClk (Unsigned 8) }
-    deriving (Generic, HdlPorts, PortRef)
+    deriving (Generic, Named)
 
 -- Pipeline-registers the outgoing byte before packaging it as a send command.
-uartSendCmd :: Entity (Sig SysClk (Unsigned 8)) UartCmd
-uartSendCmd = bind "uart_send_cmd" (hdl go)
+uartSendCmd :: EntityDef (Sig SysClk (Unsigned 8)) UartCmd
+uartSendCmd = entity "uart_send_cmd" (hdl go)
   where
     go byte = do
         byteR <- regS 0 byte >>= named "byte_r"
         return UartSend { txByte = byteR }
 
 -- Halves the baud divisor (doubles the baud rate) then issues a set-baud command.
-uartDoubleBaud :: Entity (Sig SysClk (Unsigned 16)) UartCmd
-uartDoubleBaud = bind "uart_double_baud" (hdl go)
+uartDoubleBaud :: EntityDef (Sig SysClk (Unsigned 16)) UartCmd
+uartDoubleBaud = entity "uart_double_baud" (hdl go)
   where
     go div = return UartSetBaud { baudDiv = sigShiftR 1 div }
 
@@ -234,13 +234,13 @@ banner name = do
     putStrLn (replicate 72 '-')
 
 -- | Elaborate and emit a single entity (flat, no sub-instances).
-printEntity :: (PortRef i, PortRef o) => Entity i o -> IO ()
+printEntity :: (Named i, Named o) => EntityDef i o -> IO ()
 printEntity ent = do
     banner (entityName ent)
     putStrLn (emitEntity (elaborate ent))
 
 -- | Elaborate and emit a hierarchical design (entity + all sub-entities).
-printDesign :: (PortRef i, PortRef o) => Entity i o -> IO ()
+printDesign :: (Named i, Named o) => EntityDef i o -> IO ()
 printDesign ent = do
     let (_, design) = elaborateDesign ent
     mapM_ emit' (Map.toAscList design)

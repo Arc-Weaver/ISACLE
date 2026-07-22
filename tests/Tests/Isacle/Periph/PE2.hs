@@ -8,6 +8,7 @@ module Tests.Isacle.Periph.PE2 (runPE2Tests) where
 
 import Prelude
 import System.Exit (exitFailure)
+import Data.Functor.Identity (Identity, runIdentity)
 
 import Hdl.Bits (Signed)
 import Hdl.Prim (Unsigned)
@@ -22,14 +23,14 @@ assert msg True  = putStrLn ("ok:   " ++ msg)
 data Demo
 
 -- A peripheral with one signed RW register and one unsigned RO status register.
-demo :: PeriphDef Demo NullSig (Unsigned 8) ()
+demo :: PeriphDef Demo NullSig Identity (Unsigned 8) ()
 demo = do
     _ <- regField @(Signed 8)   0 "SETPOINT" "target value" 0
     roField @(Unsigned 8) 1 "STATUS"   "status bits"  NullSig
 
 runPE2Tests :: IO ()
 runPE2Tests = do
-    let (_, _, PeriphSpec fields) = runPeriphDef nullOps nullBusIface demo
+    let (_, _, PeriphSpec fields) = runIdentity (runPeriphDef nullOps nullBusIface demo)
     assert "two fields declared" (length fields == 2)
     case fields of
         [sp, st] -> do

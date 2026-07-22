@@ -74,6 +74,7 @@ library isacle-hdl
     Hdl.Net
     Hdl.Prim
     Hdl.Reduce
+    Hdl.Sig
     Hdl.Sim
     Hdl.Types
   build-depends:
@@ -108,7 +109,6 @@ library
     Isacle.ISA.Backend.Synth
     Isacle.ISA.Backend.SynthCPU
     Isacle.ISA.Backend.SynthVnCPU
-    Isacle.ISA.Backend.Wire
     Isacle.ISA.Chip
     Isacle.ISA.CPUDef
     Isacle.ISA.Def

@@ -8,20 +8,16 @@ module Isacle.Periph.Timer
     , counterFSM
       -- * Combined PeriphDef with FSM wired in
     , timerDefWithFSM
-      -- * Standalone circuit wrapper
-    , timerUnit
     ) where
 
 import Prelude
-import Data.Word (Word32)
-import Data.Proxy (Proxy(..))
-import GHC.TypeLits (natVal)
+import Control.Monad.Fix (MonadFix)
+import Data.Kind (Type)
 
-import Hdl.Net
-import Hdl.Types
+import Hdl.Monad (Hdl, registerEn)
+import Hdl.Sig
 import Hdl.Prim (Unsigned)
 import Isacle.System.Periph
-import Isacle.System.HdlCircuit (hdlOps, hdlBusIface)
 
 -- ---------------------------------------------------------------------------
 -- Peripheral kind tag
@@ -44,9 +40,9 @@ data Timer
 --
 -- Returns @(tccr, ocr, tcntPreset, tcntWritten)@.
 timerDef
-    :: (Num dat)
+    :: (Num dat, MonadFix m)
     => sig dat                     -- ^ current counter value (from counter FSM)
-    -> PeriphDef Timer sig dat (sig dat, sig dat, sig dat, sig Bool)
+    -> PeriphDef Timer sig m dat (sig dat, sig dat, sig dat, sig Bool)
 timerDef cntSig = do
     -- TCCR: has the CTC bit-field, so it keeps the explicit register/bitF
     -- declaration (the read-back is the written value).
@@ -81,47 +77,34 @@ timerDef cntSig = do
 --   emission so the feedback signal (cnt feeding timerDef feeding counterFSM
 --   feeding cnt) is safe.
 counterFSM
-    :: forall dom dat.
-       (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat m.
+       (Hdl Sig m, KnownDom dom, HdlType dat, Num dat)
     => Sig dom Bool           -- ^ tick / count enable
     -> Sig dom dat            -- ^ TCCR (from timerDef)
     -> Sig dom dat            -- ^ OCR  (from timerDef)
     -> Sig dom dat            -- ^ TCNT preset value (from timerDef onWriteStrobe)
     -> Sig dom Bool           -- ^ TCNT write strobe (from timerDef)
-    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
-counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
-  where
-    w       = fromIntegral (natVal (Proxy @(Width dat)))
-    domInfo = domId (Proxy @dom)
-    maxVal  = fromInteger (2^w - 1) :: Sig dom dat
+    -> m (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (cnt, ovfIrq, cmpIrq)
+counterFSM tick tccr ocr tcntPreset tcntWritten = mdo
+    -- The counter: advance on a tick, load on a TCNT write, hold otherwise.
+    cnt <- registerEn 0 advance nextCnt
+    let -- Decode the current state.
+        ctcMode     = sigBit 0 tccr           -- TCCR bit 0: clear-timer-on-compare
+        incremented = cnt + 1                 -- wraps to 0 automatically at 2^w
+        reachedOcr  = cnt .==. ocr            -- compare match (CTC's top)
+        reachedMax  = incremented .==. 0      -- free-running wrap (next tick is zero)
 
-    -- Counter register with deferred feedback.
-    cnt = SExpr $ do
-        outWid <- freshWire
-        let cntSig     = SWire outWid :: Sig dom dat
-            cntCtcMode = sigBit 0 tccr
-            cntAtTop   = cntSig .==. ocr
-            cntAtMax   = cntSig .==. maxVal
-            cntInc     = cntSig + 1
-            cntTick    = mux (cntCtcMode .&&. cntAtTop)
-                             0
-                             (mux (sigNot cntCtcMode .&&. cntAtMax)
-                                  0
-                                  cntInc)
-            cntNext    = mux tcntWritten tcntPreset (mux tick cntTick cntSig)
+        -- Next count: CTC clears at OCR; normal mode wraps naturally.  A TCNT
+        -- write preempts either and loads the preset.
+        counted = mux (ctcMode .&&. reachedOcr) 0 incremented
+        nextCnt = mux tcntWritten tcntPreset counted
+        advance = tick .||. tcntWritten
 
-        defer $ do
-            nextWid <- materialize cntNext
-            let initBits = SomeBits 0 w
-            emit $ NReg outWid nextWid Nothing initBits domInfo
-        pure outWid
-
-    ctcMode = sigBit 0 tccr
-    atTop   = cnt .==. ocr
-    atMax   = cnt .==. maxVal
-
-    ovf = tick .&&. sigNot ctcMode .&&. atMax  .&&. sigNot tcntWritten
-    cmp = tick .&&. ctcMode        .&&. atTop  .&&. sigNot tcntWritten
+        -- Interrupts fire only on a real tick (a software preset is not a tick).
+        ticking = tick .&&. sigNot tcntWritten
+        ovfIrq  = ticking .&&. sigNot ctcMode .&&. reachedMax
+        cmpIrq  = ticking .&&. ctcMode        .&&. reachedOcr
+    pure (cnt, ovfIrq, cmpIrq)
 
 -- ---------------------------------------------------------------------------
 -- Combined PeriphDef with counter FSM
@@ -131,38 +114,19 @@ counterFSM tick tccr ocr tcntPreset tcntWritten = (cnt, ovf, cmp)
 -- Use this as the @ptDef@ in a 'PeriphToken' so that 'attachPeripheral'
 -- gets real overflow and compare-match outputs instead of stubs.
 timerDefWithFSM
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
+    :: forall (dom :: Type) dat m.
+       (Hdl Sig m, KnownDom dom, HdlType dat, Num dat)
     => Sig dom Bool              -- ^ tick / count enable
-    -> PeriphDef Timer (Sig dom) dat (Sig dom Bool, Sig dom Bool)
+    -> PeriphDef Timer (Sig dom) m dat (Sig dom Bool, Sig dom Bool)
                                  -- ^ (ovfIrq, cmpIrq)
 timerDefWithFSM tick = mdo
     (tccr, ocr, tcntPreset, tcntWritten) <- timerDef cnt
-    let (cnt, ovf, cmp) = counterFSM tick tccr ocr tcntPreset tcntWritten
+    (cnt, ovf, cmp) <- liftHdl (counterFSM tick tccr ocr tcntPreset tcntWritten)
     return (ovf, cmp)
 
 -- ---------------------------------------------------------------------------
 -- Standalone circuit wrapper
 -- ---------------------------------------------------------------------------
 
--- | Memory-mapped timer built from 'timerDef' + 'counterFSM'.
---
---   Register layout:
---     base + 0  TCCR  control
---     base + 1  TCNT  counter (write = preset, read = current value)
---     base + 2  OCR   output compare
-timerUnit
-    :: (KnownDom dom, HdlType dat, Num dat, Num (Sig dom dat))
-    => Word32                          -- ^ peripheral base address
-    -> Sig dom Bool                    -- ^ tick / count enable
-    -> Sig dom (Unsigned 32)           -- ^ bus write address
-    -> Sig dom dat                     -- ^ bus write data
-    -> Sig dom Bool                    -- ^ bus write enable
-    -> Sig dom (Unsigned 32)           -- ^ bus read address
-    -> (Sig dom dat, Sig dom Bool, Sig dom Bool)  -- ^ (rdData, ovfIrq, cmpIrq)
-timerUnit base tick wrAddr wrData wrEn rdAddr = (rdData, ovfIrq, cmpIrq)
-  where
-    bus = hdlBusIface wrAddr wrData wrEn rdAddr base
-    ((tccr, ocr, tcntPreset, tcntWritten), rdData, _spec) =
-        runPeriphDef hdlOps bus (timerDef cnt)
-    (cnt, ovfIrq, cmpIrq) =
-        counterFSM tick tccr ocr tcntPreset tcntWritten
+-- (The legacy standalone @timerUnit@ wrapper was removed — use 'timerDefWithFSM'
+--  as a 'PeriphToken' def via 'createTimer'.)

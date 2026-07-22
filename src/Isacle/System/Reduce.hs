@@ -31,7 +31,7 @@ module Isacle.System.Reduce
 import Prelude
 
 import Hdl.Net (NetNode, Design)
-import Isacle.System.SystemDSL (SysDSL, SysDoc, runSystemDSL, execSystemDSL)
+import Isacle.System.SystemDSL (SysNet, SysDoc, runSystemDSL, execSystemDSL)
 import Isacle.System.Generate
     (sysExtractMemoryMap, sysGenCHeader, sysGenLinkerScript)
 
@@ -47,7 +47,7 @@ data SysReductions a = SysReductions
     }
 
 -- | Reduce a system to all of its targets at once. @name@ guards the C header.
-reduceSystem :: forall a. String -> SysDSL a -> SysReductions a
+reduceSystem :: forall a. String -> SysNet a -> SysReductions a
 reduceSystem name dsl =
     let (a, nodes, doc) = runSystemDSL dsl
     in SysReductions
@@ -61,25 +61,27 @@ reduceSystem name dsl =
 
 -- | A system reduces to Hdl I/O: its exposed result plus the flat netlist (SY7).
 -- The result and the nodes are /not/ the system — they are what it reduces to.
-reduceToHdl :: SysDSL a -> (a, [NetNode])
+reduceToHdl :: SysNet a -> (a, [NetNode])
 reduceToHdl dsl = let (a, nodes, _) = runSystemDSL dsl in (a, nodes)
 
 -- | Reduce to the full 'Design' (top entity + sub-entities) for VHDL emission.
-reduceToDesign :: forall a. String -> SysDSL a -> Design
-reduceToDesign = execSystemDSL
+-- Wraps the raw system computation as a __portless__ top entity (@() -> SysNet ()@)
+-- — signals here are supplied as Haskell arguments, not top-level ports.
+reduceToDesign :: forall a. String -> SysNet a -> Design
+reduceToDesign name sys = execSystemDSL name (\() -> sys >> pure ())
 
 -- | Reduce to the introspectable topology document (BU5).
-reduceToDoc :: SysDSL a -> SysDoc
+reduceToDoc :: SysNet a -> SysDoc
 reduceToDoc dsl = let (_, _, doc) = runSystemDSL dsl in doc
 
 -- | Reduce to memory-map text (SY6).
-reduceToMemoryMap :: SysDSL a -> String
+reduceToMemoryMap :: SysNet a -> String
 reduceToMemoryMap = sysExtractMemoryMap . reduceToDoc
 
 -- | Reduce to a C header guarded by the given name (SY6).
-reduceToCHeader :: String -> SysDSL a -> String
+reduceToCHeader :: String -> SysNet a -> String
 reduceToCHeader name = sysGenCHeader name . reduceToDoc
 
 -- | Reduce to a GNU LD linker script (SY6).
-reduceToLinkerScript :: SysDSL a -> String
+reduceToLinkerScript :: SysNet a -> String
 reduceToLinkerScript = sysGenLinkerScript . reduceToDoc

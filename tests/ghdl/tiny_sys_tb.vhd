@@ -14,8 +14,8 @@ begin
     dut : entity work.tiny_sys port map (
         sys                      => clk,
         rst                      => rst,
-        gpio0_GpioPhys_gpioPort  => gpio_port,
-        gpio0_GpioPhys_gpioDdr   => gpio_ddr
+        gpio0_gpioPort  => gpio_port,
+        gpio0_gpioDdr   => gpio_ddr
     );
 
     clk <= not clk after 10 ns;  -- 50 MHz

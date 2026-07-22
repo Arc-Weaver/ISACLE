@@ -3,8 +3,8 @@ module Isacle.Periph.Interrupt
     ) where
 
 import Prelude
-import Hdl.Net (freshWire, emit, NetNode(..), PrimOp(..))
-import Hdl.Types
+import Hdl.Sig
+import Hdl.Reduce (sigFalse)
 
 -- | Combinational priority interrupt arbiter.
 --
@@ -25,11 +25,6 @@ interruptArbiter
     -> (Sig dom Bool, Sig dom addr)     -- ^ (valid, selected vector)
 interruptArbiter sources iEnabled = (iEnabled .&&. anyActive, winner)
   where
-    sigFalse = SExpr $ do
-        out <- freshWire
-        emit $ NComb out (PLit 0 1) []
-        pure out
-
     anyActive = foldr (.||.) sigFalse (map fst sources)
 
     winner = foldr (\(req, vec) acc -> mux req vec acc) (fromInteger 0) sources

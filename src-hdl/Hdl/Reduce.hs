@@ -36,7 +36,8 @@ import Prelude
 import Data.Proxy (Proxy(..))
 import GHC.TypeLits (natVal)
 import Hdl.Net   (lookupOrEmit, PrimOp(PLit))
-import Hdl.Types (Sig(..), HdlType(..), (.||.), (.&&.))
+import Hdl.Sig   (Sig(..))
+import Hdl.Types (HdlType(..), (.||.), (.&&.))
 
 -- | A constant signal holding a compile-time value of a synthesizable type.
 -- (Signed literals are still emitted unsigned-encoded for now.)
